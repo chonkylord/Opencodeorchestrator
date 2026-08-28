@@ -304,6 +304,25 @@ describe("watchdogs", () => {
     expect(detail.detail["limit"]).toBe(12_000);
   });
 
+  test("a chatty worker cannot starve the watchdogs", async () => {
+    // The regression this exists for: the run loop races the event stream
+    // against a `tickMs` timer and used to run the watchdogs only when the timer
+    // won. A worker emitting text deltas every millisecond wins that race every
+    // time, so the budget, the idle timer and the hard deadline never fired at
+    // all — and the runaway worker the token budget exists to stop is the
+    // chattiest one there is. Deltas here arrive 20x faster than the tick.
+    const { manager, store } = await harness(
+      { scenario: "over_budget", latencyMs: 1, burnPerTickTokens: 5_000 },
+      { tickMs: 20, budgetPollMs: 20 },
+    );
+    const w = await manager.spawn(spec({ budget: { tokens: 12_000, wallClockMs: 60_000, idleMs: 60_000 } }));
+    const done = await manager.wait(w.workerID, 6_000);
+
+    expect(done.state).toBe("over_budget");
+    expect(done.reason).toBe("token_budget");
+    expect(store.listEvents(w.workerID, { limit: 100 }).map((e) => e.kind)).toContain("budget_exceeded");
+  }, 10_000);
+
   test("cancelling a running worker settles it as cancelled", async () => {
     const { manager } = await harness({ scenario: "hang" });
     const w = await manager.spawn(spec());

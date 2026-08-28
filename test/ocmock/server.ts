@@ -80,6 +80,18 @@ export interface OCMockOptions {
    * tests do not re-prompt and should not pay for the guard.
    */
   readonly dropPromptsWithinMs?: number;
+  /**
+   * Delay before `abort` answers, simulating a server that is slow to stop.
+   *
+   * The knob exists for one assertion Phase 3 cannot make without it. DD-1 says
+   * every MCP tool returns in under two seconds, and `manager.cancel()`
+   * deliberately does not — it resolves only once the worker has genuinely
+   * stopped. So `worker_stop` must start the abort and return, and a test that
+   * checks only the final state passes whether it awaited or not. With the abort
+   * held here, "the tool returned while the worker was still running" becomes a
+   * fact rather than a race. Default 0.
+   */
+  readonly abortDelayMs?: number;
 }
 
 export interface RecordedRequest {
@@ -137,6 +149,7 @@ const DEFAULTS = {
   report: null as unknown,
   writeFiles: false,
   dropPromptsWithinMs: 0,
+  abortDelayMs: 0,
 };
 
 let evtSeq = 0;
@@ -304,6 +317,11 @@ export class OCMock {
         return;
       }
       if (req.method === "POST" && sub === "/abort") {
+        if (this.opts.abortDelayMs > 0) {
+          const t = setTimeout(() => json(res, 200, this.abort(session)), this.opts.abortDelayMs);
+          t.unref?.();
+          return;
+        }
         return json(res, 200, this.abort(session));
       }
     }

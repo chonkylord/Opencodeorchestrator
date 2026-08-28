@@ -639,6 +639,18 @@ export class WorkerManager {
     const stream = w.stream!;
     const it = stream[Symbol.asyncIterator]();
     let pending: Promise<IteratorResult<OCEvent>> | undefined;
+    /**
+     * When the watchdogs last ran.
+     *
+     * The tick below is a race, not a schedule: a stream that produces an event
+     * every few milliseconds — a worker streaming text deltas, or a server whose
+     * heartbeat is faster than `tickMs` — wins that race every time, and the
+     * watchdogs then never run at all. Which is precisely backwards: the runaway
+     * worker the token budget exists to stop is the *chattiest* one there is.
+     * So the tick decides how often they run, and the race only decides what
+     * else the loop does while it waits.
+     */
+    let lastCheckAt = this.opts.now();
 
     for (;;) {
       if (this.halted) return { kind: "cancelled", reason: "manager_halted" };
@@ -661,6 +673,7 @@ export class WorkerManager {
       tick.cancel();
 
       if (winner.t === "tick") {
+        lastCheckAt = this.opts.now();
         const d = await this.checkWatchdogs(w);
         if (d) return d;
         continue;
@@ -679,6 +692,12 @@ export class WorkerManager {
 
       const outcome = await this.onEvent(w, winner.r.value);
       if (outcome) return outcome;
+
+      if (this.opts.now() - lastCheckAt >= this.opts.tickMs) {
+        lastCheckAt = this.opts.now();
+        const d = await this.checkWatchdogs(w);
+        if (d) return d;
+      }
     }
   }
 
@@ -981,7 +1000,14 @@ export class WorkerManager {
     this.update(w, {
       state: w.machine.state,
       endedAt: this.opts.now(),
-      ...(reason === undefined ? {} : { reason }),
+      // Written unconditionally, `undefined` included: a clean completion has to
+      // *clear* whatever reason an earlier state left on the record. A worker
+      // that blocked, was answered and then finished used to carry
+      // `reported_blocked` into its final row, where every status line rendered
+      // it as `completed: reported_blocked` — which reads as though blocking
+      // were the reason it completed. `WorkerResult.reason` was always right;
+      // it was the record that lied.
+      reason,
       totalTokens: result.usage.totalTokens,
       cost: result.usage.cost,
       result,
