@@ -300,20 +300,26 @@ After all workers in a wave finish, the manager computes intersections of change
 
 ## 7. MCP Tool Surface
 
+**Phase 3 corrections.** The rows below were drawn before anything was built.
+Four of them were wrong about shapes that only became visible once the tools
+existed, and are corrected **in place** rather than appended to; each says what
+it used to claim. Rows marked ✅ are built and tested
+([`src/mcp/tools.ts`](src/mcp/tools.ts), [`test/mcp/`](test/mcp/)).
+
 | Tool | Params | Returns | Notes |
 |------|--------|---------|-------|
-| `worker_spawn` | `task`, `mode` (implement/research/review), `model?`, `owns?` (file paths), `dependsOn?` (worker ids) | `{workerId, worktree, branch}` | Returns in <2s; runs in background |
-| `worker_status` | `ids?` | state, elapsed, last-activity age, revision count, ~cost | Cheap; safe to poll |
-| `worker_wait` | `ids`, `timeoutMs` (≤30,000) | same as status | Bounded block; reduces polling chatter |
-| `worker_result` | `id` | structured result (§4.3) | The default thing Claude reads |
-| `worker_diff` | `id`, `paths?`, `cursor?`, `maxLines?` (default 400) | paginated unified diff | On-demand detail |
-| `worker_output` | `id`, `cursor?`, `limit?` (default 50 events) | paginated event log tail | Debugging only |
-| `worker_message` | `id`, `message` | new run id | Answers a blocked worker; session reused |
-| `worker_revise` | `id`, `feedback` | revision number | Review-loop entry point; session reused; capped |
-| `worker_stop` | `id`, `reason?` | — | Graceful abort + snapshot |
-| `worker_list` | `state?` | worker summaries | |
-| `workspace_merge` | `id`, `strategy?`, `runTests?` (default true) | merge + test-gate result | Auto-rollback on red |
-| `workspace_cleanup` | `ids?`, `force?` | — | Prunes worktrees/branches |
+| `worker_spawn` ✅ | `task`, `scope?`, `mode` (implement/research/review), `model?`, `ownedPaths?` (file paths/globs), `acceptance?`, `testCommand?`, `baseRef?`, `runID?`, `notes?`, `budget?`, `dependsOn?` (rejected until Phase 5) | `{workerID, branch, runID}` | Returns in <2s; runs in background. **Corrected:** the param was `owns?` (renamed to match `WorkerSpec.ownedPaths`), and the return used to promise `worktree` — which DD-1 makes impossible, because the worktree is created in the background *after* spawn returns. It appears in `worker_status` once it exists. |
+| `worker_status` ✅ | `ids?` | state, elapsed, last-activity age, revision count, ~cost, and the suggested next call | Cheap; safe to poll. With no `ids`, reports what is still active or blocked. |
+| `worker_wait` ✅ | `id`, `timeoutMs?` (≤30,000) | same as status | Bounded block; reduces polling chatter. Resolves on any settled state, `blocked` included. A timeout is not an error. **Corrected:** the param was `ids` — batched waits are Phase 5 (§11), so Phase 3 takes one id. The 30,000 cap was a guess when written and is now calibrated against a measured host ceiling; see [`docs/phase3-notes.md`](docs/phase3-notes.md). |
+| `worker_result` ✅ | `id` | structured result (§4.3) | The default thing Claude reads. On a `blocked` worker it renders the *record* — there is no result until a worker settles, and blocking is not settling. |
+| `worker_diff` | `id`, `paths?`, `cursor?`, `maxLines?` (default 400) | paginated unified diff | On-demand detail. **Not built in Phase 3** (§11 does not name it, and `src/workspace/` exposes `diffStat` but no paginated unified diff). The reader belongs in `src/workspace/`; Phase 4 owns it. |
+| `worker_output` ✅ | `id`, `cursor?`, `limit?` (default 50 events) | paginated event log tail | Debugging only. Lifecycle-grained, never the transcript — that is what the firewall keeps out. |
+| `worker_message` ✅ | `id`, `message` | confirmation; poll `worker_status` | Answers a blocked worker; session reused. **Corrected:** it does not return a "new run id" — no run is created, because the point is that the *same* session continues. It also returns before the worker has resumed (DD-1): `manager.answer()` waits out the session settle guard, which is seconds. |
+| `worker_revise` | `id`, `feedback` | revision number | Review-loop entry point; session reused; capped. **Phase 6** (§11), not Phase 3. |
+| `worker_stop` ✅ | `id`, `reason?` | confirmation; poll `worker_status` | Graceful abort + snapshot. Returns before the worker has stopped, for the same DD-1 reason as `worker_message`. |
+| `worker_list` ✅ | `state?`, `runID?` | worker summaries | |
+| `workspace_merge` | `id`, `strategy?`, `runTests?` (default true) | merge + test-gate result | Auto-rollback on red. **Phase 4.** |
+| `workspace_cleanup` | `ids?`, `force?` | — | Prunes worktrees/branches. **Phase 4.** |
 
 **Delegation heuristics live in the tool descriptions** so Claude self-calibrates:
 
@@ -428,11 +434,24 @@ Three things worth knowing before Phase 3 builds on this:
 - **A terminal event does not mean *your* turn ended, and a session drops a prompt sent right after one.** Both are in §5 above and in the fact sheet. They are the two bugs most likely to be reintroduced by anyone touching the run loop.
 - **Phase 0's `AGENTS.md` question is closed** (it is auto-loaded), and one new open item is recorded: the adapter still has no way to *answer* a permission or question request in band.
 
-### Phase 3 — MCP server (2–3 days)
+### Phase 3 — MCP server ✅ COMPLETE
 
-- Tools: spawn, status, wait, result, output, stop, list. Async pattern + pagination.
+> Outcome: [`src/mcp/`](src/mcp/) — [`server.ts`](src/mcp/server.ts) (one pre-warmed backend, one index, one manager; `recover()` and `rebuildIndex()` run before the transport is connected, so no `worker_spawn` can race them), [`tools.ts`](src/mcp/tools.ts) (the eight tools, and the descriptions that are the actual product), [`render.ts`](src/mcp/render.ts) (§8's caps, and the plain-text rendering that keeps a round trip under 2k tokens), [`config.ts`](src/mcp/config.ts) (`ORCHESTRATOR_REPO` / `_DB` / `_MODEL` / `_BASE_URL` / `_VERIFY_TESTS`, all defaulted — documented in the [README](README.md#configuration)). §7's table is corrected in place above: four rows described shapes that turned out to be impossible or renamed. Measurements and method in [`docs/phase3-notes.md`](docs/phase3-notes.md). Tests: [`test/mcp/`](test/mcp/) — 24 new, 171 total green, every one driven over real JSON-RPC through the SDK's `InMemoryTransport` rather than by calling handlers.
 
-**AC:** from Claude Code, Claude drives a single worker to completion end-to-end. **Measure:** Claude's context grows by <2k tokens for the interaction.
+- Tools: spawn, status, wait, result, output, stop, list — plus `worker_message`, which §11 did not name and the blocked path is useless without: a worker that asks a question nobody can answer is a worker that times out. Async pattern + pagination.
+
+**AC met:**
+
+- **Claude drove a worker to completion from a live Claude Code session** — the golden repo, the orchestrator registered over `--mcp-config`, and **only** orchestrator tools allowed, so Claude could not have touched the repository itself. Four tool calls: spawn (with `scope`, `ownedPaths`, `acceptance` and `testCommand` it was never told to fill in), wait, result. The worker added `range()` and its tests on `worker/w-001`; Claude reported back that "the orchestrator independently re-ran the test suite itself" and agreed with the worker — the DD-8 distinction, arrived at from the tool descriptions alone.
+- **Context grew by ~278 tokens, against a budget of 2,000.** 1,112 characters of tool results over the whole interaction, ÷4. The worker spent ~15,800 tokens doing the work, so the §1 firewall passes through about 1.8%. The same measurement runs in the suite as an assertion, so a rendering change that inflates it fails the build.
+- **Every tool returns in under two seconds**, `worker_wait` excepted and capped at 30,000 ms — now **half a measured ceiling** rather than a guess. Phase 0's unresolved item 1 is closed: Claude Code 2.1.251's MCP tool-call timeout is **60 s**, and the host names it in the error.
+- **The full loop works over JSON-RPC against `ocmock`:** spawn → poll → result, blocked → message → completed, stop. `worker_stop` and `worker_message` start their operation and return, because `cancel()` and `answer()` deliberately do not resolve until the worker has genuinely moved; `ocmock` gained an `abortDelayMs` knob so that "returned while the worker was still running" is asserted rather than raced.
+
+Three things worth knowing before Phase 4 builds on this:
+
+- **`worker_diff` is not built.** §7 lists it, §11 does not, and the workspace layer has `diffStat` but no paginated unified diff. It belongs in `src/workspace/`, under §8's 400-line cap, and Phase 4 needs it anyway for overlap detection.
+- **The run loop was starving its own watchdogs**, and a chatty worker was the case that broke it — text deltas arrive faster than the tick, and the watchdogs only ran when the tick won the race. The token budget therefore never fired for the runaway workers it exists to stop. Fixed, with a deterministic regression test. See [`docs/phase3-notes.md`](docs/phase3-notes.md) §5.
+- **A completed worker used to keep a stale `reason`**, so a worker that blocked, was answered and then finished read `completed: reported_blocked` on every status line. `WorkerResult` was always right; the record was not.
 
 ### Phase 4 — Isolation & merge (4–5 days)
 
@@ -500,7 +519,7 @@ Model-routing presets with automatic selection, worker priorities, smarter summa
 3. ~~Session resume semantics?~~ **Resolved:** yes, context is retained across prompts to the same session.
 4. ~~Permission config granularity — sufficient for headless?~~ **Resolved:** yes — inline per-session ruleset, or CLI `--auto`. A full edit+bash run completed with zero pending permission requests.
 5. ~~Can one serve instance handle 4+ concurrent sessions without degradation?~~ **Resolved in Phase 1:** yes at 4 — four worktree sessions on one server all completed with no cross-talk, at ~1.4–1.9× single-session latency. One run, one free-tier model; re-measure before going past 4. See `docs/phase0-facts.md`.
-6. Claude Code's actual MCP tool timeout in the target environment? **Still open** — instrument built (`orchestrator_timeout_probe`), measurement requires a live Claude Code session.
+6. ~~Claude Code's actual MCP tool timeout in the target environment?~~ **Resolved in Phase 3: 60 seconds.** Measured on Claude Code 2.1.251 with the orchestrator registered as a real MCP server — 55,000 ms returns, 60,000 ms fails, and the host states its own limit in the error. `worker_wait`'s 30,000 ms cap is now half a measured ceiling instead of a guess. See `docs/phase0-facts.md` §7.
 
 Everything above is structured so that wrong answers to any of these change **one adapter file or one config default** — not the architecture.
 

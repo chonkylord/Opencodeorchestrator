@@ -54,12 +54,12 @@ const QUOTE = "» ";
 // Primitives
 // ---------------------------------------------------------------------------
 
-export function clampChars(text: string, max: number): string {
+function clampChars(text: string, max: number): string {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
-export function duration(ms: number): string {
+function duration(ms: number): string {
   if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
   const s = Math.round(ms / 1000);
   if (s < 60) return `${s}s`;
@@ -68,12 +68,12 @@ export function duration(ms: number): string {
 }
 
 /** Tokens unless a provider actually reported money; free tiers report `0`. */
-export function spend(totalTokens: number, cost: number): string {
+function spend(totalTokens: number, cost: number): string {
   return cost > 0 ? `~$${cost.toFixed(2)}` : `~${totalTokens.toLocaleString("en-US")} tok`;
 }
 
 /** How long this worker has been alive, excluding nothing. */
-export function elapsedMs(r: WorkerRecord, now: number): number {
+function elapsedMs(r: WorkerRecord, now: number): number {
   const from = r.startedAt ?? r.createdAt;
   return (r.endedAt ?? now) - from;
 }
@@ -110,7 +110,7 @@ export function listRow(r: WorkerRecord, now: number): string {
 }
 
 /** What a caller should do next, given where the worker is. */
-export function nextStep(r: WorkerRecord): string {
+function nextStep(r: WorkerRecord): string {
   switch (r.state) {
     case "spawned":
     case "preparing":
@@ -177,11 +177,6 @@ export function renderPending(r: WorkerRecord, now: number): string {
 // Event pages
 // ---------------------------------------------------------------------------
 
-export interface EventPage {
-  readonly text: string;
-  readonly nextCursor?: number;
-}
-
 /**
  * The lifecycle trail, paginated (§8's "event log pages of 50").
  *
@@ -190,11 +185,9 @@ export interface EventPage {
  * and its description says so: the trail says *what the manager did*, and it is
  * the wrong place to look for what the worker produced.
  */
-export function renderEvents(workerID: string, events: readonly StoredEvent[], hasMore: boolean, t0?: number): EventPage {
-  if (events.length === 0) {
-    return { text: `No events for ${workerID} after this cursor. The trail is complete.` };
-  }
-  const base = t0 ?? events[0]!.at;
+export function renderEvents(workerID: string, events: readonly StoredEvent[], hasMore: boolean): string {
+  if (events.length === 0) return `No events for ${workerID} after this cursor. The trail is complete.`;
+  const base = events[0]!.at;
   const lines = events.map((e) => {
     const detail = renderDetail(e.detail);
     return `${String(e.id).padStart(4)} +${duration(e.at - base).padStart(6)} ${e.kind}${detail ? ` ${detail}` : ""}`;
@@ -203,10 +196,7 @@ export function renderEvents(workerID: string, events: readonly StoredEvent[], h
   const footer = hasMore
     ? `\n(${events.length} events; more remain — call again with cursor: ${last.id})`
     : `\n(${events.length} events; end of the trail)`;
-  return {
-    text: `Events for ${workerID}, oldest first. Times are relative to the first event on this page.\n${lines.join("\n")}${footer}`,
-    ...(hasMore ? { nextCursor: last.id } : {}),
-  };
+  return `Events for ${workerID}, oldest first. Times are relative to the first event on this page.\n${lines.join("\n")}${footer}`;
 }
 
 /**

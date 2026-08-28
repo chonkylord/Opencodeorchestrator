@@ -7,6 +7,11 @@ adapter (`src/opencode/`), either from the OpenAPI document or on the wire. Two 
 rows were wrong or incomplete and have been corrected in place rather than appended to —
 see `Corrected in Phase 1` in the detail column.
 
+**Phase 3 additions.** §7 is new and holds one fact about the *host* rather than
+about OpenCode: Claude Code's MCP tool-call timeout, measured at last, which
+closes unresolved item 1 and is what DD-1's "every tool returns in under two
+seconds" is calibrated against. Nothing in §1–§6 needed correcting this phase.
+
 **Phase 2 additions.** Rows marked **verified (phase 2)** were established while building the
 worker manager (`src/manager/`), on the wire against 1.18.25. **One earlier row was wrong**
 and is corrected in place: structured output was marked "verified (schema)" and does not
@@ -93,11 +98,21 @@ Worth reading before Phase 4:
 
 None of these are drop-in replacements for §6's gated merge, but building git plumbing from scratch without evaluating them first would be wasted work.
 
+## 7. The host (not OpenCode)
+
+One fact here, and it is the one DD-1 is calibrated against. It is about *Claude
+Code*, not about OpenCode, which is why it sits in its own section: an OpenCode
+version bump does not invalidate it, and a host upgrade does.
+
+| Fact | Status | Detail |
+|---|---|---|
+| **Claude Code's MCP tool-call timeout is 60 s** | **verified (phase 3)** · *resolves unresolved #1* | Measured on **Claude Code 2.1.251**, on **2026-08-28**, with the orchestrator registered as a real MCP server (`--mcp-config`, `--strict-mcp-config`) in a headless `claude -p` session, using `orchestrator_timeout_probe` — the instrument Phase 0 built for exactly this and could not run. `delayMs` of 30,000, 45,000 and 55,000 all returned normally (the last as `{"requestedMs":55000,"actualMs":55002,"returned":true}`); 60,000 failed, and the host named its own limit in the error: `MCP server "orchestrator" tool "orchestrator_timeout_probe" timed out after 60s`. So it is a hard 60 s deadline on the call, not a shorter budget that happens to round to one. The failure is per tool call — the session continues and the server stays connected — but the call's result is lost, which for a long `worker_wait` means a worker still running with nobody watching. **`worker_wait`'s cap therefore stays at §7's 30,000 ms, now as a measured half of the ceiling rather than a guess.** The remaining 30 s absorbs the tool's own work, the transport, and any host that lowers the limit. |
+
 ---
 
 ## Unresolved — carry into Phase 1
 
-1. **Claude Code's MCP tool-call timeout.** The instrument is built (`orchestrator_timeout_probe`) and verified working over real JSON-RPC, but the measurement requires the server registered in a live Claude Code session. It cannot be taken from inside this container. *Run it before finalizing the `worker_wait` ≤30 s cap.*
+1. ~~**Claude Code's MCP tool-call timeout.**~~ **Resolved in Phase 3 — 60 s.** The measurement always needed a live Claude Code session with the server registered, and Phase 3 was the first phase to have one. See the row in §7 for the number, the host version, the date and the method. `worker_wait`'s cap stays at 30,000 ms, now because it is half a measured ceiling rather than because §7 guessed it.
 2. ~~**Concurrency.** One serve process with 4+ simultaneous sessions was never exercised.~~
    **Resolved in Phase 1 — yes, at 4.** `test/e2e/serve.e2e.test.ts` (`OC_E2E=1
    OC_E2E_CONCURRENCY=1`) runs four sessions in four git worktrees on one server
