@@ -120,7 +120,14 @@ Thin layer over the manager. Tool schemas, pagination, truncation defaults. **Th
 
 ### 4.1 Task Brief
 
-Manager-generated, injected as the worker's prompt and written to the worktree (as `AGENTS.md`, which OpenCode auto-loads).
+> **Corrected in Phase 2 ([ADR-0002](docs/adr/0002-worker-contract-channel.md)).** The brief
+> is **not** written to the worktree. It splits in two and both halves go over the wire: the
+> standing contract (everything below except the `Task:`/`Scope` lines) travels in the
+> per-prompt **`system`** field and is re-sent on every turn, so a resumed worker cannot drift
+> off it; the turn's instruction is the prompt text. `AGENTS.md` pickup *does* work — Phase 2
+> settled that with a marker string and `docs/phase0-facts.md` §5 records it — but a brief
+> written into the worktree is a file the worker can edit mid-run and a file the DD-4
+> reconciliation then has to exclude from every diff it measures. Built by `src/briefs/brief.ts`.
 
 ```
 Task: <one-line objective, from Claude's worker_spawn call>
@@ -151,15 +158,27 @@ the question — do not edit it anyway.
 - Test command `npm test` passes (run it yourself before reporting).
 
 ## Required output
-When finished, write `report.json` to the worktree root matching the
-schema in §4.2. This is the only channel by which your work is read —
-anything not in the report is invisible to the orchestrator.
+When finished, reply with a single JSON object matching the schema in
+§4.2 and nothing else. This is the only channel by which your work is
+read — anything not in the report is invisible to the orchestrator.
+(`report.json` in the worktree root is still read as a fallback if the
+reply carries no usable report.)
 
 Budget: ~$2.00 / 15 min wall clock. If you approach either, stop and
 report what you have.
 ```
 
-### 4.2 Worker Report (`report.json`)
+### 4.2 Worker Report
+
+> **Corrected in Phase 2 ([ADR-0002](docs/adr/0002-worker-contract-channel.md)).** The report
+> is the worker's **final message**, not a file. The manager asks OpenCode to constrain the
+> reply to this schema (`format: {type: "json_schema", …}`), but that is an optimization, not
+> the contract: it is implemented as a forced tool call and the free-tier model this project
+> defaults to rejects it outright, so the manager drops the constraint and re-sends the turn,
+> then stops asking for it on that backend. The brief states the contract in words either way,
+> and `src/briefs/report.ts` parses leniently and records every repair it makes. A
+> `report.json` at the worktree root is still read as §5's secondary signal when the reply
+> yields nothing usable, and is excluded from the diff.
 
 ```json
 {
@@ -176,9 +195,11 @@ report what you have.
 }
 ```
 
-`status` is one of `completed` | `blocked` | `failed`.
+`status` is one of `completed` | `blocked` | `failed`. A `blocked` report is §5's escalation
+channel: the worker stops, the manager surfaces `questions` to Claude, and the answer resumes
+the same session.
 
-**Verification step (critical):** the manager reconciles `changes[]` against the actual `git diff --name-only` and flags discrepancies in the result it returns to Claude. Workers will sometimes misreport.
+**Verification step (critical):** the manager reconciles `changes[]` against the actual `git diff --name-only` and flags discrepancies in the result it returns to Claude. Workers will sometimes misreport. Implemented in `src/briefs/reconcile.ts`; the diff comes from **local git, not from the backend** — asking the worker's own server for the evidence would make the witness and the accused the same process.
 
 ### 4.3 Worker Result (what Claude actually sees)
 
@@ -215,6 +236,21 @@ Risks: JWT expiry not configurable yet
 2. **Secondary:** `report.json` appears in worktree.
 3. **Watchdog:** no events for `idleTimeout` (default 3 min) → mark stuck, surface to Claude.
 4. **Hard timeout** (default 15 min) → abort.
+
+> **Phase 2, the hard way.** Two things about (1) that are not obvious and cost a
+> two-minute silent hang each before they were found (`docs/phase0-facts.md` §4):
+>
+> - **A terminal event is scoped to the session, not to your prompt.** A failed turn emits
+>   `session.idle` *twice*, ~30ms apart. Treat a turn as finished only once something proved
+>   it started — `session.status {type:"busy"}` is that signal.
+> - **A session silently drops a prompt sent immediately after a terminal event.** HTTP 204,
+>   then nothing at all. Let it settle (~2s) before re-prompting. This applies to the
+>   blocked→resume path below as much as to any retry.
+>
+> Also: the watchdog in (3) keys off *worker* events, not stream silence — liveness ticks
+> arrive every 10s regardless, so a watchdog that resets on any frame never fires. Heartbeats
+> with no worker events means the worker wedged; no heartbeats means the server died, which
+> `health()` confirms. They are different failures and only one of them is `timed_out`.
 
 **Blocked path:** worker stops and writes a `blocked` report → manager sets `blocked` → Claude sees `questions` → `worker_message(id, answer)` → same session resumes. This is the escalation channel — the only way a worker asks for help.
 
@@ -372,11 +408,25 @@ Two things worth knowing before Phase 2 builds on this:
   if anything outside `src/opencode/` names an endpoint, parses an OpenCode event type, or
   imports past the barrel.
 
-### Phase 2 — Worker manager core (3–4 days)
+### Phase 2 — Worker manager core ✅ COMPLETE
+
+> Outcome: [`src/manager/`](src/manager/) — [`state.ts`](src/manager/state.ts) (§5 enumerated as data; illegal transitions throw), [`worker.ts`](src/manager/worker.ts) (registry, run loop, watchdogs, budgets, recovery), [`result.ts`](src/manager/result.ts) (§4.3, under the 1.5k-token cap), [`types.ts`](src/manager/types.ts). Plus [`src/briefs/`](src/briefs/) (brief builder, report parser, and the DD-4 reconciliation), [`src/workspace/`](src/workspace/) (worktree, DD-5 snapshot commit, diff stat, independent test re-run), and [`src/store/`](src/store/) (SQLite over worktrees that carry their own manifests). Channel decisions recorded in [ADR-0002](docs/adr/0002-worker-contract-channel.md); §4.1, §4.2 and §5 above are corrected where they were stale. Tests: 90 new, 146 total green, plus [`test/fixtures/`](test/fixtures/) (the golden repo §12 asked for) and [`test/e2e/manager.e2e.test.ts`](test/e2e/manager.e2e.test.ts) green against real OpenCode 1.18.25.
 
 - State machine, registry, SQLite store, task-brief builder, report parser + diff reconciliation, timeout/idle watchdogs.
 
-**AC:** full spawn→running→completed lifecycle on the golden repo; blocked path works; timeout aborts; manager restart recovers state.
+**AC met**, each with the test that shows it (`test/manager/lifecycle.test.ts` unless noted):
+
+- **Full spawn→running→completed on the golden repo** — `test/e2e/manager.e2e.test.ts`: a real worker adds `range()` to the fixture, the manager snapshots the worktree, re-runs `npm test` itself, and reconciliation finds nothing to disagree with. 15s, ~13k tokens, result rendered in under 500 characters.
+- **Blocked path works** — the worker reports `blocked`, the manager surfaces the questions, `answer()` resumes **the same session on the same subscription**, and the run completes. A mid-run permission wall becomes the same escalation rather than a hang.
+- **Timeout aborts** — and lands in `timed_out`, not `failed`. An abort emits an error *then* idle; the manager records why it aborted before asking, so the intent decides the state. Hard deadline and idle watchdog are distinguished, as are a wedged worker and a dead server.
+- **Manager restart recovers state** — `halt()` kills the manager the way a crash does, writing nothing; a second manager on the same database turns the stale `running` rows into `interrupted` with their worktrees untouched. A *lost* database is rebuilt from the worktree manifests (DD-7).
+- **Reconciliation catches a lying report** — `ocmock`'s `lying_report` claims two files and touches none; both are in the result, and the run still completes, because the discrepancies are the finding.
+
+Three things worth knowing before Phase 3 builds on this:
+
+- **`format: json_schema` does not work on the default free-tier model.** It was "verified (schema)" and had never been sent. The manager attempts it, drops it on rejection and stops asking on that backend; the report contract lives in the brief's words either way. See ADR-0002.
+- **A terminal event does not mean *your* turn ended, and a session drops a prompt sent right after one.** Both are in §5 above and in the fact sheet. They are the two bugs most likely to be reintroduced by anyone touching the run loop.
+- **Phase 0's `AGENTS.md` question is closed** (it is auto-loaded), and one new open item is recorded: the adapter still has no way to *answer* a permission or question request in band.
 
 ### Phase 3 — MCP server (2–3 days)
 

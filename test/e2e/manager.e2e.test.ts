@@ -119,10 +119,12 @@ describe.skipIf(!AGENTS_PROBE)("phase 0 unresolved #3: AGENTS.md pickup", () => 
 
       const spawned = await manager.spawn({
         runID: "e2e-agents",
-        task: "Report the marker.",
+        task: "Report the marker, if you already have it.",
         scope:
-          "Do not edit any file. Read AGENTS.md in the root of this worktree and put the marker string it contains " +
-          "into your report's `summary`, verbatim. If there is no such file, say exactly: NO AGENTS FILE.",
+          "Do NOT read, open, list or search any file, and do not run any tool. Answer only from the instructions and " +
+          "context you were given before this message. If that context contains a marker string of the form " +
+          "AGENTS_MARKER_XXXXXXXX, put it in your report's `summary`, verbatim and alone. If it does not, put exactly: " +
+          "NO MARKER IN CONTEXT.",
         mode: "research",
       });
       // Written after the worktree exists and before the model gets far.
@@ -140,7 +142,9 @@ describe.skipIf(!AGENTS_PROBE)("phase 0 unresolved #3: AGENTS.md pickup", () => 
       const summary = done.result?.summary ?? "";
       console.log(`\nAGENTS.md probe: marker=${marker}\nsummary: ${summary}\n`);
       // Not asserted either way — this is a measurement, and the result belongs
-      // in docs/phase0-facts.md. It fails only if the worker never reported.
+      // in docs/phase0-facts.md. The marker present means the file reached the
+      // model's context without anyone reading it; "NO MARKER IN CONTEXT" means
+      // it did not. It fails only if the worker never reported at all.
       expect(done.state).toBe("completed");
       expect(summary.length).toBeGreaterThan(0);
     },
