@@ -5,6 +5,7 @@
  * orchestrator knows about a worker; a `WorkerResult` is what Claude is shown.
  */
 
+import type { MergeOutcome, MergeState } from "../workspace/merge.js";
 import type { WorkerState } from "./state.js";
 
 /** DD-10. `research` and `review` are read-only; only `implement` may edit. */
@@ -184,4 +185,38 @@ export interface WorkerManifest {
   readonly createdAt: number;
   readonly spec: WorkerSpec;
   readonly sessionID?: string;
+}
+
+/**
+ * One gated merge (§6.3), as the index stores it.
+ *
+ * A merge is a first-class entity rather than a field on a worker, and the
+ * reason is DD-1: the gate runs a test suite, which takes minutes, and the host
+ * abandons a tool call at sixty seconds. So `workspace_merge` starts a merge and
+ * returns this handle, exactly as `worker_spawn` returns a worker — and a thing
+ * with its own identity, its own state and its own poll needs its own row.
+ *
+ * It carries a set of workers rather than one, because merging is inherently
+ * about a wave: "which worker broke it" is only a meaningful question when the
+ * others are named alongside.
+ */
+export interface MergeRecord {
+  readonly mergeID: string;
+  readonly runID?: string;
+  readonly state: MergeState;
+  readonly integrationBranch: string;
+  /** Where the integration branch started. The floor every rollback lands on. */
+  readonly baseSha: string;
+  /** Where it is now. Equal to `baseSha` while nothing has merged. */
+  readonly headSha: string;
+  /** The workers offered, in merge order. */
+  readonly workers: readonly string[];
+  /** The gate, from the brief (DD-8). Absent means the merge ran ungated. */
+  readonly testCommand?: string;
+  readonly startedAt: number;
+  readonly endedAt?: number;
+  /** The full per-step detail, once the pipeline has produced it. */
+  readonly outcome?: MergeOutcome;
+  /** Set when the merge could not run at all. */
+  readonly error?: string;
 }

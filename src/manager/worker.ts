@@ -426,6 +426,47 @@ export class WorkerManager {
   }
 
   /**
+   * Fire the one edge Phase 2 enumerated and never used: `completed → merged`.
+   *
+   * The state machine is what makes this safe. Attempting to merge a `failed`,
+   * `timed_out` or already-`merged` worker throws {@link IllegalTransitionError}
+   * here, loudly, before any git command runs — rather than quietly at a `git
+   * merge` whose error message would be about refs. That is exactly why §5's
+   * table enumerates edges instead of documenting them.
+   *
+   * Called by the merge coordinator once a worker's commits are genuinely in the
+   * integration branch. A worker whose branch had nothing to merge stays
+   * `completed`: it was never merged, and saying it was would put a false row in
+   * the run report.
+   */
+  markMerged(workerID: string, detail: { mergeID: string; integrationBranch: string; sha?: string }): WorkerRecord {
+    const live = this.workers.get(workerID);
+    const record = live?.record.current ?? this.opts.store.getWorker(workerID);
+    if (!record) throw new Error(`unknown worker ${workerID}`);
+
+    // A worker the manager still holds in memory has the authoritative machine;
+    // one that only exists in the index (a previous process's, rebuilt at
+    // startup) gets a machine seeded from its stored state. Both reject an
+    // illegal move identically, which is the property that matters.
+    if (live) live.machine.apply("merge", { reason: "gated_merge", detail });
+    else new WorkerMachine({ workerID, initial: record.state }).apply("merge", { reason: "gated_merge", detail });
+
+    const updated: WorkerRecord = { ...record, state: "merged", updatedAt: this.opts.now() };
+    if (live) live.record.current = updated;
+    this.opts.store.putWorker(updated);
+    this.opts.store.appendEvent(workerID, "state:merged", {
+      from: record.state,
+      trigger: "merge",
+      reason: "gated_merge",
+      mergeID: detail.mergeID,
+      branch: detail.integrationBranch,
+      ...(detail.sha === undefined ? {} : { sha: detail.sha }),
+    });
+    if (live) this.notify(live);
+    return updated;
+  }
+
+  /**
    * §9's restart recovery.
    *
    * Call it before spawning anything. Rows left `running`, `blocked`, `preparing`

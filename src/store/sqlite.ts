@@ -14,6 +14,7 @@
 
 import { Database } from "bun:sqlite";
 
+import type { MergeRecord } from "../manager/types.js";
 import type { WorkerManifest, WorkerRecord, WorkerResult, WorkerSpec } from "../manager/types.js";
 import { isActive, type WorkerState } from "../manager/state.js";
 import { SCHEMA_SQL, SCHEMA_VERSION } from "./schema.js";
@@ -64,6 +65,22 @@ interface WorkerRow {
   reason: string | null;
   questions: string;
   result: string | null;
+}
+
+/** The `merges` row shape as SQLite hands it back. */
+interface MergeRow {
+  id: string;
+  run_id: string;
+  state: string;
+  branch: string;
+  base_sha: string;
+  head_sha: string;
+  workers: string;
+  test_command: string | null;
+  started_at: number;
+  ended_at: number | null;
+  outcome: string | null;
+  error: string | null;
 }
 
 export class Store {
@@ -243,6 +260,59 @@ export class Store {
     }));
   }
 
+  // --- merges (§6.3, Phase 4) ---------------------------------------------
+
+  /**
+   * Write a merge row, in full, on every change.
+   *
+   * Same upsert shape as `putWorker` and for the same reason: a merge is written
+   * once when it starts and again after each step, and a partial update is a
+   * chance for the row to disagree with itself. DD-7 still holds — losing this
+   * table costs the merge's history, not its result, because the result is a
+   * branch in the repository.
+   */
+  putMerge(record: MergeRecord): void {
+    this.db
+      .query(
+        `INSERT INTO merges
+           (id, run_id, state, branch, base_sha, head_sha, workers, test_command,
+            started_at, ended_at, outcome, error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           run_id = excluded.run_id, state = excluded.state, branch = excluded.branch,
+           base_sha = excluded.base_sha, head_sha = excluded.head_sha, workers = excluded.workers,
+           test_command = excluded.test_command, ended_at = excluded.ended_at,
+           outcome = excluded.outcome, error = excluded.error`,
+      )
+      .run(
+        record.mergeID,
+        record.runID ?? "",
+        record.state,
+        record.integrationBranch,
+        record.baseSha,
+        record.headSha,
+        JSON.stringify(record.workers),
+        record.testCommand ?? null,
+        record.startedAt,
+        record.endedAt ?? null,
+        record.outcome ? JSON.stringify(record.outcome) : null,
+        record.error ?? null,
+      );
+  }
+
+  getMerge(id: string): MergeRecord | undefined {
+    const row = this.db.query<MergeRow, [string]>("SELECT * FROM merges WHERE id = ?").get(id);
+    return row ? toMerge(row) : undefined;
+  }
+
+  listMerges(filter: { runID?: string } = {}): MergeRecord[] {
+    const sql = `SELECT * FROM merges${filter.runID ? " WHERE run_id = ?" : ""} ORDER BY started_at, id`;
+    const rows = filter.runID
+      ? this.db.query<MergeRow, [string]>(sql).all(filter.runID)
+      : this.db.query<MergeRow, []>(sql).all();
+    return rows.map(toMerge);
+  }
+
   // --- recovery (§9) ------------------------------------------------------
 
   /**
@@ -327,6 +397,23 @@ function toRecord(row: WorkerRow): WorkerRecord {
     ...(row.reason === null ? {} : { reason: row.reason }),
     questions: parseJson<string[]>(row.questions, []),
     ...(row.result === null ? {} : { result: parseJson<WorkerResult>(row.result, undefined as never) }),
+  };
+}
+
+function toMerge(row: MergeRow): MergeRecord {
+  return {
+    mergeID: row.id,
+    ...(row.run_id === "" ? {} : { runID: row.run_id }),
+    state: row.state as MergeRecord["state"],
+    integrationBranch: row.branch,
+    baseSha: row.base_sha,
+    headSha: row.head_sha,
+    workers: parseJson<string[]>(row.workers, []),
+    ...(row.test_command === null ? {} : { testCommand: row.test_command }),
+    startedAt: row.started_at,
+    ...(row.ended_at === null ? {} : { endedAt: row.ended_at }),
+    ...(row.outcome === null ? {} : { outcome: parseJson<MergeRecord["outcome"]>(row.outcome, undefined) }),
+    ...(row.error === null ? {} : { error: row.error }),
   };
 }
 

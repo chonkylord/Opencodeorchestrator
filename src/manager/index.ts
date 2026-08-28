@@ -26,8 +26,17 @@ export { type RenderOptions, renderResult } from "./result.js";
 
 export { DEFAULT_BUDGET, DEFAULT_MODEL, WorkerManager, type WorkerManagerOptions } from "./worker.js";
 
+export {
+  MergeCoordinator,
+  type MergeCoordinatorOptions,
+  MergeStartError,
+  type StartMergeRequest,
+  type StartedMerge,
+} from "./merges.js";
+
 export type {
   DiffStat,
+  MergeRecord,
   Discrepancy,
   ReportedChange,
   WORKER_MODES,

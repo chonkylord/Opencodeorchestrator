@@ -31,19 +31,21 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { ServeBackend } from "../opencode/index.js";
-import { WorkerManager, type WorkerManagerOptions } from "../manager/index.js";
+import { MergeCoordinator, WorkerManager, type WorkerManagerOptions } from "../manager/index.js";
 import { Store } from "../store/index.js";
 import { type ServerConfig, loadConfig } from "./config.js";
 import { registerWorkerTools } from "./tools.js";
 
 export const SERVER_NAME = "opencode-orchestrator";
-export const SERVER_VERSION = "0.3.0";
+export const SERVER_VERSION = "0.4.0";
 
 const log = (line: string): void => console.error(`[orchestrator] ${line}`);
 
 export interface Orchestrator {
   readonly server: McpServer;
   readonly manager: WorkerManager;
+  /** Phase 4's gated merge, tracked separately from the workers it merges. */
+  readonly merges: MergeCoordinator;
   readonly store: Store;
   readonly config: ServerConfig;
   readonly dispose: () => Promise<void>;
@@ -100,22 +102,28 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
   });
   if (rebuilt.length > 0) log(`rebuilt ${rebuilt.length} worker row(s) from worktree manifests`);
 
+  const merges = new MergeCoordinator({ manager, store, repoRoot: config.repoRoot, log });
+
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
-  registerWorkerTools(server, { manager, store, log });
+  registerWorkerTools(server, { manager, store, merges, repoRoot: config.repoRoot, log });
   registerProbe(server);
 
   let disposed = false;
   const dispose = async (): Promise<void> => {
     if (disposed) return;
     disposed = true;
-    // Order mirrors construction, reversed: stop the workers, then the backend
-    // they talk to, then the index that recorded them.
+    // Order mirrors construction, reversed: let any merge in flight finish (it
+    // holds an integration worktree and a `git reset` it must be allowed to
+    // complete — a merge killed mid-rollback is the one way this system could
+    // leave a repository in a state nobody asked for), then stop the workers,
+    // then the backend they talk to, then the index that recorded them.
+    await merges.drain().catch((e: unknown) => log(`merge drain: ${String(e)}`));
     await manager.dispose().catch((e: unknown) => log(`manager dispose: ${String(e)}`));
     await backend.dispose().catch((e: unknown) => log(`backend dispose: ${String(e)}`));
     store.close();
   };
 
-  return { server, manager, store, config, dispose };
+  return { server, manager, merges, store, config, dispose };
 }
 
 /**

@@ -48,7 +48,7 @@ MCP Server (the orchestrator — this product)
 | DD-1 | All MCP tools return in <2s, except `worker_wait` (bounded ≤30s) | MCP hosts time out long calls; background execution + polling is the only workable pattern |
 | DD-2 | Single `opencode serve` process hosting many sessions (default); one-process-per-worker as a config option | Sessions are cheap; enables session reuse for revisions; per-process isolation available when needed |
 | DD-3 | TypeScript monorepo | MCP SDK and OpenCode SDK (`@opencode-ai/sdk`) are both first-class TS; one language for server, tests, fixtures |
-| DD-4 | Workers write `report.json`; manager parses it and cross-checks against `git status`/`diff` | Structured results enforced by contract, not by hoping the model summarizes well |
+| DD-4 | Workers report in their **final reply**; manager parses it and cross-checks against `git status`/`diff` | Structured results enforced by contract, not by hoping the model summarizes well. **Corrected in Phase 4:** this row still described the `report.json` channel that [ADR-0002](docs/adr/0002-worker-contract-channel.md) replaced in Phase 2 — the reply is the contract channel and `report.json` in the worktree is only a fallback, read when the reply is unusable. The cross-check against git is unchanged and is the half that matters. |
 | DD-5 | Manager runs `git add -A && git commit` after every worker completion | Workers can't be trusted to commit; snapshotting makes diff/merge reliable |
 | DD-6 | Sequential merge with per-merge test gate + auto-rollback | Prevents broken main from parallel merges |
 | DD-7 | SQLite persistence from Phase 2 | Crash recovery and audit trails; worktrees are the durable state, DB is the index |
@@ -272,8 +272,8 @@ Worker `cwd` = worktree root, set via `POST /session?directory=<worktree>`.
 
 - **Permissions** — passed inline on session create (`permission: [{permission, pattern, action}]`). No `opencode.json` file. Verified.
 - **Worker contract** — carried in the per-prompt `system` field on `prompt_async`, not `.opencode/agent/worker.md`. Custom agent files are only discovered at *server start from the server's own cwd*, so a running shared server will not see them. Verified.
-- **Task brief** — delivered as the prompt itself. `AGENTS.md` in the worktree remains an option but is unverified (see `docs/phase0-facts.md`).
-- **Report contract** — prefer `format: {type: "json_schema", …}` on `prompt_async`, which constrains and retries the reply server-side, over asking the worker to write a file.
+- **Task brief** — delivered as the prompt itself. `AGENTS.md` in the worktree remains an option and is **verified** — Phase 2 confirmed OpenCode auto-loads it (`docs/phase0-facts.md` §5, probe in `test/e2e/manager.e2e.test.ts` behind `OC_E2E_AGENTS=1`). The brief still travels in the per-prompt `system` field, by choice rather than by necessity. *(Corrected in Phase 4: this line said "unverified" long after Phase 2 verified it.)*
+- **Report contract** — carried in the brief's words, and read from the worker's final reply. *(Corrected in Phase 4: this line said to prefer `format: {type: "json_schema", …}`, which was written as "verified (schema)" and had never been sent. Phase 2 sent it: the free-tier model this project defaults to **rejects** schema-constrained output. The manager attempts it, drops it on rejection and stops asking on that backend — see [ADR-0002](docs/adr/0002-worker-contract-channel.md). The contract cannot depend on a feature the default model does not have.)*
 
 On completion the manager runs `git add -A && git commit` to snapshot everything, then computes diffs.
 
@@ -288,6 +288,22 @@ After all workers in a wave finish, the manager computes intersections of change
 - **Shared integration files** (`package.json`, router indexes) → warn Claude up front; better: task planning assigns one worker ownership of integration points, or Claude does the wiring itself post-merge.
 
 ### 6.3 Gated merge pipeline
+
+**Corrected in Phase 4 — where the merge runs.** The steps below were drawn
+before there was a real repository to be careful about, and they do not say. They
+must: `config.repoRoot` is a repository a human may have open, on a branch of
+their choosing, with uncommitted work in it. Step 2's `git reset --hard` run
+there destroys work the orchestrator never created and cannot restore. So every
+step below runs in a **dedicated integration worktree**
+(`.orchestrator/integration/<mergeID>` on branch `integration/<mergeID>`),
+created for the merge and removed after it; the user's branch, index and working
+tree are never written to, and landing the integration branch is a separate,
+explicit, human act. See [ADR-0003](docs/adr/0003-integration-worktree.md).
+
+**Also corrected: step 2's option (a) is not Phase 4's.** "Send the worker a
+'rebase onto new base, resolve, re-test' message" is a revision, and the revision
+loop is Phase 6's, with its caps. In Phase 4 a red gate rolls back and *reports*;
+Claude may then answer or respawn.
 
 1. Claude reviews each worker (report + diff), runs revision loops until satisfied or capped.
 2. Merge **one at a time** into the integration branch. After each merge: run the test command.
@@ -312,14 +328,15 @@ it used to claim. Rows marked ✅ are built and tested
 | `worker_status` ✅ | `ids?` | state, elapsed, last-activity age, revision count, ~cost, and the suggested next call | Cheap; safe to poll. With no `ids`, reports what is still active or blocked. |
 | `worker_wait` ✅ | `id`, `timeoutMs?` (≤30,000) | same as status | Bounded block; reduces polling chatter. Resolves on any settled state, `blocked` included. A timeout is not an error. **Corrected:** the param was `ids` — batched waits are Phase 5 (§11), so Phase 3 takes one id. The 30,000 cap was a guess when written and is now calibrated against a measured host ceiling; see [`docs/phase3-notes.md`](docs/phase3-notes.md). |
 | `worker_result` ✅ | `id` | structured result (§4.3) | The default thing Claude reads. On a `blocked` worker it renders the *record* — there is no result until a worker settles, and blocking is not settling. |
-| `worker_diff` | `id`, `paths?`, `cursor?`, `maxLines?` (default 400) | paginated unified diff | On-demand detail. **Not built in Phase 3** (§11 does not name it, and `src/workspace/` exposes `diffStat` but no paginated unified diff). The reader belongs in `src/workspace/`; Phase 4 owns it. |
+| `worker_diff` ✅ | `id`, `paths?`, `cursor?`, `maxLines?` (default 400) | paginated unified diff | On-demand detail; **built in Phase 4** ([`src/workspace/diff.ts`](src/workspace/diff.ts)), where Phase 3 said the reader belonged. Pages by **line**, not by file — a cap that rounds up to whole files is not a cap. Untracked files are included, so a worker's diff does not go empty just because DD-5's snapshot has not run yet; a worker whose worktree has been cleaned up is diffed from its snapshot commit instead. |
 | `worker_output` ✅ | `id`, `cursor?`, `limit?` (default 50 events) | paginated event log tail | Debugging only. Lifecycle-grained, never the transcript — that is what the firewall keeps out. |
 | `worker_message` ✅ | `id`, `message` | confirmation; poll `worker_status` | Answers a blocked worker; session reused. **Corrected:** it does not return a "new run id" — no run is created, because the point is that the *same* session continues. It also returns before the worker has resumed (DD-1): `manager.answer()` waits out the session settle guard, which is seconds. |
 | `worker_revise` | `id`, `feedback` | revision number | Review-loop entry point; session reused; capped. **Phase 6** (§11), not Phase 3. |
 | `worker_stop` ✅ | `id`, `reason?` | confirmation; poll `worker_status` | Graceful abort + snapshot. Returns before the worker has stopped, for the same DD-1 reason as `worker_message`. |
 | `worker_list` ✅ | `state?`, `runID?` | worker summaries | |
-| `workspace_merge` | `id`, `strategy?`, `runTests?` (default true) | merge + test-gate result | Auto-rollback on red. **Phase 4.** |
-| `workspace_cleanup` | `ids?`, `force?` | — | Prunes worktrees/branches. **Phase 4.** |
+| `workspace_merge` ✅ | `workerIDs`, `testCommand?`, `runTests?` (default true), `integrationBranch?`, `continueOnFailure?`, `runID?` | `{mergeID, integrationBranch}` + the §6.2 overlap warning, immediately | Sequential merge, test gate after **each**, `git reset --hard` on red, in a dedicated integration worktree. **Corrected:** the params were `id`, `strategy?` and the return was a "merge + test-gate result" — three things this row got wrong. It takes a *set* of workers, because a merge is about a wave; `strategy` was never meaningful (git's own merge is the merge, per §5's scope); and it **cannot be synchronous** — the gate runs the test suite after every merge and the host abandons a tool call at 60 s, so it returns a handle. See [ADR-0003](docs/adr/0003-integration-worktree.md). |
+| `workspace_merge_status` ✅ | `mergeID?`, `runID?` | merge + test-gate result, per step | **Added in Phase 4**, and required by the row above: an async merge needs a poll. Names which worker broke it, how, and the sha the branch was rolled back to. With no `mergeID` it lists. |
+| `workspace_cleanup` ✅ | `ids?`, `force?`, `scan?`, `pruneOrphans?` | what was pruned, what was **kept** and why, plus the §9 orphan scan | Prunes worktrees/branches. A branch is deleted only if its commits are already contained in HEAD or an integration branch; an unmerged branch is kept with the reason, because it is the only copy of what its worker produced (DD-7). `force` deletes those commits and the description says so in those words. Orphans are reported, never pruned, unless asked. |
 
 **Delegation heuristics live in the tool descriptions** so Claude self-calibrates:
 
@@ -453,11 +470,26 @@ Three things worth knowing before Phase 4 builds on this:
 - **The run loop was starving its own watchdogs**, and a chatty worker was the case that broke it — text deltas arrive faster than the tick, and the watchdogs only ran when the tick won the race. The token budget therefore never fired for the runaway workers it exists to stop. Fixed, with a deterministic regression test. See [`docs/phase3-notes.md`](docs/phase3-notes.md) §5.
 - **A completed worker used to keep a stale `reason`**, so a worker that blocked, was answered and then finished read `completed: reported_blocked` on every status line. `WorkerResult` was always right; the record was not.
 
-### Phase 4 — Isolation & merge (4–5 days)
+### Phase 4 — Isolation & merge ✅ COMPLETE
+
+> Outcome: [`src/workspace/`](src/workspace/) gained its second half — [`diff.ts`](src/workspace/diff.ts) (the paginated unified diff, §8's 400-line cap, line-cursored), [`overlap.ts`](src/workspace/overlap.ts) (§6.2's intersection and, the actual product, its classification), [`merge.ts`](src/workspace/merge.ts) (§6.3's sequential gated pipeline with auto-rollback, run in a dedicated integration worktree) and [`cleanup.ts`](src/workspace/cleanup.ts) (pruning that cannot destroy unmerged work, plus §9's orphan scan). [`src/manager/merges.ts`](src/manager/merges.ts) makes a merge a first-class, pollable entity and fires the `completed → merged` edge Phase 2 enumerated and never used; [`src/store/schema.ts`](src/store/schema.ts) gained the `merges` table it had deliberately held back. Four tools in [`src/mcp/tools.ts`](src/mcp/tools.ts): `worker_diff`, `workspace_merge`, `workspace_merge_status`, `workspace_cleanup`. Decisions in [ADR-0003](docs/adr/0003-integration-worktree.md). §2's DD-4 row, §6.1, §6.3 and four §7 rows are corrected in place above. Tests: 49 new, **220 total green** (4 skipped), the merge suites against real git repositories and the tool suites over real JSON-RPC. `bun run spike` still green against OpenCode 1.18.25.
 
 - WorktreeManager, per-worker config injection, snapshot commits, diff tooling, overlap detection, gated merge with auto-rollback, cleanup.
 
-**AC:** two workers on disjoint files merge green; a seeded conflicting merge is detected and rolled back; failed test gate restores pre-merge state.
+**AC met**, each with the test that shows it:
+
+- **Two workers on disjoint files merge green** — over real JSON-RPC in [`test/mcp/workspace.test.ts`](test/mcp/workspace.test.ts): two real workers, two worktrees, two snapshot commits, `npm test` as the gate after *each* merge, and both files on the integration branch afterwards according to `git ls-tree`. Both workers land in `merged`.
+- **A seeded conflicting merge is detected and rolled back** — [`test/workspace/merge.test.ts`](test/workspace/merge.test.ts) asserts the integration branch is **bit-identical** to its pre-merge sha, not that nothing threw. A rollback that throws nothing and restores nothing is invisible to any weaker assertion.
+- **A failed test gate restores pre-merge state** — using `breakGoldenRepo()`, so the suite fails on an assertion rather than a stubbed exit code. §13's flaky-test mitigation is in: a red suite is re-run **once** before it is believed, and the result says it was.
+- **The user's checkout is untouched** — tested rather than asserted in prose: the fixture's working tree is dirtied (a modified tracked file and an untracked one), a full merge-and-rollback cycle runs, and `git status`, HEAD, the current branch and both files are unchanged. This is the property ADR-0003 exists for.
+- **Every tool returns in under two seconds**, `workspace_merge` included — it validates, computes the overlap warning and returns a handle before the gate has run.
+
+Four things worth knowing before Phase 5 builds on this:
+
+- **`workspace_merge` cannot be synchronous, and a merge is its own entity.** §7's row promised a "merge + test-gate result"; the gate runs a test suite and the host abandons a tool call at 60 s. The handle is a row in the new `merges` table rather than a field on a worker, because a merge is about a *set* — "which worker broke it" is only answerable when the others are named alongside. ADR-0003 has the reasoning.
+- **OpenCode's native worktree endpoints were evaluated on the wire and declined.** Not on principle: they name their own branches (`opencode/<name>`, the requested name is silently overridden), take no base ref, put worktrees in OpenCode's data directory rather than the repository, and their delete removes the branch with the worktree and no merged check. The second of those would quietly invalidate §6.2's overlap test, which is only valid because every worker in a run branches from one resolved sha. `docs/phase0-facts.md` §6's warning is closed rather than deferred again.
+- **A `completed` worker may have nothing to merge, and that is an outcome.** `snapshotCommit` returns `{committed: false}` when a worker changed nothing, so `result.snapshot.sha` is absent on exactly the workers most worth being suspicious of. `nothing_to_merge` is reported and the worker stays `completed` — marking it `merged` would put a false row in the run report.
+- **Cleanup's default is the safe half.** An unmerged branch is kept with its reason; `force` deletes commits that exist nowhere else and says so in those words; orphans are reported, not pruned. DD-7 means a worker's branch is the only copy of what it produced.
 
 ### Phase 5 — Parallelism (2–3 days)
 

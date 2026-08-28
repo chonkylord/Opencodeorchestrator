@@ -12,7 +12,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Store } from "../../src/store/index.js";
+import { SCHEMA_VERSION, Store } from "../../src/store/index.js";
 import type { WorkerManifest, WorkerRecord } from "../../src/manager/types.js";
 
 const temps: string[] = [];
@@ -118,7 +118,10 @@ describe("persistence", () => {
     first.close();
 
     const second = store(path);
-    expect(second.schemaVersion).toBe(1);
+    // Phase 4 added the `merges` table and bumped the version with it. The
+    // constant is the assertion's source of truth so that a future migration
+    // shows up as a schema change rather than as a broken test.
+    expect(second.schemaVersion).toBe(SCHEMA_VERSION);
     expect(second.getWorker("w-001")).toMatchObject({ state: "running" });
     expect(second.listEvents("w-001")).toHaveLength(1);
   });

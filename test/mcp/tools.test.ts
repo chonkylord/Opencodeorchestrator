@@ -148,6 +148,7 @@ describe("registration", () => {
 
     expect(names).toEqual([
       "orchestrator_timeout_probe",
+      "worker_diff",
       "worker_list",
       "worker_message",
       "worker_output",
@@ -156,6 +157,9 @@ describe("registration", () => {
       "worker_status",
       "worker_stop",
       "worker_wait",
+      "workspace_cleanup",
+      "workspace_merge",
+      "workspace_merge_status",
     ]);
   });
 
@@ -176,12 +180,35 @@ describe("registration", () => {
     expect(result.description).toMatch(/discrepanc/i);
   });
 
-  test("Phase 4, 5 and 6 tools are absent rather than half-built", async () => {
+  test("Phase 5 and 6 tools are absent rather than half-built", async () => {
+    // Phase 4 moved `worker_diff`, `workspace_merge` and `workspace_cleanup` out
+    // of this list by building them. What is left is what is genuinely not here:
+    // the review loop's revision entry point (Phase 6), and the batched wait the
+    // queue needs (Phase 5). `worker_spawn` still *rejects* `dependsOn` by name
+    // rather than ignoring it, which is the same principle at argument level.
     const { client } = await harness();
     const names = (await client.listTools()).tools.map((t) => t.name);
-    for (const absent of ["workspace_merge", "workspace_cleanup", "worker_revise", "worker_diff"]) {
+    for (const absent of ["worker_revise", "worker_wait_all", "workspace_status"]) {
       expect(names).not.toContain(absent);
     }
+  });
+
+  test("workspace_merge says it returns before the merge finishes, and that it is gated", async () => {
+    // §7's row read "merge + test-gate result", which is synchronous and
+    // impossible against a 60s host ceiling. The description is where a model
+    // learns otherwise, so the description is what this asserts on.
+    const { client } = await harness();
+    const tools = (await client.listTools()).tools;
+    const merge = tools.find((t) => t.name === "workspace_merge")!;
+    const cleanup = tools.find((t) => t.name === "workspace_cleanup")!;
+
+    expect(merge.description).toMatch(/workspace_merge_status/);
+    expect(merge.description).toMatch(/ONE AT A TIME/);
+    // The two safety properties a model must not have to infer.
+    expect(merge.description).toMatch(/reset\s+--hard|rolled back|never left half-merged/i);
+    expect(merge.description).toMatch(/CHECKOUT IS NOT TOUCHED/);
+    // Cleanup's `force` has to say what it destroys, not just that it forces.
+    expect(cleanup.description).toMatch(/DELETES UNMERGED COMMITS/);
   });
 });
 

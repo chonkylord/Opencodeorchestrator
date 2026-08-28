@@ -8,14 +8,18 @@ The full design is in [`projectplan.md`](projectplan.md).
 
 ## Status
 
-**Phases 0, 1, 2 and 3 complete.** The architecture's OpenCode assumptions are
+**Phases 0, 1, 2, 3 and 4 complete.** The architecture's OpenCode assumptions are
 verified against a live server, the backend decision is recorded, the adapter that
 isolates those assumptions is built, a worker goes from a one-line task to a
-committed worktree and a structured result without a human in the loop — and
-Claude can now drive that from a Claude Code session over MCP.
+committed worktree and a structured result without a human in the loop, Claude can
+drive that from a Claude Code session over MCP — and the work a worker produces
+can now be **taken**: merged one at a time into an integration branch behind a
+test gate, and rolled back to the exact sha it started from when the gate goes
+red.
 
 - [`docs/adr/0001-serve-vs-run-backend.md`](docs/adr/0001-serve-vs-run-backend.md) — ServeBackend accepted, with costs
 - [`docs/adr/0002-worker-contract-channel.md`](docs/adr/0002-worker-contract-channel.md) — how the brief goes out and the report comes back
+- [`docs/adr/0003-integration-worktree.md`](docs/adr/0003-integration-worktree.md) — where the merge runs, and why not OpenCode's own worktrees
 - [`docs/phase0-facts.md`](docs/phase0-facts.md) — verified API facts, and what is still unresolved
 - [`src/opencode/`](src/opencode/) — the adapter. **The only code that knows OpenCode exists** (DD-2)
 - [`src/manager/`](src/manager/) — the lifecycle: state machine, run loop, watchdogs, budgets, recovery
@@ -40,7 +44,24 @@ Discrepancies: none
 Snapshot: a7c6376179 on the worker's branch
 ```
 
-**Phase 4 (isolation and the gated merge) is next** — see [`projectplan.md`](projectplan.md) §11.
+The merge never runs in your checkout. It runs in an integration worktree the
+orchestrator creates under `.orchestrator/` and removes afterwards, so
+`git reset --hard` — which is the rollback, on the path a merge pipeline exists
+for — can never reach a file you have not committed. A green merge leaves a
+branch and tells you where it is; landing it is yours to do.
+
+```
+Merge m-001 — MERGED GREEN. 2 worker(s) are on integration/m-001 at 4f1c8ade.
+Took 6s · gate: `npm test`
+  w-001: merged → 9b23f1c0 · tests green
+  w-002: merged → 4f1c8ade · tests green
+
+The work is on integration/m-001. Review it (worker_diff per worker), then land it yourself —
+the orchestrator never writes to your branch or your working tree.
+```
+
+**Phase 5 (parallelism: the concurrency semaphore, the queue, `dependsOn` and
+batched waits) is next** — see [`projectplan.md`](projectplan.md) §11.
 
 ## Requirements
 
@@ -138,9 +159,16 @@ uncommitted, because your `.gitignore` is yours.
 | `worker_message` | Answer a blocked worker; the session is reused. |
 | `worker_stop` | Graceful abort, with the worktree snapshotted. |
 | `worker_list` | Inventory, filterable by state and run. |
+| `worker_diff` | The unified diff a worker produced, paginated under a 400-line cap. |
+| `workspace_merge` | Start a gated merge of completed workers into an integration branch. |
+| `workspace_merge_status` | Poll it: which workers merged, which one broke it, where it rolled back to. |
+| `workspace_cleanup` | Prune worktrees and branches — and refuse, by default, to delete unmerged work. |
 
 Every one of them returns in under two seconds (DD-1); `worker_wait` is the
-single bounded exception. The delegation heuristics from
+single bounded exception. `workspace_merge` is no exception either: it runs a
+test suite after **every** merge, which is minutes, so it validates, warns about
+overlapping files and returns a handle to poll — the same spawn-and-poll shape as
+everything else, for the same reason (the host abandons a tool call at 60 s). The delegation heuristics from
 [`projectplan.md`](projectplan.md) §7 and the DD-8 trust model — the worker's
 summary is a *claim*, the discrepancies are the orchestrator's own finding —
 live in the tool descriptions, because that is the only documentation a model
@@ -150,9 +178,11 @@ reliably reads.
 surface: it is the instrument that measured the host's tool-call ceiling
 `worker_wait`'s cap sits under. See [`docs/phase3-notes.md`](docs/phase3-notes.md).
 
-Phase 4's `workspace_merge` / `workspace_cleanup`, Phase 5's `dependsOn` and
-Phase 6's `worker_revise` are deliberately absent rather than half-built — a
-tool that promises a merge gate that does not exist is worse than no tool.
+Phase 5's `dependsOn` and Phase 6's `worker_revise` are deliberately absent
+rather than half-built — a tool that promises a review loop that does not exist
+is worse than no tool. `worker_spawn` *rejects* `dependsOn` by name rather than
+ignoring it, so a worker that ran too early cannot look like a worker that failed
+for no reason.
 
 ## Layout
 
@@ -161,9 +191,9 @@ spike/          Phase 0 verification script — the reference for adapter behavi
 src/opencode/   The OpenCode adapter: interface, ServeBackend, RunBackend stub
 src/manager/    Worker lifecycle: state machine, run loop, watchdogs, results
 src/briefs/     Task brief out, report in, and the reconciliation between them
-src/workspace/  Worktrees, snapshot commits, diff stats, independent test runs
+src/workspace/  Worktrees, snapshot commits, diffs, overlap, the gated merge, cleanup
 src/store/      SQLite — an index over worktrees that carry their own manifests
-src/mcp/        The MCP server and its eight tools — what Claude sees
+src/mcp/        The MCP server and its twelve tools — what Claude sees
 test/ocmock/    Scriptable fake OpenCode server
 test/fixtures/  The golden repo
 docs/adr/       Decision records

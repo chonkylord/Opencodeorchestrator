@@ -72,6 +72,24 @@ export interface OCMockOptions {
    */
   readonly writeFiles?: boolean;
   /**
+   * Give each session's file a name derived from its own directory.
+   *
+   * Phase 4 needs two workers whose changed-file sets are *disjoint*, which the
+   * fixed `hello.txt` cannot produce: two branches that add the same path with
+   * the same content are not disjoint, they are identical. With this on, a
+   * worker in `.../w-001` writes `w-001.txt`, so an overlap check has something
+   * real to be right about.
+   */
+  readonly perWorktreeFileName?: boolean;
+  /**
+   * Give each session's file *content* derived from its own directory.
+   *
+   * The other half of the same need: two branches that add the same path with
+   * *different* content is precisely a merge conflict, and a conflict has to be
+   * producible on demand rather than hoped for.
+   */
+  readonly perWorktreeFileContent?: boolean;
+  /**
    * Silently drop a prompt that arrives within this many ms of the session's
    * last terminal event — accepted with 204, then nothing.
    *
@@ -148,6 +166,8 @@ const DEFAULTS = {
   version: "1.18.25-ocmock",
   report: null as unknown,
   writeFiles: false,
+  perWorktreeFileName: false,
+  perWorktreeFileContent: false,
   dropPromptsWithinMs: 0,
   abortDelayMs: 0,
 };
@@ -538,18 +558,23 @@ export class OCMock {
         state: { status: "completed", input: {}, output: "ok", title: "hello.txt", metadata: {}, time: {} },
       },
     });
+    const stem = session.directory.split("/").filter(Boolean).pop() ?? "worker";
+    const fileName = this.opts.perWorktreeFileName ? `${stem}.txt` : "hello.txt";
     if (this.opts.writeFiles) {
       // A real file, so `git diff` has something to agree or disagree with.
       try {
         mkdirSync(session.directory, { recursive: true });
-        writeFileSync(join(session.directory, "hello.txt"), "hello from ocmock\n");
+        writeFileSync(
+          join(session.directory, fileName),
+          this.opts.perWorktreeFileContent ? `hello from ${stem}\n` : "hello from ocmock\n",
+        );
       } catch {
         /* the test did not give us a real directory; the events are the point */
       }
     }
-    this.emit(session, "file.edited", { file: `${session.directory}/hello.txt` });
+    this.emit(session, "file.edited", { file: `${session.directory}/${fileName}` });
     session.summary = { additions: 1, deletions: 0, files: 1 };
-    this.emit(session, "session.diff", { sessionID: session.id, diff: [{ file: "hello.txt" }] });
+    this.emit(session, "session.diff", { sessionID: session.id, diff: [{ file: fileName }] });
   }
 
   private burn(session: MockSession): void {

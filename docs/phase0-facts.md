@@ -90,13 +90,13 @@ they are listed in full at the bottom rather than quietly omitted.
 
 Worth reading before Phase 4:
 
-- `POST /experimental/worktree` (+ `GET`, `DELETE`, `/reset`) and `/experimental/workspace` — native worktree/workspace management, with `worktree.ready` / `worktree.failed` events.
+- ~~`POST /experimental/worktree` (+ `GET`, `DELETE`, `/reset`)~~ — **evaluated on the wire in Phase 4 and declined.** They work; they are the wrong tool. Measured against 1.18.25 in a scratch repository: creation names its own branch (`opencode/<name>` — a requested `branch` is silently overridden), takes **no base ref** so the worktree branches from whatever HEAD is at the moment of the call, places worktrees under `~/.local/share/opencode/worktree/<sha>/<name>` rather than in the repository, and `DELETE` removes the branch along with the worktree with no merged check and no way to withhold it. The missing base ref is the disqualifying one: every worker in a run branching from **one resolved sha** is what makes §6.2's overlap test valid, and losing it produces a wrong answer rather than an error. Local `git worktree` keeps all four properties and is backend-independent. See [ADR-0003](adr/0003-integration-worktree.md). `/experimental/workspace` was not exercised and is not needed.
 - `GET /session/{id}/diff` and `Session.summary{additions,deletions,files}` — diff and diff-stat.
 - `POST /session/{id}/revert` / `revert/stage` / `revert/commit` / `unrevert` — snapshot and rollback primitives.
 - `POST /session/{id}/summarize` and `/compact` — context compaction.
 - `format: json_schema` on prompt — schema-enforced structured output with retries.
 
-None of these are drop-in replacements for §6's gated merge, but building git plumbing from scratch without evaluating them first would be wasted work.
+None of these are drop-in replacements for §6's gated merge, but building git plumbing from scratch without evaluating them first would be wasted work. **Phase 4 evaluated the worktree row and closed it** (above). The diff and revert rows stay open on purpose, for the reason [ADR-0002](adr/0002-worker-contract-channel.md) gives: the diff is the evidence a worker's claims are checked against, and asking the worker's own server for it makes the witness and the accused the same process.
 
 ## 7. The host (not OpenCode)
 
