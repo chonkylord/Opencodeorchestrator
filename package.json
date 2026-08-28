@@ -1,0 +1,20 @@
+{
+  "name": "opencode-orchestrator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Claude -> OpenCode subagent orchestrator (MCP server)",
+  "scripts": {
+    "spike": "bun run spike/spike.ts",
+    "mcp": "bun run src/mcp/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
+  }
+}

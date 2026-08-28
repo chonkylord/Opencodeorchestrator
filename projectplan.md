@@ -76,7 +76,7 @@ interface OpenCodeBackend {
 }
 ```
 
-- **`ServeBackend`** (default): starts/connects `opencode serve` (default port ~4096 — verify), uses the SDK + SSE event stream for completion detection.
+- **`ServeBackend`** (default): starts/connects `opencode serve` (**`--port` defaults to `0` = random; parse the port from stdout — never assume 4096**), and subscribes to the SSE event stream **per worktree** (`GET /event?directory=…`) for completion detection.
 - **`RunBackend`** (fallback): spawns `opencode run` subprocesses per prompt; more isolation, simpler, but weaker eventing.
 
 ### 3.2 Worker Manager
@@ -211,11 +211,14 @@ Risks: JWT expiry not configurable yet
 git worktree add .orchestrator/worktrees/w-003 -b worker/w-003 <base-sha>
 ```
 
-Worker `cwd` = worktree root. Per-worker config injected into the worktree:
+Worker `cwd` = worktree root, set via `POST /session?directory=<worktree>`.
 
-- `AGENTS.md` — the task brief + constraints (OpenCode auto-loads it)
-- `.opencode/agent/worker.md` — a custom "worker" agent definition enforcing the report contract (verify agent-file location against current docs)
-- `opencode.json` — permissions: `edit: allow`, `bash: allow` (for tests), `webfetch: deny` for implement workers
+**Revised after Phase 0** — per-worktree file injection largely does not work under DD-2, and is not needed:
+
+- **Permissions** — passed inline on session create (`permission: [{permission, pattern, action}]`). No `opencode.json` file. Verified.
+- **Worker contract** — carried in the per-prompt `system` field on `prompt_async`, not `.opencode/agent/worker.md`. Custom agent files are only discovered at *server start from the server's own cwd*, so a running shared server will not see them. Verified.
+- **Task brief** — delivered as the prompt itself. `AGENTS.md` in the worktree remains an option but is unverified (see `docs/phase0-facts.md`).
+- **Report contract** — prefer `format: {type: "json_schema", …}` on `prompt_async`, which constrains and retries the reply server-side, over asking the worker to write a file.
 
 On completion the manager runs `git add -A && git commit` to snapshot everything, then computes diffs.
 
@@ -315,7 +318,9 @@ orchestrator/
 
 Each phase ends at a testable state. Estimates assume a single experienced dev.
 
-### Phase 0 — Spike & verification (2–3 days)
+### Phase 0 — Spike & verification ✅ COMPLETE
+
+> Outcome: [`docs/adr/0001-serve-vs-run-backend.md`](docs/adr/0001-serve-vs-run-backend.md) (ServeBackend accepted) and [`docs/phase0-facts.md`](docs/phase0-facts.md). AC met by `spike/spike.ts`, green against OpenCode 1.18.23. Five items remain unresolved and are listed at the end of the fact sheet.
 
 Validate every uncertain OpenCode fact before committing to architecture:
 
@@ -410,12 +415,12 @@ Model-routing presets with automatic selection, worker priorities, smarter summa
 
 ## 14. Open Questions (resolve in Phase 0)
 
-1. Does OpenCode expose per-session token/cost usage via API? (Determines budget enforcement mechanism.)
-2. Exact SSE event shapes for run completion — and do they differ between serve and run modes?
-3. Session resume semantics: full context retention across prompts to the same session?
-4. Permission config granularity — per-agent? per-tool? Sufficient for fully headless runs?
-5. Can one serve instance handle 4+ concurrent sessions without degradation?
-6. Claude Code's actual MCP tool timeout default in the target environment?
+1. ~~Does OpenCode expose per-session token/cost usage via API?~~ **Resolved:** yes — `Session.cost` and `Session.tokens{input,output,reasoning,cache}`. Caveat: `cost` is `0` on free-tier models, so budget on tokens.
+2. ~~Exact SSE event shapes for run completion?~~ **Resolved:** `session.idle`, `{id, type, properties:{sessionID}}` — and the stream is **directory-scoped**. Serve-vs-run parity still unverified.
+3. ~~Session resume semantics?~~ **Resolved:** yes, context is retained across prompts to the same session.
+4. ~~Permission config granularity — sufficient for headless?~~ **Resolved:** yes — inline per-session ruleset, or CLI `--auto`. A full edit+bash run completed with zero pending permission requests.
+5. Can one serve instance handle 4+ concurrent sessions without degradation? **Still open.**
+6. Claude Code's actual MCP tool timeout in the target environment? **Still open** — instrument built (`orchestrator_timeout_probe`), measurement requires a live Claude Code session.
 
 Everything above is structured so that wrong answers to any of these change **one adapter file or one config default** — not the architecture.
 
