@@ -73,6 +73,7 @@ async function harness(
     tickMs: 10,
     budgetPollMs: 20,
     abortGraceMs: 400,
+    retrySettleMs: 60,
     verifyTests: false,
     ...managerOpts,
   });
@@ -116,7 +117,7 @@ describe("spawn to completed", () => {
     expect(result.changes.paths).toEqual(["hello.txt"]);
     expect(result.changes.files).toBe(1);
     expect(result.discrepancies).toEqual([]);
-    expect(result.reportSource).toBe("structured_output");
+    expect(result.reportSource).toBe("reply");
     expect(result.usage.totalTokens).toBeGreaterThan(0);
 
     // DD-5: the manager committed, not the worker.
@@ -177,7 +178,10 @@ describe("spawn to completed", () => {
 describe("the blocked path (§5)", () => {
   test("worker asks, manager surfaces, the answer resumes the same session", async () => {
     const blocked = { status: "blocked", summary: "I need a decision", changes: [], questions: ["May I edit src/router.ts?"] };
-    const { mock, manager, store } = await harness({ writeFiles: true, report: blocked });
+    // Same guard as the retry path: answering a blocked worker is a prompt to a
+    // session that has just gone terminal, and a dropped one would look like a
+    // worker that ignored its answer.
+    const { mock, manager, store } = await harness({ writeFiles: true, report: blocked, dropPromptsWithinMs: 30 });
 
     const w = await manager.spawn(spec());
     const asked = await manager.wait(w.workerID, 5_000);
@@ -193,6 +197,7 @@ describe("the blocked path (§5)", () => {
 
     const done = await manager.wait(w.workerID, 5_000);
     expect(done.state).toBe("completed");
+    expect(mock.droppedPromptsOf(sessionID)).toBe(0);
     expect(done.resumes).toBe(1);
     expect(done.questions).toEqual([]);
     expect(done.result!.summary).toBe("Created hello.txt as asked.");
@@ -399,6 +404,11 @@ describe("worker modes (DD-10)", () => {
     expect((create.body as Record<string, unknown>)["permission"]).toEqual([
       { permission: "edit", pattern: "**", action: "allow" },
       { permission: "bash", pattern: "**", action: "allow" },
+      // `doom_loop` is an interactive guard, and an unattended worker cannot
+      // answer it: left at `ask` it deadlocks the run the manager's own
+      // watchdogs already bound. `external_directory` is deliberately absent —
+      // that ask is §8's jail signal and is meant to reach Claude.
+      { permission: "doom_loop", pattern: "**", action: "allow" },
     ]);
     const prompt = mock.requests.find((r) => r.path.endsWith("/prompt_async"))!;
     const body = prompt.body as Record<string, unknown>;
@@ -407,6 +417,65 @@ describe("worker modes (DD-10)", () => {
     // — ADR-0002's two decisions, on the wire.
     expect(String(body["system"])).toContain("## Required output");
     expect(body["format"]).toMatchObject({ type: "json_schema", retryCount: 2 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("providers that refuse schema-constrained output", () => {
+  test("the turn is re-sent without the constraint and the worker still completes", async () => {
+    // Verified against real OpenCode 1.18.25: the default free-tier model rejects
+    // `format: json_schema` outright, because it is implemented as a forced tool
+    // call. The schema was only ever the *enforcement* of the contract — the
+    // brief states it in words — so losing it must not lose the worker.
+    const { mock, manager, store } = await harness({
+      scenario: "format_unsupported",
+      writeFiles: true,
+      report: TRUTHFUL,
+      // A prompt sent straight after a terminal event is accepted and dropped by
+      // the real server. If the manager re-sent immediately, this worker would
+      // sit silent until the idle watchdog gave up on it.
+      dropPromptsWithinMs: 30,
+    });
+    const w = await manager.spawn(spec());
+    const done = await manager.wait(w.workerID, 5_000);
+
+    expect(done.state).toBe("completed");
+    expect(mock.droppedPromptsOf(done.sessionID!)).toBe(0);
+    expect(done.result!.summary).toBe("Created hello.txt as asked.");
+
+    const prompts = mock.requests.filter((r) => r.path.endsWith("/prompt_async"));
+    expect(prompts).toHaveLength(2);
+    expect((prompts[0]!.body as Record<string, unknown>)["format"]).toBeDefined();
+    expect((prompts[1]!.body as Record<string, unknown>)["format"]).toBeUndefined();
+    // The same instruction, re-sent unchanged.
+    expect((prompts[1]!.body as Record<string, unknown>)["parts"]).toEqual(
+      (prompts[0]!.body as Record<string, unknown>)["parts"] as never,
+    );
+    expect(store.listEvents(w.workerID, { limit: 100 }).map((e) => e.kind)).toContain("structured_output_unsupported");
+  });
+
+  test("the discovery is paid once, not by every worker", async () => {
+    const { mock, manager } = await harness({ scenario: "format_unsupported", writeFiles: true, report: TRUTHFUL });
+    const first = await manager.spawn(spec());
+    await manager.wait(first.workerID, 5_000);
+    const second = await manager.spawn(spec());
+    expect((await manager.wait(second.workerID, 5_000)).state).toBe("completed");
+
+    // Three prompts total: two for the first worker's discovery, one for the
+    // second, which never asks for a constraint this backend cannot honour.
+    const prompts = mock.requests.filter((r) => r.path.endsWith("/prompt_async"));
+    expect(prompts).toHaveLength(3);
+    expect((prompts[2]!.body as Record<string, unknown>)["format"]).toBeUndefined();
+  });
+
+  test("an unrelated provider error still fails the worker", async () => {
+    // The fallback is narrow on purpose: it must not turn every API error into a
+    // silent retry that hides a real provider problem.
+    const { manager } = await harness({ scenario: "format_unsupported" }, { structuredOutput: false });
+    const w = await manager.spawn(spec());
+    const done = await manager.wait(w.workerID, 5_000);
+    expect(done.state).toBe("completed"); // no format was sent, so no rejection
   });
 });
 

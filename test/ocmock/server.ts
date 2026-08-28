@@ -12,8 +12,9 @@
  *   then waits forever in production. Here it waits forever in a unit test
  *   instead, in three seconds, with a name.
  *
- * Scenarios: `success`, `hang`, `blocked`, `over_budget`, `crash`, and the
- * `lying_report` hook that Phase 2's reconciliation will assert against.
+ * Scenarios: `success`, `hang`, `blocked`, `over_budget`, `crash`,
+ * `format_unsupported`, and the `lying_report` hook that Phase 2's
+ * reconciliation asserts against.
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -22,7 +23,15 @@ import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import type { Socket } from "node:net";
 
-export type Scenario = "success" | "hang" | "blocked" | "over_budget" | "crash" | "lying_report";
+export type Scenario =
+  | "success"
+  | "hang"
+  | "blocked"
+  | "over_budget"
+  | "crash"
+  | "lying_report"
+  /** Rejects any prompt carrying `format`, the way a free-tier provider does. */
+  | "format_unsupported";
 
 export interface OCMockOptions {
   /** Applies to every session unless overridden per-session. Default `success`. */
@@ -62,6 +71,15 @@ export interface OCMockOptions {
    * from a lying one, rather than both looking like an empty worktree.
    */
   readonly writeFiles?: boolean;
+  /**
+   * Silently drop a prompt that arrives within this many ms of the session's
+   * last terminal event — accepted with 204, then nothing.
+   *
+   * Reproduces OpenCode 1.18.25: a session that has just gone terminal ignores a
+   * prompt sent immediately afterwards. Default 0 (never drop), because most
+   * tests do not re-prompt and should not pay for the guard.
+   */
+  readonly dropPromptsWithinMs?: number;
 }
 
 export interface RecordedRequest {
@@ -93,6 +111,10 @@ interface MockSession {
   claim?: string;
   /** Per-session reply, overriding the mock-wide default. */
   report?: unknown;
+  /** When this session last emitted a terminal event. */
+  lastIdleAt?: number;
+  /** Prompts accepted and dropped, for tests that assert on the guard. */
+  dropped: number;
   prompts: unknown[];
 }
 
@@ -114,6 +136,7 @@ const DEFAULTS = {
   version: "1.18.25-ocmock",
   report: null as unknown,
   writeFiles: false,
+  dropPromptsWithinMs: 0,
 };
 
 let evtSeq = 0;
@@ -198,6 +221,11 @@ export class OCMock {
     this.emit(s, "permission.replied", { sessionID: s.id, requestID, reply: "once" });
     this.finish(s, this.opts.workMs);
     return true;
+  }
+
+  /** How many prompts this session accepted and silently dropped. */
+  droppedPromptsOf(sessionID: string): number {
+    return this.sessions.get(sessionID)?.dropped ?? 0;
   }
 
   /** Whatever a `lying_report` worker claimed. Phase 2 checks it against git. */
@@ -314,6 +342,7 @@ export class OCMock {
       running: false,
       timers: new Set(),
       prompts: [],
+      dropped: 0,
       ...(this.opts.report === null || this.opts.report === undefined ? {} : { report: this.opts.report }),
     };
     this.sessions.set(id, session);
@@ -323,6 +352,15 @@ export class OCMock {
 
   private prompt(session: MockSession, body: unknown): void {
     session.prompts.push(body);
+    if (
+      this.opts.dropPromptsWithinMs > 0 &&
+      session.lastIdleAt !== undefined &&
+      Date.now() - session.lastIdleAt < this.opts.dropPromptsWithinMs
+    ) {
+      // Accepted, and then nothing at all. The real server does this too.
+      session.dropped += 1;
+      return;
+    }
     session.running = true;
     session.tokens.input += this.opts.tokensPerPrompt;
     session.cost += this.opts.costPerPrompt;
@@ -406,6 +444,43 @@ export class OCMock {
         case "crash":
           this.after(session, this.opts.workMs, () => this.crash());
           return;
+        case "format_unsupported": {
+          // Observed on OpenCode 1.18.25 against a free-tier model: schema-
+          // constrained output is implemented by forcing a tool call, and a
+          // provider that only accepts `tool_choice: "auto"` rejects the whole
+          // request. The message is the one the real provider returned.
+          const last = asRecord(session.prompts.at(-1));
+          if (last["format"] !== undefined) {
+            this.emit(session, "session.error", {
+              sessionID: session.id,
+              error: {
+                name: "APIError",
+                data: {
+                  message:
+                    'Error from provider (Console): Upstream request failed: [invalid_request_error] only `"auto"` is ' +
+                    "supported for `tool_choice`. `\"none\"`, `\"required\"`, and named function choices are not currently supported",
+                  isRetryable: false,
+                },
+              },
+            });
+            this.emit(session, "session.idle", { sessionID: session.id });
+            session.running = false;
+            // Real OpenCode emits a *second* idle a moment later, after a
+            // trailing `message.updated`. Measured at ~30ms on 1.18.25. A manager
+            // that re-prompts on the first one reads this second one as its new
+            // turn ending instantly — which is exactly the bug worth catching in
+            // milliseconds rather than in a live run.
+            this.after(session, Math.max(1, Math.round(this.opts.latencyMs / 2)), () => {
+              this.emit(session, "message.updated", { sessionID: session.id, info: {} });
+              this.emit(session, "session.idle", { sessionID: session.id });
+            });
+            return;
+          }
+          this.work(session);
+          this.reply(session);
+          this.finish(session, this.opts.workMs);
+          return;
+        }
       }
     });
   }
@@ -509,6 +584,7 @@ export class OCMock {
 
   /** Emit a session-scoped event — delivered only to matching subscriptions. */
   private emit(session: MockSession, type: string, properties: Record<string, unknown>): void {
+    if (type === "session.idle") session.lastIdleAt = Date.now();
     this.broadcast(session.directory, type, properties);
   }
 

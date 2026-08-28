@@ -129,8 +129,12 @@ export interface WorkerResult {
   readonly error?: { readonly code: string; readonly message: string };
   /** DD-5's snapshot commit. */
   readonly snapshot?: { readonly committed: boolean; readonly sha?: string };
-  /** Which channel the report came from. `none` means the worker never reported. */
-  readonly reportSource: "structured_output" | "report_file" | "none";
+  /**
+   * Which channel the report came from. `reply` is the worker's own final
+   * message (schema-constrained where the provider allows it); `report_file` is
+   * §5's secondary signal; `none` means the worker never reported at all.
+   */
+  readonly reportSource: "reply" | "report_file" | "none";
 }
 
 /** The manager's row for one worker. The SQLite `workers` table mirrors it. */

@@ -93,6 +93,25 @@ export const DEFAULT_BUDGET: WorkerBudget = Object.freeze({
 /** DD-9: task type routes to model. One default until Phase 8 measures better. */
 export const DEFAULT_MODEL = "opencode/muse-spark-1.2-contributor-free";
 
+/**
+ * What an `implement` worker is allowed, on top of the adapter's headless set.
+ *
+ * `doom_loop` is an interactive anti-loop guard, and interactive is the one
+ * thing a headless worker cannot be: left at `ask` it does not stop a runaway,
+ * it stops the *run*, waiting for an answer from nobody. The manager already
+ * bounds loops three ways — idle watchdog, wall clock, token budget — so the
+ * guard is redundant here and the prompt is pure deadlock.
+ *
+ * `external_directory` is deliberately *not* widened. Phase 0 called it "a
+ * useful jail signal for §8", and it is: a worker reaching outside its worktree
+ * raises a question the orchestrator can surface, rather than silently writing
+ * where it should not.
+ */
+const IMPLEMENT_PERMISSIONS: readonly PermissionRule[] = Object.freeze([
+  ...HEADLESS_PERMISSIONS,
+  { permission: "doom_loop", pattern: "**", action: "allow" },
+]);
+
 /** Read-only modes (DD-10), enforced twice: at the session and at the prompt. */
 const READ_ONLY_PERMISSIONS: readonly PermissionRule[] = Object.freeze([
   { permission: "edit", pattern: "**", action: "deny" },
@@ -123,6 +142,11 @@ export interface WorkerManagerOptions {
   readonly budgetPollMs?: number;
   /** How long to wait for the terminal event after an abort before giving up. */
   readonly abortGraceMs?: number;
+  /**
+   * Minimum quiet period between a session's terminal event and the next prompt
+   * to it. See {@link WorkerManager.promptTurn} for why this is not zero.
+   */
+  readonly retrySettleMs?: number;
   /**
    * Re-run the brief's test command after a worker completes (§4.3's
    * "manager re-ran independently"). On when a spec supplies a command.
@@ -182,6 +206,27 @@ class ManagedWorker {
   abortIntent: AbortIntent | undefined;
   /** An abort we did not ask for still has to be distinguished from a clean end. */
   sawAbort = false;
+  /** This turn's instruction, kept so a turn can be re-sent unchanged. */
+  lastPromptText = "";
+  /** Was this turn's reply schema-constrained? */
+  usedFormat = false;
+  /** One retry without the constraint, at most, per worker. */
+  formatRetried = false;
+  /** Set when a re-send is pending; cleared when it goes out. */
+  retryAt: number | undefined;
+  /**
+   * Has the turn we most recently prompted actually begun?
+   *
+   * Terminal events are session-scoped, not prompt-scoped, so an idle carries no
+   * evidence about *which* turn it ends. A turn that fails emits two of them
+   * (measured ~30ms apart on OpenCode 1.18.25), and a run loop that re-prompts
+   * on the first one reads the second as its new turn finishing instantly — with
+   * an empty reply, which then looks like a worker that did nothing. So a turn
+   * is only allowed to end once something proved it started.
+   */
+  turnStarted = false;
+  /** When this session last went terminal. Gates how soon it can be re-prompted. */
+  lastTerminalAt: number | undefined;
   lastError: OpenCodeError | undefined;
   answer: ((outcome: AnswerOutcome) => void) | undefined;
   /** Settled by {@link WorkerManager.answer} once the follow-up prompt is away. */
@@ -211,6 +256,14 @@ export class WorkerManager {
     budget: WorkerBudget;
   };
   private readonly workers = new Map<string, ManagedWorker>();
+  /**
+   * Does this backend's provider actually support schema-constrained replies?
+   *
+   * Starts optimistic and latches off the first time a provider rejects the
+   * request, so exactly one worker pays for the discovery rather than all of
+   * them. See ADR-0002 and `docs/phase0-facts.md` §3.
+   */
+  private structuredOutputOK: boolean;
   private repoRootResolved: string | undefined;
   private worktreeRootResolved: string | undefined;
   private halted = false;
@@ -228,11 +281,13 @@ export class WorkerManager {
       tickMs: options.tickMs ?? 1_000,
       budgetPollMs: options.budgetPollMs ?? 15_000,
       abortGraceMs: options.abortGraceMs ?? 10_000,
+      retrySettleMs: options.retrySettleMs ?? 2_000,
       verifyTests: options.verifyTests ?? true,
       structuredOutput: options.structuredOutput ?? true,
       now: options.now ?? Date.now,
       newWorkerID: options.newWorkerID ?? (() => `w-${(++this.seq).toString().padStart(3, "0")}`),
     };
+    this.structuredOutputOK = this.opts.structuredOutput;
   }
 
   // --- public surface -----------------------------------------------------
@@ -496,7 +551,7 @@ export class WorkerManager {
       cwd: wt.path,
       title: rec.workerID,
       model: rec.model,
-      permissions: rec.mode === "implement" ? HEADLESS_PERMISSIONS : READ_ONLY_PERMISSIONS,
+      permissions: rec.mode === "implement" ? IMPLEMENT_PERMISSIONS : READ_ONLY_PERMISSIONS,
     });
     w.session = session;
     this.update(w, { sessionID: session.sessionID });
@@ -521,16 +576,57 @@ export class WorkerManager {
     return this.pump(w);
   }
 
+  /**
+   * Send one turn to the worker's session.
+   *
+   * The wait at the top is not caution, it is a measured requirement. On
+   * OpenCode 1.18.25 a prompt sent within a few tens of milliseconds of the
+   * session's previous terminal event is **accepted with HTTP 204 and then
+   * silently dropped** — no busy status, no work, no error. The run loop sees a
+   * worker that was asked to continue and did nothing, and waits until the idle
+   * watchdog calls it wedged. Measured directly: re-prompting 26ms after a
+   * terminal produced nothing in the following 57 seconds; the same prompt sent
+   * later on the same session ran normally.
+   *
+   * Both paths that re-prompt an existing session go through here — the
+   * structured-output retry and §5's blocked→resume — so the rule is stated once.
+   */
   private async promptTurn(w: ManagedWorker, text: string): Promise<void> {
     const rec = w.record.current;
+    if (w.lastTerminalAt !== undefined) {
+      const quiet = this.opts.now() - w.lastTerminalAt;
+      if (quiet < this.opts.retrySettleMs) await sleepMs(this.opts.retrySettleMs - quiet);
+    }
+    w.lastPromptText = text;
+    w.usedFormat = this.structuredOutputOK;
+    w.turnStarted = false;
     await this.opts.backend.prompt(w.session!, {
       text,
       ...(w.brief?.system === undefined ? {} : { system: w.brief.system }),
       ...(rec.mode === "implement" ? {} : { tools: READ_ONLY_TOOLS }),
-      ...(this.opts.structuredOutput
+      ...(w.usedFormat
         ? { format: { type: "json_schema" as const, schema: REPORT_SCHEMA, retryCount: REPORT_RETRY_COUNT } }
         : {}),
     });
+  }
+
+  /**
+   * Re-send the current turn with the schema constraint dropped.
+   *
+   * Verified on OpenCode 1.18.25: `format: {type: "json_schema"}` is implemented
+   * by forcing a tool call, and a provider that only accepts `tool_choice: auto`
+   * rejects the whole request — the free-tier model this project defaults to is
+   * one of them. The schema was never the contract, only its enforcement; the
+   * brief already states the contract in words and the parser was written to be
+   * lied to. So the constraint is a bonus where it works, not a dependency.
+   */
+  private async retryWithoutFormat(w: ManagedWorker): Promise<void> {
+    w.retryAt = undefined;
+    w.replyText = "";
+    w.replyTruncated = false;
+    w.sawAbort = false;
+    w.lastWorkerEventAt = this.opts.now();
+    await this.promptTurn(w, w.lastPromptText);
   }
 
   /**
@@ -593,6 +689,12 @@ export class WorkerManager {
     // idle timer, or a hung worker on a healthy server looks busy forever.
     if (isWorkerEvent(e)) w.lastWorkerEventAt = this.opts.now();
 
+    // Evidence that the turn we prompted is under way. `busy` is the explicit
+    // signal; real work arriving is the implicit one.
+    if ((e.kind === "status" && e.busy) || e.kind === "tool" || e.kind === "text" || e.kind === "file.edited" || e.kind === "diff") {
+      w.turnStarted = true;
+    }
+
     if (e.kind === "text") {
       if (w.replyText.length < MAX_REPLY_CHARS) w.replyText += e.delta;
       else w.replyTruncated = true;
@@ -624,15 +726,42 @@ export class WorkerManager {
         w.sawAbort = true;
         return undefined;
       }
+      if (w.usedFormat && !w.formatRetried && (e.error.code === "api" || e.error.code === "structured_output")) {
+        // The provider refused the constrained request. Latch it off for every
+        // later worker and re-send this turn plainly, once. Settling here would
+        // fail a worker for a capability it never needed.
+        w.formatRetried = true;
+        this.structuredOutputOK = false;
+        w.retryAt = this.opts.now();
+        this.opts.store.appendEvent(w.record.current.workerID, "structured_output_unsupported", {
+          code: e.error.code,
+          message: e.error.message.slice(0, 300),
+        });
+        return undefined;
+      }
       w.lastError = e.error;
       return { kind: "failed", reason: `worker_error_${e.error.code}`, error: e.error };
     }
 
     if (e.kind === "idle") {
+      w.lastTerminalAt = this.opts.now();
+      if (!w.turnStarted && !w.abortIntent) {
+        // A terminal event for a turn that is already over. Ignoring it is the
+        // difference between resuming a worker and silently completing it empty.
+        this.opts.store.appendEvent(w.record.current.workerID, "stale_terminal_ignored", {});
+        return undefined;
+      }
+      w.turnStarted = false;
       const intent = w.abortIntent;
       if (intent) {
         w.abortIntent = undefined;
         return this.applyIntent(w, intent);
+      }
+      if (w.retryAt !== undefined) {
+        // The failed turn's terminal event. Now the session is free to be
+        // re-prompted without the constraint that broke it.
+        await this.retryWithoutFormat(w);
+        return undefined;
       }
       if (w.sawAbort) {
         w.sawAbort = false;
@@ -729,6 +858,13 @@ export class WorkerManager {
         this.opts.store.appendEvent(w.record.current.workerID, "abort_grace_expired", { reason: intent.reason });
         return this.applyIntent(w, intent);
       }
+      return undefined;
+    }
+
+    if (w.retryAt !== undefined && now - w.retryAt > this.opts.abortGraceMs) {
+      // No terminal event followed the rejection. Re-send anyway rather than
+      // sitting here until the idle watchdog calls it a wedged worker.
+      await this.retryWithoutFormat(w);
       return undefined;
     }
 
@@ -950,7 +1086,7 @@ export class WorkerManager {
     if (w.replyTruncated) issues.push("the worker's reply was truncated by the manager before parsing");
 
     const fromReply = parseReport(w.replyText);
-    if (fromReply.report) return { report: fromReply.report, issues: [...issues, ...fromReply.issues], source: "structured_output" };
+    if (fromReply.report) return { report: fromReply.report, issues: [...issues, ...fromReply.issues], source: "reply" };
 
     const file = w.record.current.worktree ? readReportFile(w.record.current.worktree) : null;
     if (file) {
@@ -1013,6 +1149,8 @@ export class WorkerManager {
 }
 
 // ---------------------------------------------------------------------------
+
+const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** A cancellable tick, so a racing watchdog does not leave a timer per event. */
 function delay(ms: number): { promise: Promise<{ t: "tick" }>; cancel: () => void } {
