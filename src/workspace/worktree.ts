@@ -183,9 +183,18 @@ export interface Snapshot {
  * repository content to execute in the manager's process.
  */
 export async function snapshotCommit(worktree: string, message: string): Promise<Snapshot> {
-  await git(worktree, ["add", "-A", "--", ".", ...EXCLUDE_PATHSPECS]);
-  const staged = await git(worktree, ["diff", "--cached", "--name-only"]);
-  const files = splitLines(staged.stdout);
+  // Stage everything, then unstage the orchestrator's own files. Naming them in
+  // an `add` pathspec looks tidier and is not equivalent: git rejects a pathspec
+  // that explicitly matches an ignored path, and `.orchestrator/` is ignored
+  // precisely so the worker never sees it. Unstaging afterwards holds whether or
+  // not the ignore entry was written.
+  await git(worktree, ["add", "-A", "--", "."]);
+  let files = splitLines((await git(worktree, ["diff", "--cached", "--name-only"])).stdout);
+  const ours = files.filter(isExcluded);
+  if (ours.length > 0) {
+    await git(worktree, ["reset", "-q", "--", ...ours]);
+    files = files.filter((f) => !isExcluded(f));
+  }
   if (files.length === 0) return { committed: false, files: [] };
   await git(worktree, ["commit", "--no-verify", "--no-gpg-sign", "-m", message]);
   return { committed: true, sha: await resolveSha(worktree, "HEAD"), files };

@@ -17,6 +17,8 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import type { Socket } from "node:net";
 
@@ -46,6 +48,20 @@ export interface OCMockOptions {
   /** Cost added per prompt. Default 0 — free-tier behaviour, deliberately. */
   readonly costPerPrompt?: number;
   readonly version?: string;
+  /**
+   * The report the "worker" replies with, streamed as text the way a real
+   * schema-constrained reply arrives. `null` means it says nothing, which is
+   * itself a case the manager has to survive.
+   */
+  readonly report?: unknown;
+  /**
+   * Actually create files in the session's directory.
+   *
+   * Off by default because most adapter tests do not care. On, the mock leaves a
+   * real diff behind — which is what makes a *truthful* report distinguishable
+   * from a lying one, rather than both looking like an empty worktree.
+   */
+  readonly writeFiles?: boolean;
 }
 
 export interface RecordedRequest {
@@ -75,6 +91,8 @@ interface MockSession {
   timers: Set<NodeJS.Timeout>;
   /** `lying_report`: what the worker claimed, for Phase 2 to cross-check. */
   claim?: string;
+  /** Per-session reply, overriding the mock-wide default. */
+  report?: unknown;
   prompts: unknown[];
 }
 
@@ -94,6 +112,8 @@ const DEFAULTS = {
   burnPerTickTokens: 5000,
   costPerPrompt: 0,
   version: "1.18.25-ocmock",
+  report: null as unknown,
+  writeFiles: false,
 };
 
 let evtSeq = 0;
@@ -155,6 +175,18 @@ export class OCMock {
   setScenario(sessionID: string, scenario: Scenario): void {
     const s = this.sessions.get(sessionID);
     if (s) s.scenario = scenario;
+  }
+
+  /**
+   * Set what this session replies with on its next turn.
+   *
+   * The blocked -> answer -> resume path needs a worker that says one thing and
+   * then, having been answered, says another; scripting the reply per turn is
+   * the smallest way to reproduce that.
+   */
+  setReport(sessionID: string, report: unknown): void {
+    const s = this.sessions.get(sessionID);
+    if (s) s.report = report;
   }
 
   /** `blocked`: answer the outstanding request so the run resumes and finishes. */
@@ -282,6 +314,7 @@ export class OCMock {
       running: false,
       timers: new Set(),
       prompts: [],
+      ...(this.opts.report === null || this.opts.report === undefined ? {} : { report: this.opts.report }),
     };
     this.sessions.set(id, session);
     this.emit(session, "session.updated", { sessionID: id, info: serialize(session) });
@@ -310,18 +343,27 @@ export class OCMock {
       switch (session.scenario) {
         case "success":
           this.work(session);
+          this.reply(session);
           this.finish(session, this.opts.workMs);
           return;
         case "lying_report":
           // Claims edits; the diff says otherwise. That gap is the whole point.
-          session.claim = "Updated src/index.ts and added tests.";
-          this.emit(session, "message.part.delta", {
-            sessionID: session.id,
-            messageID: "msg_ocmock",
-            partID: "prt_ocmock",
-            field: "text",
-            delta: session.claim,
+          // The claim is a well-formed report, because the interesting failure is
+          // not a malformed reply — it is a perfectly valid one that is false.
+          session.claim = JSON.stringify({
+            workerId: session.title ?? "w-lying",
+            status: "completed",
+            summary: "Updated src/index.ts and added tests.",
+            changes: [
+              { file: "src/index.ts", action: "modified", rationale: "refactored the entry point" },
+              { file: "test/index.test.ts", action: "added", rationale: "coverage for the refactor" },
+            ],
+            tests: { command: "npm test", passed: 12, failed: 0, skipped: 0 },
+            risks: [],
+            questions: [],
+            followUps: [],
           });
+          this.emitText(session, session.claim);
           this.emit(session, "session.diff", { sessionID: session.id, diff: [] });
           this.finish(session, this.opts.workMs);
           return;
@@ -368,6 +410,27 @@ export class OCMock {
     });
   }
 
+  /** Stream whatever this session is scripted to reply, as a real one would. */
+  private reply(session: MockSession): void {
+    const report = session.report ?? null;
+    if (report === null) return;
+    session.claim = typeof report === "string" ? report : JSON.stringify(report);
+    this.emitText(session, session.claim);
+  }
+
+  /** Text arrives as deltas, in pieces, because that is how it really arrives. */
+  private emitText(session: MockSession, text: string): void {
+    for (let i = 0; i < text.length; i += 64) {
+      this.emit(session, "message.part.delta", {
+        sessionID: session.id,
+        messageID: "msg_ocmock",
+        partID: "prt_ocmock",
+        field: "text",
+        delta: text.slice(i, i + 64),
+      });
+    }
+  }
+
   private work(session: MockSession): void {
     this.emit(session, "message.part.updated", {
       sessionID: session.id,
@@ -382,6 +445,15 @@ export class OCMock {
         state: { status: "completed", input: {}, output: "ok", title: "hello.txt", metadata: {}, time: {} },
       },
     });
+    if (this.opts.writeFiles) {
+      // A real file, so `git diff` has something to agree or disagree with.
+      try {
+        mkdirSync(session.directory, { recursive: true });
+        writeFileSync(join(session.directory, "hello.txt"), "hello from ocmock\n");
+      } catch {
+        /* the test did not give us a real directory; the events are the point */
+      }
+    }
     this.emit(session, "file.edited", { file: `${session.directory}/hello.txt` });
     session.summary = { additions: 1, deletions: 0, files: 1 };
     this.emit(session, "session.diff", { sessionID: session.id, diff: [{ file: "hello.txt" }] });

@@ -1,0 +1,10 @@
+{
+  "name": "golden-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The golden repo (projectplan.md §12): a small npm project with real tests.",
+  "scripts": {
+    "test": "node --test test/checks.mjs"
+  }
+}

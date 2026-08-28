@@ -184,6 +184,8 @@ class ManagedWorker {
   sawAbort = false;
   lastError: OpenCodeError | undefined;
   answer: ((outcome: AnswerOutcome) => void) | undefined;
+  /** Settled by {@link WorkerManager.answer} once the follow-up prompt is away. */
+  resumeSignal: { resolve: () => void; reject: (e: unknown) => void } | undefined;
   readonly waiters = new Set<() => void>();
   done: Promise<void> | undefined;
 
@@ -341,8 +343,15 @@ export class WorkerManager {
       throw new Error(`worker ${workerID} is ${w.machine.state}, not blocked; nothing is waiting for an answer`);
     }
     this.opts.store.appendEvent(workerID, "answered", { chars: text.length });
+    // Resolve only once the worker is running again. A caller that got the
+    // record back while it still said `blocked` would poll, see a settled state
+    // and conclude the answer had been ignored.
+    const resumed = new Promise<void>((resolve, reject) => {
+      w.resumeSignal = { resolve, reject };
+    });
     w.answer({ kind: "answer", text });
     w.answer = undefined;
+    await resumed;
     return w.record.current;
   }
 
@@ -354,9 +363,11 @@ export class WorkerManager {
     if (w.answer) {
       w.answer({ kind: "cancel" });
       w.answer = undefined;
-      return w.record.current;
+    } else {
+      await this.requestAbort(w, { disposition: "cancelled", reason, at: this.opts.now() });
     }
-    await this.requestAbort(w, { disposition: "cancelled", reason, at: this.opts.now() });
+    // Return when it has genuinely stopped, not when the request was sent.
+    await w.done;
     return w.record.current;
   }
 
@@ -538,7 +549,20 @@ export class WorkerManager {
       if (this.halted) return { kind: "cancelled", reason: "manager_halted" };
       pending ??= it.next();
       const tick = delay(this.opts.tickMs);
-      const winner = await Promise.race([pending.then((r) => ({ t: "event" as const, r })), tick.promise]);
+      let winner: { t: "event"; r: IteratorResult<OCEvent> } | { t: "tick" };
+      try {
+        winner = await Promise.race([pending.then((r) => ({ t: "event" as const, r })), tick.promise]);
+      } catch (e) {
+        // The subscription broke rather than ending. Same question as below: is
+        // the worker gone, or the server? Only one of those is the worker's.
+        tick.cancel();
+        const health = await this.opts.backend.health();
+        return {
+          kind: "failed",
+          reason: health.alive ? "stream_error" : "server_gone",
+          ...(e instanceof OpenCodeError ? { error: e } : {}),
+        };
+      }
       tick.cancel();
 
       if (winner.t === "tick") {
@@ -676,9 +700,17 @@ export class WorkerManager {
     w.sawAbort = false;
     w.resumes += 1;
     w.lastWorkerEventAt = this.opts.now();
-    await this.promptTurn(w, buildAnswerPrompt(questions, outcome.text));
+    try {
+      await this.promptTurn(w, buildAnswerPrompt(questions, outcome.text));
+    } catch (e) {
+      w.resumeSignal?.reject(e);
+      w.resumeSignal = undefined;
+      throw e;
+    }
     w.machine.apply("resume");
     this.update(w, { state: "running", resumes: w.resumes, questions: [] });
+    w.resumeSignal?.resolve();
+    w.resumeSignal = undefined;
     return undefined;
   }
 
