@@ -30,7 +30,6 @@
  *    fault and is not reported as its timeout.
  */
 
-import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -881,7 +880,10 @@ export class WorkerManager {
       // the worker's fault.
       const health = await this.opts.backend.health();
       if (!health.alive) {
-        return { kind: "failed", reason: "server_gone", ...(health.detail ? {} : {}) };
+        this.opts.store.appendEvent(w.record.current.workerID, "server_gone", {
+          detail: health.detail ?? "health check reported not alive",
+        });
+        return { kind: "failed", reason: "server_gone" };
       }
       await this.requestAbort(w, { disposition: "timed_out", reason: "idle_watchdog", at: now });
       return undefined;
