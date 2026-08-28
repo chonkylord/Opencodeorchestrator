@@ -14,7 +14,8 @@ against a live server; the backend decision is recorded.
 - [`docs/adr/0001-serve-vs-run-backend.md`](docs/adr/0001-serve-vs-run-backend.md) — ServeBackend accepted, with costs
 - [`docs/phase0-facts.md`](docs/phase0-facts.md) — verified API facts, and what is still unresolved
 
-Phase 1 (the OpenCode adapter) is next.
+**Phase 1 (the OpenCode adapter) is next** — the handoff prompt is
+[`docs/handoff-phase1.md`](docs/handoff-phase1.md).
 
 ## Requirements
 
