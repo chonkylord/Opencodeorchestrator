@@ -1,6 +1,11 @@
 # Phase 0 — OpenCode fact sheet
 
-**OpenCode version:** `1.18.23` · **Verified:** 2026-08-28 · **Reproduce:** `bun run spike/spike.ts`
+**OpenCode version:** `1.18.23`, re-verified green on `1.18.25` · **Verified:** 2026-08-28 · **Reproduce:** `bun run spike/spike.ts`
+
+**Phase 1 additions.** Rows marked **verified (phase 1)** were established while building the
+adapter (`src/opencode/`), either from the OpenAPI document or on the wire. Two Phase 0
+rows were wrong or incomplete and have been corrected in place rather than appended to —
+see `Corrected in Phase 1` in the detail column.
 
 Every row marked **verified** was observed on a live `opencode serve` process in this
 repository, not read from documentation. Rows marked **unresolved** are still open —
@@ -16,7 +21,8 @@ they are listed in full at the bottom rather than quietly omitted.
 | Startup time | **verified** | ~1.3 s to "listening". |
 | First-prompt cold start | **verified** | The first prompt on a fresh server triggers a burst of ~45 `plugin.added` events plus `catalog.updated` before generation begins. Pre-warm the server; don't attribute this latency to the worker. |
 | Auth | **verified** | Server warns `OPENCODE_SERVER_PASSWORD is not set; server is unsecured`. Set it (with `OPENCODE_SERVER_USERNAME`) before binding anything but loopback. |
-| OpenAPI spec | **verified** | Served at `GET /doc` (~479 KB, 162 paths). Treat it as the contract source and diff it on version bumps to catch drift. |
+| OpenAPI spec | **verified** | Served at `GET /doc` (~479 KB, 162 paths, 472 schemas). Treat it as the contract source and diff it on version bumps to catch drift. **Not exhaustive** — see the `server.heartbeat` row in §4. |
+| Session-independent liveness probe | **verified (phase 1)** | `GET /global/health` → `{healthy: true, version}`; `GET /api/health` → `{healthy}`. Cheap, needs no session, and is the other half of telling "the server died" from "the worker wedged" (§4). The adapter exposes it as `OpenCodeBackend.health()`. |
 
 ## 2. Sessions
 
@@ -34,7 +40,8 @@ they are listed in full at the bottom rather than quietly omitted.
 | Fact | Status | Detail |
 |---|---|---|
 | Async prompt | **verified** | `POST /session/{id}/prompt_async` returns **HTTP 204** in ~30 ms and runs the work in the background. DD-1's spawn-and-poll pattern is native, not a workaround. |
-| Model selection | **verified** | Body takes `model: {providerID, modelID}` — split `"opencode/muse-spark-1.2-contributor-free"` on the **first** `/` only. |
+| Model selection | **verified** | `prompt_async` body takes `model: {providerID, modelID}` — split `"opencode/muse-spark-1.2-contributor-free"` on the **first** `/` only (model ids contain slashes; `openrouter/meta-llama/llama-3` is provider `openrouter`). |
+| **`POST /session` and `prompt_async` disagree on the model shape** | **verified (phase 1)** | Create wants `model: {providerID, id, variant?}`. `prompt_async` wants `model: {providerID, modelID}`. Same concept, two field names. Sending the prompt shape to create is **accepted and silently ignored** — the session keeps the default model and nothing warns you. `ServeBackend` translates per endpoint; anything else talking to `/session` must too. |
 | Per-prompt overrides | **verified (schema)** | `prompt_async` also accepts `agent`, `system`, `tools` (per-tool enable map), `variant` (reasoning effort), and `format`. |
 | Structured output | **verified (schema)** | `format: {type: "json_schema", schema, retryCount}` — the model's reply can be schema-constrained **and retried on violation** by OpenCode itself. This is a materially better way to enforce the §4.2 report contract than asking for a file and hoping. |
 | Abort | **verified (schema)** | `POST /session/{id}/abort` → boolean. |
@@ -46,9 +53,11 @@ they are listed in full at the bottom rather than quietly omitted.
 | **Streams are directory-scoped** | **verified** | `GET /event` delivers **nothing** for a session opened in another directory. You must subscribe to `GET /event?directory=<same abs path used at session create>`. Measured side by side: unscoped saw no `session.idle` in 90 s; scoped saw it at 10.9 s. **This is a silent hang, not an error** — it cost an hour here and would have cost more in Phase 1. |
 | Completion signal | **verified** | `session.idle` — `{id: "evt_…", type: "session.idle", properties: {sessionID}}`. Observed 10.9–11.3 s after prompt on a trivial task. |
 | Subscribe before prompting | **verified** | Work can finish in ~11 s; establish the stream first or risk missing the event entirely. |
-| Event vocabulary | **verified** | 89 variants in the spec. Ones that matter: `session.idle`, `session.status` (`{type:"busy"}`), `session.error`, `session.diff`, `message.part.updated` (carries tool state `pending`/`running`/`completed`), `message.part.delta`, `permission.asked`/`replied`, `question.asked`/`replied`/`rejected`, `file.edited`, `worktree.ready`/`failed`. |
-| Server liveness | **verified** | `server.heartbeat` arrives on the stream during long runs. The §5 idle watchdog should key off *worker* events, not stream silence — a heartbeat with no worker events means the worker is stuck; no heartbeat means the server is gone. Different failures, different responses. |
-| Typed errors | **verified (schema)** | `session.error` carries a discriminated union: `ProviderAuthError`, `MessageOutputLengthError`, `MessageAbortedError`, `StructuredOutputError`, `ContextOverflowError`, `ContentFilterError`, `APIError`. Map these to worker terminal states directly rather than string-matching. |
+| Event vocabulary | **verified** | The spec's `Event` union has 89 members. Ones that matter: `session.idle`, `session.status` (`{type: "idle" \| "busy" \| "retry"}`), `session.error`, `session.diff`, `message.part.updated` (carries tool state `pending`/`running`/`completed`/`error`), `message.part.delta`, `permission.asked`/`replied` (plus `permission.v2.*`), `question.asked`/`replied`/`rejected` (plus `question.v2.*`), `file.edited`, `worktree.ready`/`failed`. Note `*.asked` keys the request id as `id` while the matching `*.replied` keys it as `requestID`. |
+| Server liveness | **verified** · *corrected in Phase 1* | `server.heartbeat` arrives **every 10.0 s, on every subscription, whether or not anything is running** — measured over 75 s on an idle server, not merely "during long runs". It is **not in the spec's `Event` union**: the 89 documented members do not include it, so the spec is not an exhaustive list of what arrives on the wire and an adapter must tolerate unlisted types rather than reject them. The §5 idle watchdog keys off *worker* events, not stream silence: heartbeats with no worker events = the worker is stuck; no heartbeats = the server is gone. Different failures, different responses. |
+| First frame is `server.connected` | **verified (phase 1)** | Every subscription opens with `{type: "server.connected", properties: {}}` before anything else. A usable "the stream is live" signal, distinct from the HTTP headers arriving. |
+| Two envelope shapes in the spec | **verified (phase 1)** | The live `/event` stream puts the payload under `properties`. The spec *also* defines `data`-keyed variants of the same event types (the durable event log, with `durable`/`metadata`/`location` siblings). Only `properties` has been seen on `/event`; reading both costs nothing and removes a silent-hang class from a future version bump. |
+| Typed errors | **verified (schema)** · *corrected in Phase 1* | `session.error` carries a discriminated union of **eight** members — the Phase 0 list omitted `UnknownError`: `ProviderAuthError`, `MessageOutputLengthError`, `MessageAbortedError`, `StructuredOutputError`, `ContextOverflowError`, `ContentFilterError`, `APIError`, `UnknownError`. Dispatch on `name`, never on message text. `APIError.data.isRetryable` is authoritative for retry decisions. Aborting a session produces `MessageAbortedError` **followed by** `session.idle` — both arrive, in that order. |
 
 ## 5. Agents, config & permissions
 
@@ -77,7 +86,17 @@ None of these are drop-in replacements for §6's gated merge, but building git p
 ## Unresolved — carry into Phase 1
 
 1. **Claude Code's MCP tool-call timeout.** The instrument is built (`orchestrator_timeout_probe`) and verified working over real JSON-RPC, but the measurement requires the server registered in a live Claude Code session. It cannot be taken from inside this container. *Run it before finalizing the `worker_wait` ≤30 s cap.*
-2. **Concurrency.** One serve process with 4+ simultaneous sessions was never exercised. §14 Q5 stands.
+2. ~~**Concurrency.** One serve process with 4+ simultaneous sessions was never exercised.~~
+   **Resolved in Phase 1 — yes, at 4.** `test/e2e/serve.e2e.test.ts` (`OC_E2E=1
+   OC_E2E_CONCURRENCY=1`) runs four sessions in four git worktrees on one server
+   simultaneously. All four completed, all four wrote the file they were asked for,
+   and **no stream carried another session's events** — the per-directory
+   subscriptions really do isolate. Wall clock per worker: 15.3 s, 15.9 s, 20.3 s,
+   20.4 s, against a single-session baseline of 10.9–11.3 s on the same model and
+   the same trivial task. So ~1.4–1.9× latency for 4× the work: sublinear, no
+   failures, no interference. **Caveat: one run, four sessions, one free-tier
+   model.** It does not speak to 8+, to paid providers under rate limits, or to
+   long-running workers; re-measure before raising the §5 concurrency cap past 4.
 3. **`AGENTS.md` pickup.** A file was placed in the worktree but the model was never asked to prove it read it. Verify with a marker string before relying on it to carry the task brief — and note that per-prompt `system` may be the better channel regardless.
 4. **`cost` on paid providers.** Only free-tier models were exercised here (`cost: 0` throughout). Confirm `cost` populates on a paid provider before building dollar-denominated budgets.
 5. **`RunBackend` parity.** `opencode run` exposes `--session`, `--format json`, `--agent`, `--model`, `--variant`, `--attach`, `--auto`. The flags exist; the fallback path was not built or exercised.

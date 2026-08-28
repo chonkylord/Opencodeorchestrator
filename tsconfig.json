@@ -6,9 +6,18 @@
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
-    "types": ["node"],
-    "lib": ["ES2023"],
+    "types": [
+      "node",
+      "bun"
+    ],
+    "lib": [
+      "ES2023"
+    ],
     "noEmit": true
   },
-  "include": ["spike/**/*.ts", "src/**/*.ts"]
+  "include": [
+    "spike/**/*.ts",
+    "src/**/*.ts",
+    "test/**/*.ts"
+  ]
 }

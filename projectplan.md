@@ -64,17 +64,36 @@ MCP Server (the orchestrator — this product)
 
 The only code that knows OpenCode exists. Two backends behind one interface:
 
+**Built in Phase 1** — `src/opencode/`. The shipped interface, with the six places
+the original sketch could not survive contact with OpenCode marked; each deviation
+is argued at its definition in [`src/opencode/types.ts`](src/opencode/types.ts).
+
 ```ts
 interface OpenCodeBackend {
+  readonly kind: "serve" | "run"
   start(): Promise<void>
-  createSession(opts: { cwd: string; model?: string; agent?: string }): Promise<SessionHandle>
-  prompt(sessionId: string, text: string): Promise<RunHandle>
-  events(sessionId: string): AsyncIterable<OCEvent>   // SSE-backed
-  abort(runId: string): Promise<void>
-  usage(sessionId: string): Promise<Usage | null>     // tokens/cost if exposed
+  health(): Promise<BackendHealth>                                  // [5] added
+  createSession(opts: CreateSessionOptions): Promise<SessionHandle> // [3] agent != custom agent file
+  prompt(session: SessionRef, req: PromptRequest): Promise<RunHandle>
+  events(session: SessionRef, opts?): Promise<EventStream>          // [1] dir-scoped [4] eager
+  abort(target: SessionRef): Promise<boolean>                       // [6] session-, not run-scoped
+  usage(session: SessionRef): Promise<Usage | null>
   dispose(): Promise<void>
 }
 ```
+
+1. **Sessions are addressed by `{sessionID, directory}`, not a bare id.** SSE streams
+   are directory-scoped; a subscription on the wrong directory delivers nothing, with
+   no error. Carrying the directory in the type makes that structural.
+2. **`RunHandle.runID` is minted by the adapter.** `prompt_async` answers `204` with an
+   empty body — OpenCode never issues a run id.
+3. **`agent` means a *built-in* agent.** The worker contract goes in `PromptRequest.system`;
+   custom agent files are discovered only at server start, from the server's own cwd.
+4. **`events()` returns a promise of an *open* stream**, not a lazy `AsyncIterable`, so
+   "subscribe before you prompt" is what the natural code does.
+5. **`health()` is new.** The §5 watchdog cannot tell a stuck worker from a dead server
+   by stream silence alone; this plus `isWorkerEvent()` is how it does.
+6. **`abort` is session-scoped.** OpenCode has no per-run abort.
 
 - **`ServeBackend`** (default): starts/connects `opencode serve` (**`--port` defaults to `0` = random; parse the port from stdout — never assume 4096**), and subscribes to the SSE event stream **per worktree** (`GET /event?directory=…`) for completion detection.
 - **`RunBackend`** (fallback): spawns `opencode run` subprocesses per prompt; more isolation, simpler, but weaker eventing.
@@ -335,12 +354,23 @@ Validate every uncertain OpenCode fact before committing to architecture:
 **Deliverable:** decision record choosing Serve vs Run backend; documented API facts; MCP scaffolding works.
 **AC:** a script creates a session, prompts it to create a file, verifies the file, and captures the completion event.
 
-### Phase 1 — OpenCode adapter (3–4 days)
+### Phase 1 — OpenCode adapter ✅ COMPLETE
+
+> Outcome: [`src/opencode/`](src/opencode/) — [`types.ts`](src/opencode/types.ts) (the interface and its six documented deviations from the §3.1 sketch), [`serve.ts`](src/opencode/serve.ts) (`ServeBackend`), [`run.ts`](src/opencode/run.ts) (`RunBackend`, a deliberate stub per ADR-0001), [`index.ts`](src/opencode/index.ts) (the barrel — the only import path anything else may use). Tests: [`test/ocmock/`](test/ocmock/) (scriptable fake server, all five §12 scenarios plus the lying-report hook) and [`test/`](test/) — 56 unit tests green, plus one integration test green against real OpenCode 1.18.25 behind `OC_E2E=1`. `bun run spike` still green. §14 Q5 (concurrency) is resolved on the way past; see the fact sheet.
 
 - Implement `OpenCodeBackend` + `ServeBackend` (+ `RunBackend` stub if time).
 - Config injection: model, agent, permissions, cwd.
 
-**AC:** adapter unit tests pass against `ocmock`; one integration test passes against real OpenCode.
+**AC met:** `bun test` (56 pass) against `ocmock`; `OC_E2E=1 bun test test/e2e` passes against a real `opencode serve`.
+
+Two things worth knowing before Phase 2 builds on this:
+
+- **`events()` hands back a shared, explicitly-closed subscription.** Breaking out of a
+  `for await` does *not* end it — that is what makes the blocked→answer→resume path in §5
+  a single stream rather than three. Call `close()`, or let `dispose()` do it.
+- **The boundary is enforced, not just asserted.** `test/opencode/boundary.test.ts` fails
+  if anything outside `src/opencode/` names an endpoint, parses an OpenCode event type, or
+  imports past the barrel.
 
 ### Phase 2 — Worker manager core (3–4 days)
 
@@ -419,7 +449,7 @@ Model-routing presets with automatic selection, worker priorities, smarter summa
 2. ~~Exact SSE event shapes for run completion?~~ **Resolved:** `session.idle`, `{id, type, properties:{sessionID}}` — and the stream is **directory-scoped**. Serve-vs-run parity still unverified.
 3. ~~Session resume semantics?~~ **Resolved:** yes, context is retained across prompts to the same session.
 4. ~~Permission config granularity — sufficient for headless?~~ **Resolved:** yes — inline per-session ruleset, or CLI `--auto`. A full edit+bash run completed with zero pending permission requests.
-5. Can one serve instance handle 4+ concurrent sessions without degradation? **Still open.**
+5. ~~Can one serve instance handle 4+ concurrent sessions without degradation?~~ **Resolved in Phase 1:** yes at 4 — four worktree sessions on one server all completed with no cross-talk, at ~1.4–1.9× single-session latency. One run, one free-tier model; re-measure before going past 4. See `docs/phase0-facts.md`.
 6. Claude Code's actual MCP tool timeout in the target environment? **Still open** — instrument built (`orchestrator_timeout_probe`), measurement requires a live Claude Code session.
 
 Everything above is structured so that wrong answers to any of these change **one adapter file or one config default** — not the architecture.

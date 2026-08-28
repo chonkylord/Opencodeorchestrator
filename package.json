@@ -7,9 +7,12 @@
   "scripts": {
     "spike": "bun run spike/spike.ts",
     "mcp": "bun run src/mcp/server.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:e2e": "OC_E2E=1 bun test test/e2e"
   },
   "devDependencies": {
+    "@types/bun": "^1.4.0",
     "@types/node": "^22.20.1",
     "typescript": "^5.9.3"
   },
