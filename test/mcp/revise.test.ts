@@ -375,6 +375,46 @@ describe("a revised worker merges the commit it produced last", () => {
     const files = git(h.repo, ["ls-tree", "-r", "--name-only", branch]);
     expect(files).toContain("src/second.js");
   }, 60_000);
+
+  test("the overlap warning is computed from the post-revision diff, not the pre-revision one", async () => {
+    // The half of §3's merge argument that does NOT come for free. `mergeOne()`
+    // resolves the branch tip, so the *merge* is current whatever happens; but
+    // `MergeCoordinator.start()` builds the §6.2 overlap warning from
+    // `result.changes.paths`, which is the measurement taken at the previous
+    // settle. It is only current because a revision re-runs `settle()` and
+    // rebuilds the result — which means it depends on the revision settling
+    // before the merge starts, and that is an ordering to pin rather than assume.
+    const h = await harness({ report: claims("Wrote my file.") });
+    const a = idFrom((await call(h.client, "worker_spawn", { task: "worker A", runID: "run-1", ownedPaths: ["src/**"] })).text);
+    const sessionA = await waitForSession(h, a);
+    h.mock.setWrite(sessionA, [{ path: "src/a.js", content: "export const a = 1;\n" }]);
+    await waitSettled(h.client, a);
+
+    const b = idFrom((await call(h.client, "worker_spawn", { task: "worker B", runID: "run-1", ownedPaths: ["src/**"] })).text);
+    const sessionB = await waitForSession(h, b);
+    h.mock.setWrite(sessionB, [{ path: "src/b.js", content: "export const b = 2;\n" }]);
+    await waitSettled(h.client, b);
+
+    // As things stand the two are disjoint — established from the results the
+    // overlap check actually reads, rather than by starting a merge, because a
+    // merge that ran here would leave both workers `merged` and unmergeable.
+    expect((await call(h.client, "worker_result", { id: a })).text).toContain("src/a.js");
+    expect((await call(h.client, "worker_result", { id: a })).text).not.toContain("src/b.js");
+
+    // Now revise A so that it also touches B's file. If the overlap check read
+    // the stale result, it would still call these disjoint.
+    await call(h.client, "worker_revise", { id: a, feedback: "also update src/b.js" });
+    h.mock.setWrite(sessionA, [
+      { path: "src/a.js", content: "export const a = 1;\n" },
+      { path: "src/b.js", content: "export const b = 99; // A got here too\n" },
+    ]);
+    h.mock.setReport(sessionA, claims("Touched b.js as well."));
+    await waitSettled(h.client, a);
+
+    const after = await call(h.client, "workspace_merge", { workerIDs: [a, b], runTests: false, runID: "run-1" });
+    expect(after.text).not.toContain("Overlap: none");
+    expect(after.text).toContain("src/b.js");
+  }, 60_000);
 });
 
 describe("a review worker critiques another worker's diff", () => {
