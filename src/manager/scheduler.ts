@@ -191,6 +191,18 @@ export class Scheduler {
   enqueue(workerID: string, dependsOn: readonly string[]): Promise<Admission> {
     const deps = [...new Set(dependsOn)].filter((id) => id !== workerID);
     this.edges.set(workerID, deps);
+    // A worker being enqueued again is in flight again, so a refusal recorded
+    // in a previous life is stale and must not outlive it.
+    //
+    // This was sound while a refusal was permanent: before Phase 6, only a spawn
+    // could be refused, and a refused spawn settles as `cancelled` and stays
+    // there. A revision re-enqueues a worker that has already settled — and
+    // `cancelled` is revisable — so a worker can now be refused at the queue,
+    // revised again, and complete. Leaving it in `refused` would make
+    // `outcomeOf` keep answering "failed" about a worker that is `completed`,
+    // and the first dependent spawned against it would be rejected with a
+    // message naming its own contradiction.
+    this.refused.delete(workerID);
     // A spawn after `halt()` is a misuse, but it must not be a hang: `pump()`
     // does nothing once halted, so a promise pushed onto the queue here would
     // never settle and `dispose()` would wait for it forever.

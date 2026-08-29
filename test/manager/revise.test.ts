@@ -538,6 +538,40 @@ describe("waiters, cancellation and shutdown during a revision", () => {
     expect(kinds).toContain("revision_abandoned");
   });
 
+  test("a refusal at the queue does not outlive the round it refused", async () => {
+    // Found by re-reading the diff rather than by a failure. The scheduler
+    // remembers refusals so a cascade resolves in one pump, and that was sound
+    // while a refusal was permanent — a refused *spawn* settles as `cancelled`
+    // and stays there. A revision re-enqueues a worker that already settled, and
+    // `cancelled` is revisable, so a worker can now be refused at the queue,
+    // revised again, and complete. A stale refusal would make the scheduler keep
+    // answering "failed" about a `completed` worker, and the next worker to
+    // depend on it would be rejected with a message naming its own
+    // contradiction: "will never complete: w-001 (completed)".
+    const h = await harness({ workMsFor: { "w-002": 4_000 } }, { maxConcurrent: 1 });
+    const id = await settled(h);
+
+    const blocker = await h.manager.spawn(spec({ task: "occupies the slot" }));
+    await waitFor(() => h.manager.get(blocker.workerID)!.state === "running", 4_000, "blocker running");
+
+    h.manager.revise(id, "another pass");
+    expect(h.manager.queueHint(id)).toBeDefined();
+    await h.manager.cancel(id, "never mind");
+    expect(h.manager.get(id)!.state).toBe("cancelled");
+
+    // Revise it again; this time let it run.
+    await h.manager.cancel(blocker.workerID, "make room").catch(() => {});
+    h.manager.revise(id, "actually, do it after all");
+    const revived = await h.manager.wait(id, 12_000);
+    expect(revived.state).toBe("completed");
+
+    // The scheduler must now agree that it completed. Before the fix this threw.
+    const dependent = await h.manager.spawn(spec({ task: "needs it", dependsOn: [id] }));
+    const done = await h.manager.wait(dependent.workerID, 12_000);
+    expect(done.state).toBe("completed");
+    expect(done.reason).toBeUndefined();
+  });
+
   test("a manager that dies mid-revision leaves an interrupted row with its worktree", async () => {
     // A revision leaves the row in `running`, so `recover()` meets it exactly as
     // it meets any mid-flight worker — worth one test rather than one assumption.
