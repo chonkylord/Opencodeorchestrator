@@ -142,6 +142,18 @@ version bump does not invalidate it, and a host upgrade does.
    default of 3 is comfortable on the free tier. **Still unmeasured:** more than
    four, paid providers under rate limits, and workers running for minutes rather
    than seconds. The cap stays at 3 and `ORCHESTRATOR_MAX_CONCURRENT` moves it.
+
+   **Phase 6's v1 demo closed one of those three** (2026-08-29, same build, same
+   free model): **workers running for minutes rather than seconds.** Across five
+   workers and four revision rounds, one worker's revision round ran **212 s** to
+   a clean completion — an order of magnitude past Phase 5's 23.8–48.7 s — with
+   the record touched throughout, no rate limiting and no refused prompt. So the
+   watchdogs and the token polling hold over a multi-minute turn rather than only
+   over a fast one. **Still unmeasured:** more than four concurrent, and paid
+   providers under rate limits. One new caution: a *read-only* worker handed a
+   diff wedged once and hit the idle watchdog at ~14k tokens, and a revision
+   recovered it; whether that is a review-mode-specific stall is not root-caused,
+   and Phase 7's hardening is the natural home.
 3. ~~**`AGENTS.md` pickup.**~~ **Resolved in Phase 2 — yes, it is picked up.** See the row in §5; the probe lives in `test/e2e/manager.e2e.test.ts` behind `OC_E2E=1 OC_E2E_AGENTS=1`. Phase 2 still carries the brief in the per-prompt `system` field, by choice rather than by necessity (ADR-0002).
 4. **`cost` on paid providers.** Still open. Phase 2's budget enforcement was the natural place to settle it and could not: this environment has no paid provider, so every run was free-tier and `cost` was `0` throughout, exactly as before. The manager therefore budgets on `totalTokens` and reports `cost` advisorily (`WorkerResult.usage`), and the §4.3 result line prints tokens whenever cost is `0`. Confirm `cost` populates on a paid provider before building dollar-denominated budgets.
 5. **Replying to a permission or question request in band.** The adapter surfaces `permission.asked` / `question.asked` as normalized events but exposes no way to answer them — Phase 1 did not build one and the endpoint shapes (`…/reply`, `…/reject`) are schema-verified only. Phase 2 works around it: a mid-run ask is converted into an escalation by aborting the turn and delivering Claude's answer as the next prompt to the same session, which keeps its context. Nothing hangs, but a partial turn is lost each time. Add `respond()` to the adapter when the shapes are verified on the wire.
