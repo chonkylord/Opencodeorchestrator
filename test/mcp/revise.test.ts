@@ -14,7 +14,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -69,6 +69,8 @@ interface Harness {
   orchestrator: Orchestrator;
   mock: OCMock;
   repo: string;
+  /** Kept so a test can start a *second* orchestrator over the same database. */
+  config: ServerConfig;
 }
 
 async function harness(
@@ -97,6 +99,8 @@ async function harness(
     verifyTests: false,
     maxConcurrent: 3,
     maxRevisions: 3,
+    maxRetries: 2,
+    runBudgetTokens: 0,
     ...configOver,
   };
   const orchestrator = await createOrchestrator(config, {
@@ -113,7 +117,7 @@ async function harness(
   await Promise.all([orchestrator.server.connect(serverSide), client.connect(clientSide)]);
   cleanup.push(() => client.close());
 
-  return { client, orchestrator, mock, repo: repo.path };
+  return { client, orchestrator, mock, repo: repo.path, config };
 }
 
 function git(cwd: string, args: string[]): string {
@@ -516,6 +520,128 @@ describe("the run report carries the rounds", () => {
     // The table gained a column rather than overloading the existing one.
     expect(report.text).toContain("| revisions |");
   }, 60_000);
+});
+
+describe("§11 Phase 7's tools over the wire", () => {
+  test("worker_budget grants, and its reply says the grant is not a restart", async () => {
+    const h = await harness({ report: claims("Done."), tokensPerPrompt: 8_000 });
+    const spawned = await call(h.client, "worker_spawn", {
+      task: "spend a lot",
+      runID: "run-1",
+      budget: { tokens: 1_000 },
+    });
+    const id = idFrom(spawned.text);
+    await waitSettled(h.client, id);
+    expect((await call(h.client, "worker_status", { ids: [id] })).text).toContain("over_budget");
+
+    // The refusal comes first, and it names the tool that unblocks it.
+    const refused = await call(h.client, "worker_revise", { id, feedback: "carry on" });
+    expect(refused.text).toContain("worker_budget");
+
+    const granted = await call(h.client, "worker_budget", { id, tokens: 500_000 });
+    expect(granted.isError).toBe(false);
+    expect(granted.ms).toBeLessThan(2_000);
+    expect(granted.text).toContain("501,000 tokens");
+    expect(granted.text).toContain("does not restart it");
+
+    // And now the revision is accepted.
+    const revise = await call(h.client, "worker_revise", { id, feedback: "carry on where you left off" });
+    expect(revise.isError).toBe(false);
+    expect(revise.text).toContain("Revision 1 of 3");
+  }, 40_000);
+
+  test("a grant of nothing is a clean refusal", async () => {
+    const h = await harness({ report: claims("Done.") });
+    const id = idFrom((await call(h.client, "worker_spawn", { task: "a thing", runID: "run-1" })).text);
+    await waitSettled(h.client, id);
+    const r = await call(h.client, "worker_budget", { id });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("nothing was asked for");
+  }, 30_000);
+
+  test("worker_recover refuses a worker that is not interrupted, and says why", async () => {
+    const h = await harness({ report: claims("Done.") });
+    const id = idFrom((await call(h.client, "worker_spawn", { task: "a thing", runID: "run-1" })).text);
+    await waitSettled(h.client, id);
+    const r = await call(h.client, "worker_recover", { id, action: "resume" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("not interrupted");
+  }, 30_000);
+
+  test("worker_recover settles an interrupted worker and keeps its worktree", async () => {
+    // The whole flow, not a simulation of it: one orchestrator is killed mid-run
+    // with `halt()` (which writes nothing and drops the registry, exactly as a
+    // `kill -9` does), and a **second** orchestrator is started over the same
+    // database. `createOrchestrator` runs `recover()` on the way up, so the
+    // interrupted row is produced by the real startup path.
+    const h = await harness({ workMs: 3_000 });
+    const id = idFrom((await call(h.client, "worker_spawn", { task: "a long one", runID: "run-1" })).text);
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline && h.orchestrator.manager.get(id)?.state !== "running") await sleep(20);
+    const worktree = h.orchestrator.manager.get(id)!.worktree;
+    h.orchestrator.manager.halt();
+
+    const second = await createOrchestrator(h.config, { tickMs: 10, retrySettleMs: 40, recoverGraceMs: 200 });
+    cleanup.push(() => second.dispose());
+    const client2 = new Client({ name: "test-host-2", version: "0.0.0" });
+    const [c2, s2] = InMemoryTransport.createLinkedPair();
+    await Promise.all([second.server.connect(s2), client2.connect(c2)]);
+    cleanup.push(() => client2.close());
+
+    expect((await call(client2, "worker_status", { ids: [id] })).text).toContain("interrupted");
+
+    const r = await call(client2, "worker_recover", { id, action: "discard" });
+    expect(r.isError).toBe(false);
+    expect(r.ms).toBeLessThan(2_000);
+    expect(r.text).toContain("cancelled");
+    // Nothing here deletes work: the branch is the only copy of what it produced.
+    expect(r.text).toContain("worktree and branch are untouched");
+    expect(existsSync(worktree)).toBe(true);
+  }, 40_000);
+
+  test("a restarted orchestrator salvages an interrupted worker into a real result", async () => {
+    // The §11 Phase 7 AC end to end and over the wire: kill the manager mid-run,
+    // restart, and get back a worker with a measured diff and a mergeable branch
+    // rather than a row that says something went wrong.
+    const h = await harness({ workMs: 3_000, writeFiles: true });
+    const id = idFrom(
+      (await call(h.client, "worker_spawn", { task: "a long one", runID: "run-1", ownedPaths: ["hello.txt"] })).text,
+    );
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline && h.orchestrator.manager.get(id)?.state !== "running") await sleep(20);
+    h.orchestrator.manager.halt();
+
+    const second = await createOrchestrator(h.config, { tickMs: 10, retrySettleMs: 40, recoverGraceMs: 200 });
+    cleanup.push(() => second.dispose());
+    const client2 = new Client({ name: "test-host-3", version: "0.0.0" });
+    const [c2, s2] = InMemoryTransport.createLinkedPair();
+    await Promise.all([second.server.connect(s2), client2.connect(c2)]);
+    cleanup.push(() => client2.close());
+
+    const resumed = await call(client2, "worker_recover", { id, action: "resume" });
+    expect(resumed.isError).toBe(false);
+    expect(resumed.text).toContain("settled from its worktree");
+
+    await waitSettled(client2, id);
+    const result = await call(client2, "worker_result", { id });
+    expect(result.text).toContain("completed");
+    // The file it wrote before the crash is in the measured diff.
+    expect(result.text).toContain("hello.txt");
+  }, 60_000);
+
+  test("a spawn over the run cap is refused with both numbers, and writes no row", async () => {
+    const h = await harness({ report: claims("Done."), tokensPerPrompt: 4_000 }, { runBudgetTokens: 1_000 });
+    const first = idFrom((await call(h.client, "worker_spawn", { task: "first", runID: "capped" })).text);
+    await waitSettled(h.client, first);
+
+    const refused = await call(h.client, "worker_spawn", { task: "second", runID: "capped" });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain("run cap");
+    expect(refused.text).toContain("run_report");
+    // A different run is unaffected — the cap is per run, not per server.
+    const other = await call(h.client, "worker_spawn", { task: "elsewhere", runID: "fresh" });
+    expect(other.isError).toBe(false);
+  }, 40_000);
 });
 
 /** The session a worker opened, once it has opened one. */

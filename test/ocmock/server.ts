@@ -122,6 +122,26 @@ export interface OCMockOptions {
    * fact rather than a race. Default 0.
    */
   readonly abortDelayMs?: number;
+  /**
+   * Fail the first N prompts of every session with a provider error, then
+   * behave normally (§11 Phase 7's retries).
+   *
+   * A retry test needs a failure that is *transient by construction* — one that
+   * stops happening if you try again — and no existing scenario is: `crash`
+   * takes the server down and `format_unsupported` reproduces for as long as the
+   * request carries a `format`. This is the one knob that produces "it failed,
+   * and then it worked", which is the whole of what a retry is for.
+   */
+  readonly failTimes?: number;
+  /**
+   * Whether those failures carry `isRetryable: true`.
+   *
+   * The manager retries on the provider's own judgement rather than on the
+   * message text, so a test that cannot set this cannot tell the two responses
+   * apart — and "we retried something that will never succeed" is the more
+   * expensive of the two bugs.
+   */
+  readonly failRetryable?: boolean;
 }
 
 /** A file a scripted turn actually puts on disk. See {@link OCMock.setWrite}. */
@@ -166,6 +186,8 @@ interface MockSession {
   lastIdleAt?: number;
   /** Prompts accepted and dropped, for tests that assert on the guard. */
   dropped: number;
+  /** How many prompts this session has failed so far (`failTimes`). */
+  failed: number;
   prompts: unknown[];
 }
 
@@ -192,6 +214,8 @@ const DEFAULTS = {
   perWorktreeFileContent: false,
   dropPromptsWithinMs: 0,
   abortDelayMs: 0,
+  failTimes: 0,
+  failRetryable: true,
 };
 
 let evtSeq = 0;
@@ -429,6 +453,7 @@ export class OCMock {
       timers: new Set(),
       prompts: [],
       dropped: 0,
+      failed: 0,
       ...(this.opts.report === null || this.opts.report === undefined ? {} : { report: this.opts.report }),
     };
     this.sessions.set(id, session);
@@ -464,6 +489,27 @@ export class OCMock {
 
     this.after(session, delay, () => {
       this.emit(session, "session.status", { sessionID: session.id, status: { type: "busy" } });
+      // Ahead of the scenario switch, because a transient failure is something
+      // that happens *to* a turn rather than a way for one to behave. The busy
+      // status is emitted first so the manager's "did this turn start" test
+      // (Phase 2's fact 1) sees what it would see from a real one.
+      if (session.failed < this.opts.failTimes) {
+        session.failed += 1;
+        this.emit(session, "session.error", {
+          sessionID: session.id,
+          error: {
+            name: "APIError",
+            data: {
+              message: `Error from provider: upstream temporarily unavailable (attempt ${session.failed})`,
+              isRetryable: this.opts.failRetryable,
+            },
+          },
+        });
+        this.emit(session, "session.idle", { sessionID: session.id });
+        session.running = false;
+        session.lastIdleAt = Date.now();
+        return;
+      }
       switch (session.scenario) {
         case "success":
           this.work(session);

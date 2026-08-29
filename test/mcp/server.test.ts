@@ -56,6 +56,8 @@ describe("configuration", () => {
         ORCHESTRATOR_BASE_URL: "http://127.0.0.1:4096",
         ORCHESTRATOR_VERIFY_TESTS: "0",
         ORCHESTRATOR_MAX_REVISIONS: "5",
+        ORCHESTRATOR_MAX_RETRIES: "1",
+        ORCHESTRATOR_RUN_BUDGET_TOKENS: "500000",
       },
       "/ignored",
     );
@@ -67,6 +69,8 @@ describe("configuration", () => {
       verifyTests: false,
       maxConcurrent: 3,
       maxRevisions: 5,
+      maxRetries: 1,
+      runBudgetTokens: 500_000,
     });
     // `:memory:` is a SQLite keyword, not a path, and must survive resolution.
     expect(loadConfig({ ORCHESTRATOR_DB: ":memory:" }, "/x").dbPath).toBe(":memory:");
@@ -82,6 +86,22 @@ describe("configuration", () => {
     expect(loadConfig({ ORCHESTRATOR_MAX_CONCURRENT: "banana" }, "/x").maxConcurrent).toBe(3);
     expect(loadConfig({ ORCHESTRATOR_MAX_CONCURRENT: "" }, "/x").maxConcurrent).toBe(3);
     expect(loadConfig({ ORCHESTRATOR_MAX_CONCURRENT: "9999" }, "/x").maxConcurrent).toBe(32);
+  });
+
+  test("Phase 7's two new variables are clamped, and each has a meaningful zero", () => {
+    // `maxRetries: 0` means "never retry"; `runBudgetTokens: 0` means "no run
+    // cap". Both are settings somebody might genuinely want, so neither is
+    // clamped up to 1 the way concurrency is.
+    expect(loadConfig({}, "/x").maxRetries).toBe(2);
+    expect(loadConfig({ ORCHESTRATOR_MAX_RETRIES: "0" }, "/x").maxRetries).toBe(0);
+    expect(loadConfig({ ORCHESTRATOR_MAX_RETRIES: "banana" }, "/x").maxRetries).toBe(2);
+    expect(loadConfig({ ORCHESTRATOR_MAX_RETRIES: "999" }, "/x").maxRetries).toBe(10);
+
+    expect(loadConfig({}, "/x").runBudgetTokens).toBe(2_000_000);
+    expect(loadConfig({ ORCHESTRATOR_RUN_BUDGET_TOKENS: "0" }, "/x").runBudgetTokens).toBe(0);
+    expect(loadConfig({ ORCHESTRATOR_RUN_BUDGET_TOKENS: "banana" }, "/x").runBudgetTokens).toBe(2_000_000);
+    // No upper clamp: a big number is somebody who has measured their own spend.
+    expect(loadConfig({ ORCHESTRATOR_RUN_BUDGET_TOKENS: "50000000" }, "/x").runBudgetTokens).toBe(50_000_000);
   });
 
   test("ORCHESTRATOR_MAX_REVISIONS is clamped the same way, and 0 turns revisions off", () => {
@@ -112,6 +132,8 @@ describe("start-up and recovery (§9)", () => {
       verifyTests: false,
       maxConcurrent: 3,
     maxRevisions: 3,
+    maxRetries: 2,
+    runBudgetTokens: 0,
     };
 
     const first = await createOrchestrator(config, { tickMs: 10, abortGraceMs: 200 });
@@ -160,6 +182,8 @@ describe("start-up and recovery (§9)", () => {
         verifyTests: false,
         maxConcurrent: 3,
     maxRevisions: 3,
+    maxRetries: 2,
+    runBudgetTokens: 0,
       },
       { tickMs: 10, abortGraceMs: 200 },
     );

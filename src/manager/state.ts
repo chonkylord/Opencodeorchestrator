@@ -174,6 +174,12 @@ export const TRANSITIONS: readonly Transition[] = Object.freeze([
   { from: "preparing", trigger: "start", to: "running", note: "prompt accepted, subscription live" },
   { from: "preparing", trigger: "fail", to: "failed", note: "worktree or session setup failed (§5 preparing to failed)" },
   { from: "preparing", trigger: "cancel", to: "cancelled", note: "stopped while setting up" },
+  // §11 Phase 7's global run cap is checked *before* the session is opened, so
+  // the one worker it stops is one that never reached `running`. Without this
+  // edge `settle()`'s `tryApply` silently declined the move and the worker sat
+  // in `preparing` forever — a hang rather than an error, which is the failure
+  // mode the machine exists to prevent.
+  { from: "preparing", trigger: "exhaust_budget", to: "over_budget", note: "§8's run cap stopped it before it opened a session" },
   { from: "preparing", trigger: "interrupt", to: "interrupted", note: "manager died mid-setup" },
 
   { from: "running", trigger: "block", to: "blocked", note: "worker asked; only the orchestrator can unblock it" },

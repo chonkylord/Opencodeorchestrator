@@ -14,7 +14,7 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { makeGoldenRepo } from "../fixtures/golden.js";
@@ -170,11 +170,70 @@ describe("the orphan scan (§9)", () => {
   test("pruneOrphans still refuses unmerged ones without force", async () => {
     const root = repo();
     const w = await worker(root, "w-001", "alpha.txt");
-    await cleanupWorkspace({ repoRoot: root, candidates: [], knownIDs: [], pruneOrphans: true });
+    // `orphanTtlMs: 0` turns off Phase 7's age check, which would otherwise
+    // protect these fixtures on its own and hide what this test is about.
+    await cleanupWorkspace({ repoRoot: root, candidates: [], knownIDs: [], pruneOrphans: true, orphanTtlMs: 0 });
     expect(await branchExists(root, w.branch)).toBe(true);
 
-    await cleanupWorkspace({ repoRoot: root, candidates: [], knownIDs: [], pruneOrphans: true, force: true });
+    await cleanupWorkspace({ repoRoot: root, candidates: [], knownIDs: [], pruneOrphans: true, force: true, orphanTtlMs: 0 });
     expect(await branchExists(root, w.branch)).toBe(false);
+  });
+
+  test("§9's TTL: a fresh orphan is reported and left alone, however forceful the ask", async () => {
+    // The failure this exists for is pruning another orchestrator's *live*
+    // worktree — or this one's, before its index has caught up. Both look
+    // exactly like an orphan to a scan, and neither is one.
+    const root = repo();
+    const w = await worker(root, "w-001", "alpha.txt");
+    const report = await cleanupWorkspace({
+      repoRoot: root,
+      candidates: [],
+      knownIDs: [],
+      pruneOrphans: true,
+      force: true,
+      // The real default; stated rather than relied on, so the test still means
+      // something if the constant moves.
+      orphanTtlMs: 24 * 60 * 60_000,
+    });
+    expect(report.orphans.length).toBe(2);
+    expect(existsSync(w.worktree)).toBe(true);
+    expect(await branchExists(root, w.branch)).toBe(true);
+  });
+
+  test("§9's TTL: an orphan past it is pruned, and age is measured rather than assumed", async () => {
+    const root = repo();
+    const w = await worker(root, "w-001", "alpha.txt");
+    const orphans = await scanOrphans({
+      repoRoot: root,
+      worktreeRoot: defaultWorktreeRoot(root),
+      knownIDs: [],
+      // A day in the future, so everything on disk is a day old.
+      now: Date.now() + 24 * 60 * 60_000,
+    });
+    // Both the worktree and the branch carry a real age, from two different
+    // sources: a directory mtime and a commit date.
+    expect(orphans).toHaveLength(2);
+    for (const o of orphans) expect(o.ageMs).toBeGreaterThan(23 * 60 * 60_000);
+
+    await cleanupWorkspace({ repoRoot: root, candidates: [], knownIDs: [], pruneOrphans: true, force: true, orphanTtlMs: 1 });
+    expect(existsSync(w.worktree)).toBe(false);
+    expect(await branchExists(root, w.branch)).toBe(false);
+  });
+
+  test("§9's TTL: an orphan whose age cannot be determined is never pruned", async () => {
+    // A TTL that prunes what it cannot date deletes the thing it was least sure
+    // about. `ageMs` is optional for exactly this reason and the filter treats
+    // its absence as "too young" rather than as zero.
+    const root = repo();
+    const w = await worker(root, "w-001", "alpha.txt");
+    rmSync(w.worktree, { recursive: true, force: true });
+    const orphans = await scanOrphans({ repoRoot: root, worktreeRoot: defaultWorktreeRoot(root), knownIDs: [] });
+    const gone = orphans.find((o) => o.kind === "worktree");
+    expect(gone?.ageMs).toBeUndefined();
+
+    await cleanupWorkspace({ repoRoot: root, candidates: [], knownIDs: [], pruneOrphans: true, force: true });
+    // The branch is younger than the default TTL, so it survives too.
+    expect(await branchExists(root, w.branch)).toBe(true);
   });
 
   test("the main worktree is not in the orphan list", async () => {

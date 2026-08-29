@@ -25,7 +25,7 @@
  * its worktree reclaimed.
  */
 
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, rmSync, statSync } from "node:fs";
 import { resolve, sep } from "node:path";
 
 import { git, gitLine } from "./git.js";
@@ -60,7 +60,26 @@ export interface Orphan {
   readonly workerID?: string;
   /** True when the tip is already contained in HEAD or an integration branch. */
   readonly merged: boolean;
+  /**
+   * How old it is, in ms — a worktree by its directory's mtime, a branch by its
+   * tip's commit date (§9's TTL, added in Phase 7).
+   *
+   * `undefined` when it could not be determined, which is deliberately **not**
+   * treated as old: a TTL that prunes what it cannot date is a TTL that deletes
+   * the thing it was least sure about.
+   */
+  readonly ageMs?: number;
 }
+
+/**
+ * §9's orphan TTL: how old an orphan must be before pruning will touch it.
+ *
+ * Twenty-four hours, because the failure this protects against is pruning a
+ * worktree belonging to a *concurrently running* orchestrator — another process,
+ * or this one before its index caught up — and an hour is not obviously longer
+ * than a slow wave. It is a floor on carelessness, not a retention policy.
+ */
+export const DEFAULT_ORPHAN_TTL_MS = 24 * 60 * 60_000;
 
 export interface CleanupReport {
   readonly pruned: readonly PrunedWorker[];
@@ -87,6 +106,15 @@ export interface CleanupOptions {
   readonly scan?: boolean;
   /** Prune the orphans the scan finds, rather than reporting them (§9). */
   readonly pruneOrphans?: boolean;
+  /**
+   * §9's TTL: orphans younger than this are reported and never pruned.
+   *
+   * Defaults to {@link DEFAULT_ORPHAN_TTL_MS}. `0` disables the age check, which
+   * is what a test wants and what an operator cleaning up after a known-dead run
+   * may want; it is never the default, because the orphan a scan is most likely
+   * to find on a busy machine is another orchestrator's live worktree.
+   */
+  readonly orphanTtlMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,11 +147,18 @@ export async function cleanupWorkspace(opts: CleanupOptions): Promise<CleanupRep
           containers,
         });
 
+  const ttl = opts.orphanTtlMs ?? DEFAULT_ORPHAN_TTL_MS;
   if (opts.pruneOrphans === true) {
     // Worktrees before branches, always: git refuses to delete a branch that is
     // checked out in a worktree, so the other order silently leaves every branch
     // behind while reporting that it pruned.
-    const prunable = orphans.filter((o) => o.merged || force);
+    // Three conditions, and the age one is the Phase 7 addition. `merged || force`
+    // decides whether the *content* is safe to lose; the TTL decides whether the
+    // orphan is safe to *touch at all* — a worktree created ninety seconds ago
+    // most likely belongs to something still using it.
+    const tooYoung = orphans.filter((o) => ttl > 0 && (o.ageMs === undefined || o.ageMs < ttl));
+    const young = new Set(tooYoung.map((o) => o.name));
+    const prunable = orphans.filter((o) => (o.merged || force) && !young.has(o.name));
     for (const orphan of prunable.filter((o) => o.kind === "worktree")) {
       await removeWorktree(repoRoot, orphan.name, worktreeRoot);
     }
@@ -201,20 +236,25 @@ export async function scanOrphans(opts: {
   worktreeRoot: string;
   knownIDs: readonly string[];
   containers?: readonly string[];
+  /** Exposed so a TTL test does not have to wait a day for one. */
+  now?: number;
 }): Promise<Orphan[]> {
   const known = new Set(opts.knownIDs);
   const containers = opts.containers ?? (await containerRefs(opts.repoRoot));
   const orphans: Orphan[] = [];
+  const now = opts.now ?? Date.now();
 
   for (const wt of await listWorktrees(opts.repoRoot)) {
     if (!isUnder(wt.path, opts.worktreeRoot)) continue; // never the user's checkout
     const id = wt.path.split(sep).pop() ?? wt.path;
     if (known.has(id)) continue;
+    const ageMs = directoryAgeMs(wt.path, now);
     orphans.push({
       kind: "worktree",
       name: wt.path,
       workerID: id,
       merged: wt.head ? (await containedWhere(opts.repoRoot, wt.head, containers)) !== undefined : false,
+      ...(ageMs === undefined ? {} : { ageMs }),
     });
   }
 
@@ -224,11 +264,13 @@ export async function scanOrphans(opts: {
     if (!name || !sha) continue;
     const id = name.slice("worker/".length);
     if (known.has(id)) continue;
+    const ageMs = await commitAgeMs(opts.repoRoot, sha, now);
     orphans.push({
       kind: "branch",
       name,
       workerID: id,
       merged: (await containedWhere(opts.repoRoot, sha, containers)) !== undefined,
+      ...(ageMs === undefined ? {} : { ageMs }),
     });
   }
 
@@ -316,4 +358,28 @@ function isUnder(path: string, root: string): boolean {
   const p = resolve(path);
   const r = resolve(root);
   return p === r || p.startsWith(r.endsWith(sep) ? r : `${r}${sep}`);
+}
+
+/**
+ * How long ago a worktree was last written to, or `undefined` if we cannot tell.
+ *
+ * The directory's own mtime rather than the manifest's `createdAt`: an orphan is
+ * by definition a directory the index does not know about, so it may have no
+ * manifest at all, and the question the TTL asks — "is anything still using
+ * this?" — is about recent activity rather than about when it was created.
+ */
+function directoryAgeMs(path: string, now: number): number | undefined {
+  try {
+    return Math.max(0, now - statSync(path).mtimeMs);
+  } catch {
+    return undefined;
+  }
+}
+
+/** How long ago a commit was made. `undefined` when git will not say. */
+async function commitAgeMs(repoRoot: string, sha: string, now: number): Promise<number | undefined> {
+  const out = await gitLine(repoRoot, ["log", "-1", "--format=%ct", sha], { allowFailure: true });
+  const seconds = Number.parseInt(out.trim(), 10);
+  if (!Number.isFinite(seconds)) return undefined;
+  return Math.max(0, now - seconds * 1_000);
 }

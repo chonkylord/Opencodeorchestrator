@@ -70,6 +70,8 @@ async function harness(
     verifyTests: false,
     maxConcurrent: 3,
     maxRevisions: 3,
+    maxRetries: 2,
+    runBudgetTokens: 0,
     ...configOver,
   };
   const orchestrator = await createOrchestrator(config, {
@@ -151,10 +153,12 @@ describe("registration", () => {
     expect(names).toEqual([
       "orchestrator_timeout_probe",
       "run_report",
+      "worker_budget",
       "worker_diff",
       "worker_list",
       "worker_message",
       "worker_output",
+      "worker_recover",
       "worker_result",
       "worker_revise",
       "worker_spawn",

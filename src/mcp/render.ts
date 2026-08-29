@@ -21,7 +21,8 @@
  */
 
 import type { StoredEvent } from "../store/index.js";
-import type { MergeRecord, QueueHint, RevisionCapReport, RevisionRound, StartedMerge, WorkerRecord } from "../manager/index.js";
+import type { MergeRecord, QueueHint, RecoverOutcome, RevisionCapReport, RevisionRound, StartedMerge, WorkerRecord } from "../manager/index.js";
+import { isSettled as isSettledState } from "../manager/index.js";
 import type { CleanupReport, DiffPage, MergeStep, OverlapReport } from "../workspace/index.js";
 
 // ---------------------------------------------------------------------------
@@ -640,7 +641,9 @@ export function renderRevisionCap(report: RevisionCapReport): string {
   lines.push(
     capped
       ? "The cap exists because a worker that has not converged in three rounds of specific feedback usually will not converge in a fourth — the instruction is more likely wrong than the worker."
-      : "Its wall clock would reset for a new round but its tokens do not: every round re-sends the accumulated context, so the next one would be killed by the budget mid-turn.",
+      : "Its wall clock would reset for a new round but its tokens do not: every round re-sends the accumulated context, so the next one would be killed by the budget mid-turn.\n" +
+        `If the work is worth more spend, raise the ceiling first: worker_budget({id: "${report.workerID}", tokens: 100000}), then revise it again. ` +
+        "That is a decision about this worker's value, which is why nothing here takes it for you.",
   );
 
   // --- what was tried, round by round ---
@@ -704,6 +707,11 @@ export function renderRevisionCap(report: RevisionCapReport): string {
       "",
       `Raising \`ORCHESTRATOR_MAX_REVISIONS\` above ${report.maxRevisions} is possible and is a decision about this repository rather than this worker. Nothing here does it for you.`,
     );
+  } else {
+    lines.push(
+      "",
+      `5. **Give it more budget and carry on.** \`worker_budget({id: "${report.workerID}", tokens: 100000})\` raises the ceiling; the worker keeps its session and everything in it, and \`worker_revise\` will then accept it.`,
+    );
   }
   return lines.join("\n");
 }
@@ -724,4 +732,63 @@ function roundLine(round: RevisionRound): string {
     (round.discrepancies ? `, ${round.discrepancies} discrepanc${round.discrepancies === 1 ? "y" : "ies"}` : "");
   const said = round.summary ? `\n  it said: ${QUOTE}${clampChars(round.summary, ROUND_SUMMARY_CHARS)}` : "";
   return `${head}${asked}\n  outcome: \`${round.state ?? "unknown"}\` — ${measured}.${said}`;
+}
+
+// ---------------------------------------------------------------------------
+// Hardening (§11 Phase 7)
+// ---------------------------------------------------------------------------
+
+/** What a recovery decision tells Claude, including which half of `resume` ran. */
+export function renderRecovered(outcome: RecoverOutcome, maxRevisions: number): string {
+  const r = outcome.record;
+  if (outcome.kind === "settled") {
+    return (
+      `${r.workerID} is now \`${r.state}\`${r.reason ? ` (${r.reason})` : ""}.\n` +
+      "Its worktree and branch are untouched — nothing here deletes work, because a worker's branch is the\n" +
+      `only copy of what it produced. Read it with worker_diff({id: "${r.workerID}"}), or remove it deliberately\n` +
+      "with workspace_cleanup."
+    );
+  }
+  const lines: string[] = [];
+  lines.push(`Recovering ${r.workerID}. It has left \`interrupted\`, so worker_wait now waits for the outcome.`);
+  if (outcome.hint) {
+    lines.push("", `It is not running yet: ${queueNote(outcome.hint)}.`);
+  }
+  lines.push(
+    "",
+    // Which of the two paths ran is a fact about the backend, not a choice, and
+    // it is only known once the work starts — so this says what will be decided
+    // rather than pretending to know it.
+    "If its session survived the crash it is re-attached and monitored. If it did not — the ordinary case —",
+    "it is settled from its worktree instead: snapshot, measured diff, your test command re-run by the",
+    "orchestrator, reconciliation. Either way you get a result and a branch worth merging; what is gone is",
+    "the worker's own report, which died with the process that was holding it.",
+    "",
+    `Next: worker_wait({ids: ["${r.workerID}"]}), then worker_result. If it comes back short of done, its`,
+    `session may still have context worth using — worker_revise({id: "${r.workerID}", feedback: "…"}) has`,
+    `${maxRevisions} rounds available.`,
+  );
+  return lines.join("\n");
+}
+
+/** The grant, and the one thing worth knowing about what it does not do. */
+export function renderBudgetGrant(r: WorkerRecord, budget: { tokens: number; wallClockMs: number }): string {
+  const lines: string[] = [];
+  lines.push(
+    `${r.workerID} now has ${budget.tokens.toLocaleString("en-US")} tokens and ` +
+      `${Math.round(budget.wallClockMs / 60_000)} minutes of wall clock. It has spent ` +
+      `${r.totalTokens.toLocaleString("en-US")} tokens so far.`,
+  );
+  if (isSettledState(r.state)) {
+    lines.push(
+      "",
+      "The grant does not restart it — raising a ceiling and deciding to carry on are two different",
+      `decisions, and this tool only takes the first. To continue: worker_revise({id: "${r.workerID}",`,
+      'feedback: "continue where you left off; …"}). The session is reused, so it still has everything',
+      "it read and worked out.",
+    );
+  } else {
+    lines.push("", "It is still running, and the new ceiling applies from the next watchdog tick — no restart needed.");
+  }
+  return lines.join("\n");
 }

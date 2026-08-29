@@ -65,6 +65,8 @@ async function harness(
     verifyTests: false,
     maxConcurrent: 3,
     maxRevisions: 3,
+    maxRetries: 2,
+    runBudgetTokens: 0,
     ...configOver,
   };
   const orchestrator = await createOrchestrator(config, {

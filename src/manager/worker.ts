@@ -73,6 +73,7 @@ import {
   writeManifest,
 } from "../workspace/index.js";
 import { type Admission, DEFAULT_MAX_CONCURRENT, DependencyError, type QueueHint, Scheduler } from "./scheduler.js";
+import { type Metric, type MetricsSink, NULL_METRICS } from "./metrics.js";
 import { type RevisionRound, revisionRounds } from "./revisions.js";
 import { WorkerMachine, type WorkerState, isSettled } from "./state.js";
 import type {
@@ -119,6 +120,44 @@ export const DEFAULT_MODEL = "opencode/muse-spark-1.2-contributor-free";
  * report. `ORCHESTRATOR_MAX_REVISIONS` moves it.
  */
 export const DEFAULT_MAX_REVISIONS = 3;
+
+/**
+ * How many times a turn is re-sent after a retryable provider error.
+ *
+ * Two, so a rate limit or a dropped upstream costs seconds rather than a worker,
+ * and a provider that is genuinely down costs three attempts rather than
+ * fifteen. §5 is explicit that a retry is not a revision: a retry re-runs the
+ * same instruction, so it has no cap of its own to interact with and no round
+ * to report.
+ */
+export const DEFAULT_MAX_RETRIES = 2;
+
+/**
+ * How long a recovered worker waits for its old turn to speak up (§11 Phase 7).
+ *
+ * Eight seconds: long enough that a busy provider mid-response is not mistaken
+ * for a finished one, short enough that the salvage is a pause rather than an
+ * outage. A turn that is genuinely running emits *something* — a text delta, a
+ * tool part — well inside it.
+ */
+export const DEFAULT_RECOVER_GRACE_MS = 8_000;
+
+/** Base of the exponential backoff: 1s, then 2s, then 4s, capped. */
+export const DEFAULT_RETRY_BACKOFF_MS = 1_000;
+
+/** Nothing waits longer than this between attempts, whatever the exponent says. */
+export const MAX_RETRY_BACKOFF_MS = 30_000;
+
+/**
+ * §8's global run cap, in tokens.
+ *
+ * Two million is roughly eight workers at the default per-worker ceiling: high
+ * enough that an ordinary wave never meets it, low enough that a runaway costs
+ * a bounded amount. It is a backstop, not a quota — the number to change if your
+ * waves are bigger, and the number that means a `worker_spawn` can be refused
+ * for a reason that is about the *run* rather than about the worker.
+ */
+export const DEFAULT_RUN_BUDGET_TOKENS = 2_000_000;
 
 /**
  * What an `implement` worker is allowed, on top of the adapter's headless set.
@@ -180,6 +219,45 @@ export interface WorkerManagerOptions {
    * refuses, and the refusal carries the terminal report §13 calls actionable.
    */
   readonly maxRevisions?: number;
+  /**
+   * How many times one turn may be re-sent after a **retryable** provider error
+   * (§11 Phase 7).
+   *
+   * Defaults to {@link DEFAULT_MAX_RETRIES}. Only errors the provider itself
+   * marks retryable are retried; a content filter or a bad request reproduces
+   * and is failed on the first try. `0` turns retries off.
+   */
+  readonly maxRetries?: number;
+  /** Base for the exponential backoff between retries. Small in tests. */
+  readonly retryBackoffMs?: number;
+  /**
+   * How long a recovered worker waits for its old turn to show signs of life
+   * before it is salvaged from its worktree instead (§9, §11 Phase 7).
+   *
+   * Not the idle watchdog: that one asks "has this worker wedged" and answers in
+   * minutes, which is the right question for a turn we know started and the
+   * wrong one for a turn that may have ended before we were listening.
+   */
+  readonly recoverGraceMs?: number;
+  /**
+   * §8's **global run cap**, in tokens across every worker sharing a `runID`.
+   *
+   * The per-worker budget stops one worker running away; this stops a *wave*
+   * doing it — six workers each dutifully inside their own ceiling still spend
+   * six ceilings. Defaults to {@link DEFAULT_RUN_BUDGET_TOKENS}; `0` disables it.
+   * Enforced at spawn, where a refusal is legible, and again before a queued
+   * worker opens a session, because the spend that matters accrues while it
+   * waits.
+   */
+  readonly runBudgetTokens?: number;
+  /**
+   * Where §11 Phase 7's metrics go. Defaults to {@link NULL_METRICS}.
+   *
+   * The manager records; it does not decide where. The server hands it a file
+   * sink rooted at the repository, and every test that does not care gets the
+   * one that writes nothing.
+   */
+  readonly metrics?: MetricsSink;
   /** Watchdog resolution. Small in tests, ~1s in production. */
   readonly tickMs?: number;
   /** How often to poll the backend for token usage. */
@@ -228,6 +306,39 @@ type Disposition =
   | { kind: "cancelled"; reason: string };
 
 type AnswerOutcome = { kind: "answer"; text: string } | { kind: "cancel" } | { kind: "timeout" };
+
+/**
+ * §8's global run cap, refused at spawn.
+ *
+ * Its own class rather than a bare `Error` for the same reason
+ * {@link DependencyError} is: the tool layer turns it into a refusal Claude can
+ * act on, and a refusal that arrives as a stack trace is one nobody acts on.
+ */
+export class RunBudgetError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RunBudgetError";
+  }
+}
+
+/** §9's three decisions about a worker a dead process left behind. */
+export type RecoverAction = "resume" | "fail" | "discard";
+
+/** What {@link WorkerManager.recoverWorker} answers with. */
+export type RecoverOutcome =
+  | {
+      /** `fail` and `discard` are synchronous: there is nothing to run. */
+      readonly kind: "settled";
+      readonly action: RecoverAction;
+      readonly record: WorkerRecord;
+    }
+  | {
+      /** `resume` runs in the background, like every other unit of work here. */
+      readonly kind: "resuming";
+      readonly action: RecoverAction;
+      readonly record: WorkerRecord;
+      readonly hint?: QueueHint;
+    };
 
 /** Why {@link WorkerManager.revise} declined. Both are reports, not errors. */
 export type RevisionRefusal = "revision_cap" | "token_budget";
@@ -311,6 +422,32 @@ class ManagedWorker {
   /** Set when a re-send is pending; cleared when it goes out. */
   retryAt: number | undefined;
   /**
+   * While recovering: when to stop waiting for the old turn to say something.
+   *
+   * A session that outlived the manager may have finished its turn while nobody
+   * was listening, and a terminal event that arrived then is simply gone —
+   * subscriptions are not replayed. Without a deadline the recovered worker
+   * would sit through the full idle watchdog before anything happened, which
+   * turns a three-second salvage into a three-minute timeout that also throws
+   * the work away. Cleared the moment a real worker event arrives.
+   */
+  recoverDeadline: number | undefined;
+  /** When the recovery watch began, so "has anything arrived since" is answerable. */
+  recoverStartedAt = 0;
+  /**
+   * Which kind of re-send is pending, and how long to wait before it.
+   *
+   * Two paths re-send the *same* turn and they are not the same thing.
+   * `format` is Phase 2's one-shot drop of the schema constraint and waits for
+   * nothing. `transient` is Phase 7's retry of a provider error the provider
+   * itself called retryable, and waits out a backoff — which is the whole
+   * difference between a retry and a hot loop against a rate limiter.
+   */
+  resendKind: "format" | "transient" = "format";
+  resendDelayMs = 0;
+  /** Transient-error retries this worker has spent. Capped; never reset. */
+  retries = 0;
+  /**
    * A cancellation that arrived before there was anything to abort.
    *
    * The queue widened a window that always existed: between `spawn()` returning
@@ -344,8 +481,23 @@ class ManagedWorker {
     readonly record: { current: WorkerRecord },
     now: () => number,
     onChange: (change: { from: WorkerState; to: WorkerState; trigger: string; reason?: string; detail?: Readonly<Record<string, unknown>> }) => void,
+    /**
+     * Where the machine starts.
+     *
+     * `spawned` for a worker this process is spawning; the stored state for one
+     * it is *adopting* from a previous process (§9). A machine seeded at the
+     * beginning would happily accept `prepare` on a worker that already has a
+     * worktree and a session, which is the class of bug the machine exists to
+     * make impossible.
+     */
+    initial?: WorkerState,
   ) {
-    this.machine = new WorkerMachine({ workerID: record.current.workerID, now, onChange });
+    this.machine = new WorkerMachine({
+      workerID: record.current.workerID,
+      now,
+      onChange,
+      ...(initial === undefined ? {} : { initial }),
+    });
   }
 }
 
@@ -405,6 +557,11 @@ export class WorkerManager {
       budget: { ...DEFAULT_BUDGET, ...options.budget },
       maxConcurrent: options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT,
       maxRevisions: Math.max(0, Math.floor(options.maxRevisions ?? DEFAULT_MAX_REVISIONS)),
+      maxRetries: Math.max(0, Math.floor(options.maxRetries ?? DEFAULT_MAX_RETRIES)),
+      retryBackoffMs: Math.max(0, Math.floor(options.retryBackoffMs ?? DEFAULT_RETRY_BACKOFF_MS)),
+      recoverGraceMs: options.recoverGraceMs ?? DEFAULT_RECOVER_GRACE_MS,
+      runBudgetTokens: Math.max(0, Math.floor(options.runBudgetTokens ?? DEFAULT_RUN_BUDGET_TOKENS)),
+      metrics: options.metrics ?? NULL_METRICS,
       tickMs: options.tickMs ?? 1_000,
       budgetPollMs: options.budgetPollMs ?? 15_000,
       abortGraceMs: options.abortGraceMs ?? 10_000,
@@ -432,6 +589,38 @@ export class WorkerManager {
   /** §5's revision cap. Configuration, exposed so the tools can quote it. */
   get maxRevisions(): number {
     return this.opts.maxRevisions;
+  }
+
+  /** §8's global run cap, in tokens. `0` when disabled. */
+  get runBudgetTokens(): number {
+    return this.opts.runBudgetTokens;
+  }
+
+  /**
+   * What a run has spent so far, across every worker that shares its id.
+   *
+   * Summed from the index rather than tracked in a counter, because the index is
+   * where a restarted process finds the spend that already happened — a counter
+   * in memory would reset to zero and hand a runaway run a fresh budget on every
+   * crash, which is the opposite of what a backstop is for.
+   */
+  runSpend(runID: string): number {
+    let total = 0;
+    for (const row of this.opts.store.listWorkers({ runID })) total += row.totalTokens;
+    return total;
+  }
+
+  /** `undefined` when the run may proceed; the refusal text when it may not. */
+  private runBudgetRefusal(runID: string): string | undefined {
+    const cap = this.opts.runBudgetTokens;
+    if (cap <= 0) return undefined;
+    const spent = this.runSpend(runID);
+    if (spent < cap) return undefined;
+    return (
+      `run ${runID} has spent ${spent.toLocaleString("en-US")} tokens against a run cap of ${cap.toLocaleString("en-US")} ` +
+      "(§8's global cap, ORCHESTRATOR_RUN_BUDGET_TOKENS). Per-worker budgets stop one worker running away; this stops a wave doing it. " +
+      "Read run_report to see where the tokens went, then start a new run with a fresh runID if the work is worth continuing, or raise the cap deliberately."
+    );
   }
 
   /**
@@ -467,6 +656,11 @@ export class WorkerManager {
     // Before any row is written: a spawn that cannot ever run leaves nothing
     // behind to explain later.
     this.scheduler.validate(workerID, spec.dependsOn ?? []);
+    // Before a row is written, for the same reason an unsatisfiable `dependsOn`
+    // is: a spawn that cannot be honoured should be a refusal Claude can read,
+    // not a worker that appears and then dies.
+    const overRun = this.runBudgetRefusal(spec.runID ?? "run-default");
+    if (overRun) throw new RunBudgetError(overRun);
     // Same rule as `dependsOn`, and for the same reason: ids are minted by
     // `spawn()`, so one nobody has been handed is a typo, and a typo honoured
     // here becomes a reviewer that starts, finds nothing to review and reports
@@ -760,6 +954,9 @@ export class WorkerManager {
     // at its token ceiling would be admitted, prompted and killed by the first
     // budget poll, which reads as a revision that silently did nothing.
     if (rec.totalTokens >= budget.tokens) {
+      // Refused, not blocked: `worker_budget` raises the ceiling and the report
+      // says so. Before Phase 7 this was a dead end, which is exactly what §8's
+      // "pause and surface" was supposed not to be.
       return { kind: "refused", reason: "token_budget", report: this.capReport(w, "token_budget") };
     }
 
@@ -904,6 +1101,172 @@ export class WorkerManager {
     }
     if (live) this.notify(live);
     return updated;
+  }
+
+  /**
+   * Raise a worker's budget ceiling (§8's cost controls, §11 Phase 7).
+   *
+   * §8 says a worker that exceeds its cap should **pause and surface to Claude**,
+   * and until Phase 7 only half of that was true: the worker stopped and said so,
+   * and there was no way to say "carry on, you may have more". The grant is that
+   * way, and it is deliberately *not* a resume — raising a ceiling and deciding
+   * to continue are two different decisions, and a tool that did both would take
+   * the second one on Claude's behalf. Grant, then `worker_revise` to continue;
+   * the refusal `worker_revise` gives an over-budget worker names this tool.
+   *
+   * The grant is additive and is written to the worker's own spec, so it
+   * survives a restart in the row like everything else that matters. It applies
+   * to a running worker immediately — the watchdogs read the budget fresh on
+   * every tick — which means a worker about to be killed for its tokens can be
+   * rescued mid-turn rather than only after it dies.
+   */
+  grantBudget(workerID: string, grant: { tokens?: number; wallClockMs?: number }): { record: WorkerRecord; budget: WorkerBudget } {
+    const w = this.workers.get(workerID);
+    const stored = w?.record.current ?? this.opts.store.getWorker(workerID);
+    if (!stored) throw new Error(`unknown worker ${workerID}`);
+    if (stored.state === "merged") {
+      throw new Error(`worker ${workerID} is merged; its work is already on an integration branch and more budget would buy nothing`);
+    }
+    const addTokens = Math.max(0, Math.floor(grant.tokens ?? 0));
+    const addWallClockMs = Math.max(0, Math.floor(grant.wallClockMs ?? 0));
+    if (addTokens === 0 && addWallClockMs === 0) {
+      throw new Error("a budget grant needs tokens, wallClockMs, or both — nothing was asked for");
+    }
+
+    const before = this.budgetFor(stored.spec);
+    const after: WorkerBudget = {
+      ...before,
+      tokens: before.tokens + addTokens,
+      wallClockMs: before.wallClockMs + addWallClockMs,
+    };
+    // Onto the spec, because the spec is what `budgetFor()` reads and what the
+    // row persists. A grant kept only in memory would be forgotten by the next
+    // process, which is the one place a worker most needs it remembered.
+    const spec: WorkerSpec = { ...stored.spec, budget: { ...(stored.spec.budget ?? {}), tokens: after.tokens, wallClockMs: after.wallClockMs } };
+    const updated: WorkerRecord = { ...stored, spec, updatedAt: this.opts.now() };
+    if (w) w.record.current = updated;
+    this.opts.store.putWorker(updated);
+    this.opts.store.appendEvent(workerID, "budget_granted", {
+      addTokens,
+      addWallClockMs,
+      tokens: after.tokens,
+      wallClockMs: after.wallClockMs,
+      spent: stored.totalTokens,
+      state: stored.state,
+    });
+    return { record: updated, budget: after };
+  }
+
+  /**
+   * Act on a worker a previous process left mid-flight (§9, §11 Phase 7).
+   *
+   * `recover()` turns a dead process's `running` rows into `interrupted`, which
+   * §9 calls *a decision point, not a verdict* — and until Phase 7 nothing could
+   * take the decision. The state machine has enumerated the three edges out of
+   * `interrupted` since Phase 2 and fired none of them; these are them.
+   *
+   * - **`resume`** — carry on with this worker. What that means depends on a
+   *   fact only the backend knows: whether its session still exists. If it does
+   *   (a shared server, `ORCHESTRATOR_BASE_URL`), the turn may still be running
+   *   and this re-subscribes and monitors it. If it does not — the ordinary case,
+   *   because a restarted manager spawns a fresh server — the turn is gone but
+   *   **the worktree is not**, so the worker is settled from what is on disk:
+   *   snapshot, measured diff, the test command re-run, reconciliation, a real
+   *   result. That salvage is what makes a `kill -9` cost a turn rather than the
+   *   work, and it is the honest reading of §9's "resume monitoring".
+   * - **`fail`** — settle it as `failed`, keeping the worktree. For a worker
+   *   whose work is not worth having but whose row should stop being a question.
+   * - **`discard`** — settle it as `cancelled`, keeping the worktree. DD-7: the
+   *   commits are the only copy of what the worker produced, so nothing here
+   *   deletes anything. `workspace_cleanup` is the tool that deletes.
+   *
+   * Like {@link revise} this returns as soon as the decision is registered, and
+   * for the same three reasons: the state leaves `interrupted` before it
+   * returns, the new `done` is installed in the same tick, and the work itself
+   * re-enters the concurrency queue rather than running unaccounted.
+   */
+  recoverWorker(workerID: string, action: RecoverAction): RecoverOutcome {
+    const stored = this.opts.store.getWorker(workerID);
+    if (!stored) throw new Error(`unknown worker ${workerID}`);
+    if (this.halted) throw new Error(`the manager is shutting down; ${workerID} cannot be recovered`);
+    if (stored.state !== "interrupted") {
+      throw new Error(
+        `worker ${workerID} is ${stored.state}, not interrupted — worker_recover is for workers a previous manager process left mid-flight. ` +
+          (isSettled(stored.state)
+            ? "This one has settled; read worker_result."
+            : "This one is live in this process; wait for it, or stop it with worker_stop."),
+      );
+    }
+
+    // A worker this process has never held has no `ManagedWorker` — `recover()`
+    // wrote the row and nothing else. Rebuild one around the stored record so
+    // the run loop, the waiters and `dispose()` all see it like any other.
+    const w = this.workers.get(workerID) ?? this.adopt(stored);
+
+    if (action === "fail" || action === "discard") {
+      const trigger = action === "fail" ? "fail" : "cancel";
+      const reason = action === "fail" ? "recovered_failed" : "recovered_discarded";
+      w.machine.apply(trigger, { reason });
+      this.update(w, { state: w.machine.state, reason, endedAt: this.opts.now() });
+      this.opts.store.appendEvent(workerID, "recovered", { action, reason });
+      this.metric({ kind: "recovery", at: this.opts.now(), runID: stored.runID, workerID, action, resumed: false });
+      this.notify(w);
+      return { kind: "settled", action, record: w.record.current };
+    }
+
+    // --- resume: nothing awaits until `done` is installed ---
+    w.cancelRequested = undefined;
+    w.machine.apply("recover", { reason: "recovering" });
+    this.opts.store.appendEvent(workerID, "recovered", { action, sessionID: stored.sessionID ?? null });
+    this.metric({ kind: "recovery", at: this.opts.now(), runID: stored.runID, workerID, action, resumed: true });
+    const admission = this.scheduler.enqueue(workerID, []);
+    const hint = this.scheduler.hint(workerID);
+    this.update(w, { state: w.machine.state, reason: hint?.reason ?? "recovering", endedAt: undefined });
+    w.done = this.driveRecovery(w, admission).catch(() => {
+      /* total, exactly as drive() and driveRevision() are */
+    });
+    return { kind: "resuming", action, record: w.record.current, ...(hint ? { hint } : {}) };
+  }
+
+  /**
+   * Rebuild the in-memory half of a worker this process never ran.
+   *
+   * Everything durable is already in the row (DD-7); what is missing is the
+   * machine, the waiter set and the session handle. The machine is seeded at the
+   * stored state so an illegal move still throws, and the hook that writes
+   * `state:*` is installed exactly as `spawn()` installs it — one writer per
+   * transition, which is the defect Phase 5's run report found.
+   */
+  private adopt(stored: WorkerRecord): ManagedWorker {
+    const workerID = stored.workerID;
+    const box = { current: stored };
+    const w = new ManagedWorker(
+      box,
+      this.opts.now,
+      (change) => {
+        this.opts.store.appendEvent(workerID, `state:${change.to}`, {
+          from: change.from,
+          trigger: change.trigger,
+          ...(change.reason === undefined ? {} : { reason: change.reason }),
+          ...(change.detail ?? {}),
+        });
+      },
+      // Seeded from the row, not from `spawned`.
+      stored.state,
+    );
+    // Rebuilt rather than restored: the handle the previous process held is
+    // gone, and everything this one needs of it is in the row. Whether the
+    // *backend* still knows this session is a different question, and
+    // `driveRecovery` asks it rather than assuming.
+    if (stored.sessionID) {
+      w.session = { sessionID: stored.sessionID, directory: stored.worktree, createdAt: stored.createdAt };
+    }
+    w.revisions = stored.revisions;
+    w.resumes = stored.resumes;
+    w.totalTokens = stored.totalTokens;
+    w.cost = stored.cost;
+    this.workers.set(workerID, w);
+    return w;
   }
 
   /**
@@ -1103,6 +1466,122 @@ export class WorkerManager {
   }
 
   /**
+   * Carry on with a worker a previous process left mid-flight.
+   *
+   * The whole function turns on one question the backend answers and nothing
+   * else can: **does this session still exist?**
+   *
+   * - **It does** — a shared server outlived the manager. The turn may still be
+   *   running, so this re-subscribes and pumps it exactly as the original loop
+   *   would have. What cannot be recovered is the *reply so far*: it lived in
+   *   the dead process's memory, so `readReport()` will fall back to the
+   *   worktree's `report.json` (§5's secondary channel) or to no report at all,
+   *   and the measured diff carries the result either way.
+   * - **It does not** — the ordinary case, because a restarted manager spawns a
+   *   fresh server. There is nothing to monitor and nothing to abort, but the
+   *   worktree is intact and is the durable half (DD-7). So the worker is
+   *   settled *from disk*: snapshot, diff, the brief's test command re-run
+   *   independently, reconciliation. The worker's own claims are mostly gone;
+   *   the measurements are all still there, and they are the half §4.3 calls the
+   *   finding.
+   *
+   * Either way this ends in a settled row with a real result and a branch worth
+   * merging, which is what "clean recovery" has to mean.
+   */
+  private async driveRecovery(w: ManagedWorker, admission: Promise<Admission>): Promise<void> {
+    const workerID = w.record.current.workerID;
+    const verdict = await admission;
+    if (this.halted) return;
+
+    if (verdict.kind === "refused") {
+      w.machine.tryApply("cancel", { reason: verdict.reason });
+      this.update(w, { state: w.machine.state, reason: verdict.reason, endedAt: this.opts.now() });
+      this.notify(w);
+      return;
+    }
+    if (w.record.current.reason !== undefined) this.update(w, { reason: undefined });
+
+    let disposition: Disposition;
+    try {
+      disposition = await this.recoverTurn(w);
+    } catch (e) {
+      const err = e instanceof OpenCodeError ? e : undefined;
+      disposition = {
+        kind: "failed",
+        reason: err ? `backend_${err.code}` : "manager_error",
+        ...(err ? { error: err } : {}),
+      };
+      if (!err) this.opts.store.appendEvent(workerID, "manager_error", { message: String(e) });
+    } finally {
+      w.stream?.close();
+    }
+    if (this.halted) return;
+    try {
+      await this.settle(w, disposition);
+    } finally {
+      this.scheduler.release(workerID);
+    }
+  }
+
+  /** The live-session half of {@link WorkerManager.driveRecovery}, or the salvage. */
+  private async recoverTurn(w: ManagedWorker): Promise<Disposition> {
+    const rec = w.record.current;
+    if (this.halted) return { kind: "cancelled", reason: "manager_halted" };
+    if (w.cancelRequested) return { kind: "cancelled", reason: w.cancelRequested };
+
+    // `usage()` answers `null` for a session the backend does not know, which is
+    // the liveness probe this needs and costs one request. Deliberately not a
+    // new backend method: DD-2's surface is small on purpose, and a question the
+    // existing one already answers does not earn a new one.
+    const alive = w.session ? await this.opts.backend.usage(w.session).catch(() => null) : null;
+    if (!alive) {
+      this.opts.store.appendEvent(rec.workerID, "recovery_salvaged", {
+        sessionID: rec.sessionID ?? null,
+        worktree: rec.worktree,
+        reason: rec.sessionID ? "session_gone" : "no_session",
+      });
+      // No prompt, no stream, no watchdogs — there is nothing running to watch.
+      // `settle()` does the rest: it snapshots, measures, re-runs the tests and
+      // reconciles, all from the worktree, which is exactly what is left.
+      w.runningSince = this.opts.now();
+      return { kind: "complete" };
+    }
+
+    this.opts.store.appendEvent(rec.workerID, "recovery_resumed", {
+      sessionID: rec.sessionID ?? null,
+      totalTokens: alive.totalTokens,
+    });
+    w.totalTokens = alive.totalTokens;
+    w.cost = alive.cost;
+    // A fresh subscription and a fresh clock, for the same reasons a revision
+    // gets them: the previous stream died with the process, and the deadline
+    // exists to bound *this* watch rather than to charge the worker for the time
+    // the manager spent not running.
+    w.stream = await this.opts.backend.events(w.session!, { deltas: true });
+    const now = this.opts.now();
+    w.runningSince = now;
+    w.blockedTotalMs = 0;
+    w.lastWorkerEventAt = now;
+    w.lastBudgetPollAt = now;
+    w.replyText = "";
+    w.replyTruncated = false;
+    w.sawAbort = false;
+    w.abortIntent = undefined;
+    w.retryAt = undefined;
+    // The turn was already under way when the manager died, so nothing is going
+    // to prove it started a second time. Treating it as started is what lets the
+    // terminal event that ends it actually end it, rather than being discarded
+    // as stale — the one place the Phase 2 discrimination has to be told the
+    // answer instead of observing it.
+    w.turnStarted = true;
+    // The turn may have ended while nobody was listening. Give it a short window
+    // to prove otherwise, then salvage rather than wait out the idle watchdog.
+    w.recoverStartedAt = now;
+    w.recoverDeadline = now + this.opts.recoverGraceMs;
+    return this.pump(w);
+  }
+
+  /**
    * Prompt the existing session with Claude's feedback and read the turn out.
    *
    * Everything before the prompt is the answer to one question: which of
@@ -1176,6 +1655,14 @@ export class WorkerManager {
       // `buildResult` report this round as `not_started`.
       ...(rec.startedAt === undefined ? { startedAt: now } : {}),
     });
+    this.metric({
+      kind: "revision_round",
+      at: now,
+      runID: rec.runID,
+      workerID: rec.workerID,
+      round,
+      feedbackChars: feedback.length,
+    });
     this.opts.store.appendEvent(rec.workerID, "revision_started", {
       round,
       ...(rec.sessionID === undefined ? {} : { sessionID: rec.sessionID }),
@@ -1230,6 +1717,15 @@ export class WorkerManager {
         truncated: review.target.diffTruncated,
         source: review.source,
       });
+    }
+
+    // Checked again here, and not only at spawn: a worker admitted from the queue
+    // may have waited while its siblings spent the run's whole budget, and the
+    // point of a cap is that it binds at the moment the money would be spent.
+    const overRun = this.runBudgetRefusal(rec.runID);
+    if (overRun) {
+      this.opts.store.appendEvent(rec.workerID, "run_budget_exceeded", { runID: rec.runID, spent: this.runSpend(rec.runID) });
+      return { kind: "over_budget", reason: "run_budget" };
     }
 
     const session = await this.opts.backend.createSession({
@@ -1307,10 +1803,34 @@ export class WorkerManager {
    * lied to. So the constraint is a bonus where it works, not a dependency.
    */
   private async retryWithoutFormat(w: ManagedWorker): Promise<void> {
+    await this.resendTurn(w);
+  }
+
+  /**
+   * Re-send the turn that is already in {@link ManagedWorker.lastPromptText}.
+   *
+   * Both re-send paths land here so the reset is written once: the partial reply
+   * from the failed attempt has to go (`parseReport` takes the first usable
+   * object, so a kept prefix wins over the real answer), and `sawAbort` has to
+   * go with it or the retry's clean finish reads as `aborted_externally`.
+   *
+   * The backoff is *before* the prompt and after the reset, and it is a real
+   * wait rather than a token one: a provider that rate-limited us will do it
+   * again if we come straight back, and the retry that arrives 30 ms later is
+   * indistinguishable from the request that caused the problem.
+   */
+  private async resendTurn(w: ManagedWorker): Promise<void> {
     w.retryAt = undefined;
     w.replyText = "";
     w.replyTruncated = false;
     w.sawAbort = false;
+    const delay = w.resendDelayMs;
+    w.resendDelayMs = 0;
+    if (delay > 0) {
+      this.opts.store.appendEvent(w.record.current.workerID, "retry_backoff", { delayMs: delay, attempt: w.retries });
+      await sleepMs(delay);
+      if (this.halted || w.cancelRequested) return;
+    }
     w.lastWorkerEventAt = this.opts.now();
     await this.promptTurn(w, w.lastPromptText);
   }
@@ -1431,7 +1951,48 @@ export class WorkerManager {
         w.sawAbort = true;
         return undefined;
       }
-      if (w.usedFormat && !w.formatRetried && (e.error.code === "api" || e.error.code === "structured_output")) {
+      // §11 Phase 7's retry, and the one place `OpenCodeError.retryable` earns
+      // its keep: it is the provider's own judgement (`APIError.data.isRetryable`
+      // per the fact sheet), not a guess from the message text. A retry re-runs
+      // the *same* instruction — which is exactly what makes it not a revision,
+      // and why it has its own counter and no revision cap.
+      //
+      // **Ahead of the structured-output branch below, deliberately.** A schema
+      // rejection arrives as an `api` error too, so a format check that ran
+      // first would swallow every transient failure and silently re-send the
+      // turn with the constraint dropped — losing the constraint for the rest of
+      // the backend's life over a hiccup that had nothing to do with it. The
+      // real rejection is measured as `isRetryable: false`, so retryability is
+      // exactly the field that tells the two apart.
+      if (e.error.retryable && w.retries < this.opts.maxRetries) {
+        w.retries += 1;
+        w.retryAt = this.opts.now();
+        w.resendKind = "transient";
+        w.resendDelayMs = backoffMs(w.retries, this.opts.retryBackoffMs);
+        this.metric({
+          kind: "retry",
+          at: this.opts.now(),
+          runID: w.record.current.runID,
+          workerID: w.record.current.workerID,
+          attempt: w.retries,
+          code: e.error.code,
+          backoffMs: w.resendDelayMs,
+        });
+        this.opts.store.appendEvent(w.record.current.workerID, "turn_retried", {
+          attempt: w.retries,
+          maxRetries: this.opts.maxRetries,
+          code: e.error.code,
+          backoffMs: w.resendDelayMs,
+          message: e.error.message.slice(0, 300),
+        });
+        return undefined;
+      }
+      // `!e.error.retryable` matters as much as the rest of this condition. A
+      // schema rejection is measured as `isRetryable: false`, and a transient
+      // `api` error is not a schema problem — without this the provider hiccup
+      // that happens to arrive first spends the one-shot format retry and
+      // latches structured output off for the whole backend's life.
+      if (w.usedFormat && !w.formatRetried && !e.error.retryable && (e.error.code === "api" || e.error.code === "structured_output")) {
         // The provider refused the constrained request. Latch it off for every
         // later worker and re-send this turn plainly, once. Settling here would
         // fail a worker for a capability it never needed.
@@ -1445,7 +2006,11 @@ export class WorkerManager {
         return undefined;
       }
       w.lastError = e.error;
-      return { kind: "failed", reason: `worker_error_${e.error.code}`, error: e.error };
+      return {
+        kind: "failed",
+        reason: w.retries > 0 ? `worker_error_${e.error.code}_after_${w.retries}_retries` : `worker_error_${e.error.code}`,
+        error: e.error,
+      };
     }
 
     if (e.kind === "idle") {
@@ -1463,9 +2028,10 @@ export class WorkerManager {
         return this.applyIntent(w, intent);
       }
       if (w.retryAt !== undefined) {
-        // The failed turn's terminal event. Now the session is free to be
-        // re-prompted without the constraint that broke it.
-        await this.retryWithoutFormat(w);
+        // The failed turn's terminal event. Now the session is free to take the
+        // turn again — without the constraint that broke it, or after the
+        // backoff a transient failure earned.
+        await this.resendTurn(w);
         return undefined;
       }
       if (w.sawAbort) {
@@ -1554,6 +2120,25 @@ export class WorkerManager {
     const now = this.opts.now();
     const budget = this.budgetFor(w.record.current.spec);
 
+    // The recovery window, and it has to be first: a recovered worker whose old
+    // turn is genuinely over produces no events at all, and every other watchdog
+    // below reads that as a wedged worker rather than as a finished one.
+    if (w.recoverDeadline !== undefined) {
+      if (w.lastWorkerEventAt > w.recoverStartedAt) {
+        // Something is alive on the other end. Ordinary rules from here on.
+        w.recoverDeadline = undefined;
+        this.opts.store.appendEvent(w.record.current.workerID, "recovery_live", {});
+      } else if (now > w.recoverDeadline) {
+        w.recoverDeadline = undefined;
+        this.opts.store.appendEvent(w.record.current.workerID, "recovery_salvaged", {
+          reason: "session_alive_but_turn_over",
+          waitedMs: now - w.recoverStartedAt,
+        });
+        // Settle from the worktree, exactly as the no-session path does.
+        return { kind: "complete" };
+      }
+    }
+
     if (w.abortIntent) {
       // We asked it to stop and the terminal events have not come. Do not wait
       // forever for a server that may already be gone: take the intent.
@@ -1566,10 +2151,11 @@ export class WorkerManager {
       return undefined;
     }
 
-    if (w.retryAt !== undefined && now - w.retryAt > this.opts.abortGraceMs) {
-      // No terminal event followed the rejection. Re-send anyway rather than
-      // sitting here until the idle watchdog calls it a wedged worker.
-      await this.retryWithoutFormat(w);
+    if (w.retryAt !== undefined && now - w.retryAt > this.opts.abortGraceMs + w.resendDelayMs) {
+      // No terminal event followed the failure. Re-send anyway rather than
+      // sitting here until the idle watchdog calls it a wedged worker. The
+      // backoff is added to the grace so a long one is not mistaken for silence.
+      await this.resendTurn(w);
       return undefined;
     }
 
@@ -1708,6 +2294,28 @@ export class WorkerManager {
     // The trail is where {@link WorkerManager.revisionHistory} reads a round's
     // outcome from, so it carries what "what changed this round" needs — and the
     // round number, without which two settles are indistinguishable.
+    // Every worker passes through here exactly once per round, which is what
+    // makes it the right place for the metric and the wrong place for anything
+    // that could throw — hence `metric()` rather than the sink directly.
+    this.metric({
+      kind: "worker_settled",
+      at: this.opts.now(),
+      runID: rec.runID,
+      workerID: rec.workerID,
+      state: w.machine.state,
+      mode: rec.mode,
+      model: rec.model,
+      durationMs: result.durationMs,
+      totalTokens: result.usage.totalTokens,
+      files: result.changes.files,
+      discrepancies: result.discrepancies.length,
+      revisions: w.revisions,
+      resumes: w.resumes,
+      retries: w.retries,
+      reportSource: result.reportSource,
+      ...(reason === undefined ? {} : { reason }),
+      ...(result.tests?.failed === undefined ? {} : { testsFailed: result.tests.failed }),
+    });
     this.opts.store.appendEvent(rec.workerID, "settled", {
       state: w.machine.state,
       discrepancies: result.discrepancies.length,
@@ -1918,6 +2526,24 @@ export class WorkerManager {
     this.opts.store.putWorker(updated);
   }
 
+  /**
+   * Record a metric, and never let it matter.
+   *
+   * `fileMetrics` already swallows its own IO failures, but the sink is an
+   * injected interface and the manager cannot assume every implementation is as
+   * careful. Telemetry that can throw is telemetry that can fail a worker at
+   * `settle()` — the one place every worker passes through — which would turn a
+   * full disk into a run that never finishes. Wrapped here so the promise in
+   * `metrics.ts`'s header is true of every call site rather than of most.
+   */
+  private metric(metric: Metric): void {
+    try {
+      this.opts.metrics.record(metric);
+    } catch {
+      /* never worth a run */
+    }
+  }
+
   private notify(w: ManagedWorker): void {
     for (const waiter of [...w.waiters]) waiter();
   }
@@ -1954,6 +2580,12 @@ export class WorkerManager {
 // ---------------------------------------------------------------------------
 
 const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Exponential, capped: 1s, 2s, 4s, … and never more than half a minute. */
+export function backoffMs(attempt: number, base: number): number {
+  if (base <= 0) return 0;
+  return Math.min(MAX_RETRY_BACKOFF_MS, base * 2 ** Math.max(0, attempt - 1));
+}
 
 /** A cancellable tick, so a racing watchdog does not leave a timer per event. */
 function delay(ms: number): { promise: Promise<{ t: "tick" }>; cancel: () => void } {

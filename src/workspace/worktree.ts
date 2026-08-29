@@ -103,8 +103,14 @@ export async function createWorktree(opts: CreateWorktreeOptions): Promise<Workt
  * `.gitignore` is theirs, and a tool that edits it has overstepped. The common
  * git dir is shared by every worktree, so one entry covers them all, which is
  * also what keeps a worker's manifest out of `git add -A`.
+ *
+ * **Exported since Phase 7, and called at server start as well as here.** It
+ * used to run only when a worker prepared a worktree, but the server writes
+ * `.orchestrator/` the moment it opens its database — and a run in which no
+ * worker ever reached `preparing` therefore left the directory sitting visible
+ * in the user's `git status`. Idempotent, and safe on a read-only `.git`.
  */
-async function ensureExcluded(repoRoot: string): Promise<void> {
+export async function ensureExcluded(repoRoot: string): Promise<void> {
   const commonDir = await gitLine(repoRoot, ["rev-parse", "--git-common-dir"]);
   const excludeFile = join(isAbsolute(commonDir) ? commonDir : join(repoRoot, commonDir), "info", "exclude");
   const entry = `/${ORCHESTRATOR_DIR}/`;

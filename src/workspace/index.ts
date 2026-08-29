@@ -20,6 +20,7 @@ export {
   type Worktree,
   changedFiles,
   createWorktree,
+  ensureExcluded,
   defaultWorktreeRoot,
   diffStat,
   listManifests,

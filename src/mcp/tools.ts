@@ -61,7 +61,9 @@ import {
   renderMerge,
   renderMergeStart,
   renderNoResult,
+  renderBudgetGrant,
   renderPending,
+  renderRecovered,
   renderReviseStarted,
   renderRevisionCap,
   renderRunReport,
@@ -617,6 +619,101 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         const outcome = manager.revise(id, feedback);
         if (outcome.kind === "refused") return ok(renderRevisionCap(outcome.report));
         return ok(renderReviseStarted(outcome.record, outcome.round, manager.maxRevisions, outcome.hint));
+      } catch (e) {
+        return fail(message(e));
+      }
+    },
+  );
+
+  // --- worker_recover -----------------------------------------------------
+
+  server.registerTool(
+    "worker_recover",
+    {
+      title: "Decide what to do with a worker a crash left behind",
+      description:
+        "Act on an `interrupted` worker — one a previous orchestrator process was running when it died. " +
+        "Interrupted is a DECISION POINT, not a verdict: nothing was thrown away, the worktree is intact, " +
+        "and its branch still holds whatever it had committed. This is how you resolve it.\n\n" +
+        "ACTIONS:\n" +
+        "- `resume` (usually right) — carry on with the worker. If its session somehow survived the crash " +
+        "(only when an OpenCode server outlived the manager) it is re-attached and monitored. Otherwise the " +
+        "worker is SALVAGED from its worktree: the orchestrator snapshots what is there, measures the diff, " +
+        "re-runs the test command itself and reconciles, so you get a real result and a mergeable branch. " +
+        "What is lost either way is the worker's own report, which died with the process — the measurements " +
+        "survive, and they were always the stronger half.\n" +
+        "- `fail` — settle it as `failed` and stop asking. The worktree is kept.\n" +
+        "- `discard` — settle it as `cancelled`. The worktree is kept for this too; nothing here deletes " +
+        "anything, because a worker's branch is the only copy of what it produced. Use workspace_cleanup " +
+        "when you actually want it gone.\n\n" +
+        "There is no 'retry' action: re-running the same instruction is a new worker, so use worker_spawn. " +
+        "Returns immediately; `resume` may queue behind running workers, so poll worker_status.",
+      inputSchema: {
+        id: z.string().max(100).describe("The interrupted worker's id."),
+        action: z
+          .enum(["resume", "fail", "discard"])
+          .describe("resume (re-attach or salvage from the worktree) | fail | discard"),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ id, action }): Promise<ToolResult> => {
+      const r = find(id);
+      if (!r) return unknown(id);
+      try {
+        const outcome = manager.recoverWorker(id, action);
+        return ok(renderRecovered(outcome, manager.maxRevisions));
+      } catch (e) {
+        return fail(message(e));
+      }
+    },
+  );
+
+  // --- worker_budget ------------------------------------------------------
+
+  server.registerTool(
+    "worker_budget",
+    {
+      title: "Give a worker more budget",
+      description:
+        "Raise a worker's token and/or wall-clock ceiling. The grant is ADDITIVE and applies at once — a " +
+        "worker still running is rescued mid-turn rather than only after it dies.\n\n" +
+        "This exists because a worker that hits its budget should PAUSE AND SURFACE rather than simply be " +
+        "lost. When one settles `over_budget`, its work is still on its branch and its session still holds " +
+        "everything it read: raise the ceiling here, then worker_revise it with 'continue' to carry on with " +
+        "all that context intact. Without the grant, worker_revise refuses it — a revision re-sends the whole " +
+        "accumulated session, so it would be killed by the budget mid-turn.\n\n" +
+        "Think before granting. The budget is the backstop against a worker that has misunderstood the task " +
+        "and is spending indefinitely on it, and the question worth asking is whether another 100k tokens " +
+        "gets this worker to done or just gets it further from it. A fresh worker with a sharper brief is " +
+        "often cheaper than one more round with a confused one.",
+      inputSchema: {
+        id: z.string().max(100).describe("The worker to give more budget to."),
+        tokens: z
+          .number()
+          .int()
+          .min(0)
+          .max(5_000_000)
+          .optional()
+          .describe("Extra tokens to add to its ceiling, e.g. 100000."),
+        wallClockMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(6 * 60 * 60_000)
+          .optional()
+          .describe("Extra wall-clock milliseconds to add, e.g. 900000 for another 15 minutes."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ id, tokens, wallClockMs }): Promise<ToolResult> => {
+      const r = find(id);
+      if (!r) return unknown(id);
+      try {
+        const granted = manager.grantBudget(id, {
+          ...(tokens === undefined ? {} : { tokens }),
+          ...(wallClockMs === undefined ? {} : { wallClockMs }),
+        });
+        return ok(renderBudgetGrant(granted.record, granted.budget));
       } catch (e) {
         return fail(message(e));
       }

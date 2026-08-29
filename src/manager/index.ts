@@ -26,9 +26,16 @@ export { type RenderOptions, renderResult } from "./result.js";
 
 export {
   DEFAULT_BUDGET,
+  DEFAULT_MAX_RETRIES,
   DEFAULT_MAX_REVISIONS,
+  DEFAULT_RETRY_BACKOFF_MS,
+  DEFAULT_RUN_BUDGET_TOKENS,
+  backoffMs,
   DEFAULT_MODEL,
+  type RecoverAction,
+  type RecoverOutcome,
   type ReviseOutcome,
+  RunBudgetError,
   type RevisionCapReport,
   type RevisionRefusal,
   WorkerManager,
@@ -48,6 +55,8 @@ export {
   clampConcurrency,
   findCycle,
 } from "./scheduler.js";
+
+export { METRICS_DIR, type Metric, type MetricKind, type MetricsSink, NULL_METRICS, fileMetrics } from "./metrics.js";
 
 export { type RevisionRound, revisionRounds } from "./revisions.js";
 

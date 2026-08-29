@@ -31,13 +31,14 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { ServeBackend } from "../opencode/index.js";
-import { MergeCoordinator, WorkerManager, type WorkerManagerOptions } from "../manager/index.js";
+import { MergeCoordinator, WorkerManager, type WorkerManagerOptions, fileMetrics } from "../manager/index.js";
 import { Store } from "../store/index.js";
+import { ensureExcluded } from "../workspace/index.js";
 import { type ServerConfig, loadConfig } from "./config.js";
 import { registerWorkerTools } from "./tools.js";
 
 export const SERVER_NAME = "opencode-orchestrator";
-export const SERVER_VERSION = "0.5.0";
+export const SERVER_VERSION = "0.6.0";
 
 const log = (line: string): void => console.error(`[orchestrator] ${line}`);
 
@@ -80,6 +81,15 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
   log(`backend ready (repo ${config.repoRoot})`);
 
   if (config.dbPath !== ":memory:") mkdirSync(dirname(config.dbPath), { recursive: true });
+  // Before the first write into `.orchestrator/`, not when a worker first
+  // prepares a worktree. The database and the run reports land there whether or
+  // not any worker ever starts, so a run that spawned nothing — or whose every
+  // spawn was refused — used to leave the directory visible in the user's
+  // `git status`. Best-effort: a repository we cannot write an exclude into is
+  // not a reason to refuse to start.
+  await ensureExcluded(config.repoRoot).catch((e: unknown) => {
+    log(`could not exclude .orchestrator/ from git status: ${e instanceof Error ? e.message : String(e)}`);
+  });
   const store = new Store(config.dbPath);
 
   const manager = new WorkerManager({
@@ -90,6 +100,11 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
     verifyTests: config.verifyTests,
     maxConcurrent: config.maxConcurrent,
     maxRevisions: config.maxRevisions,
+    maxRetries: config.maxRetries,
+    runBudgetTokens: config.runBudgetTokens,
+    // §11 Phase 7's metrics. Rooted at the repository, beside the run reports,
+    // and never on the wire — see `src/manager/metrics.ts`.
+    ...(config.dbPath === ":memory:" ? {} : { metrics: fileMetrics(config.repoRoot) }),
     ...tuning,
   });
 
@@ -187,7 +202,8 @@ async function main(): Promise<void> {
   await orchestrator.server.connect(new StdioServerTransport());
   log(
     `ready on stdio · db ${config.dbPath} · model ${config.defaultModel} · ` +
-      `max ${config.maxConcurrent} concurrent · max ${config.maxRevisions} revisions`,
+      `max ${config.maxConcurrent} concurrent · max ${config.maxRevisions} revisions · ` +
+      `${config.maxRetries} retries · run cap ${config.runBudgetTokens === 0 ? "off" : config.runBudgetTokens.toLocaleString("en-US")}`,
   );
 }
 

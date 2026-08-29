@@ -13,7 +13,7 @@
 
 import { resolve } from "node:path";
 
-import { DEFAULT_MAX_REVISIONS, clampConcurrency } from "../manager/index.js";
+import { DEFAULT_MAX_RETRIES, DEFAULT_MAX_REVISIONS, DEFAULT_RUN_BUDGET_TOKENS, clampConcurrency } from "../manager/index.js";
 
 export interface ServerConfig {
   /** The repository the workers branch from. */
@@ -51,6 +51,21 @@ export interface ServerConfig {
    * turns revisions off entirely.
    */
   readonly maxRevisions: number;
+  /**
+   * How many times a turn is re-sent after a **retryable** provider error
+   * (§11 Phase 7).
+   *
+   * Only errors the provider itself marks retryable are retried — a content
+   * filter reproduces and is failed on the first try. `0` turns retries off.
+   */
+  readonly maxRetries: number;
+  /**
+   * §8's global run cap, in tokens across every worker sharing a `runID`.
+   *
+   * Per-worker budgets stop one worker running away; this stops a wave doing it.
+   * `0` disables it.
+   */
+  readonly runBudgetTokens: number;
 }
 
 /** `.orchestrator/` is already git-excluded for the worktrees; the index joins it. */
@@ -80,6 +95,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     // Clamped, not validated, for the same reason as the cap above: a typo in an
     // env var should start the server on the default rather than refuse to launch.
     maxRevisions: clampRevisions(numberOr(env["ORCHESTRATOR_MAX_REVISIONS"])),
+    maxRetries: clampRetries(numberOr(env["ORCHESTRATOR_MAX_RETRIES"])),
+    runBudgetTokens: clampRunBudget(numberOr(env["ORCHESTRATOR_RUN_BUDGET_TOKENS"])),
   };
 }
 
@@ -95,4 +112,25 @@ export const MAX_REVISIONS_LIMIT = 20;
 export function clampRevisions(value: number | undefined): number {
   if (value === undefined || !Number.isFinite(value)) return DEFAULT_MAX_REVISIONS;
   return Math.max(0, Math.min(MAX_REVISIONS_LIMIT, Math.floor(value)));
+}
+
+/** A ceiling on retries. Past this it is not a transient failure any more. */
+export const MAX_RETRIES_LIMIT = 10;
+
+export function clampRetries(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_MAX_RETRIES;
+  return Math.max(0, Math.min(MAX_RETRIES_LIMIT, Math.floor(value)));
+}
+
+/**
+ * The run cap, clamped only at the bottom.
+ *
+ * No upper limit, unlike every other clamp here: a big number is somebody who
+ * has measured their own spend and means it, and refusing to honour it would be
+ * this file deciding how much a run is allowed to be worth. `0` disables the cap
+ * and is a legitimate setting rather than a typo to correct.
+ */
+export function clampRunBudget(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_RUN_BUDGET_TOKENS;
+  return Math.max(0, Math.floor(value));
 }
