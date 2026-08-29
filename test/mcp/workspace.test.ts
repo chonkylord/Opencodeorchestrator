@@ -49,6 +49,7 @@ async function harness(mockOpts: Parameters<typeof OCMock.start>[0] = {}): Promi
     baseUrl: mock.baseUrl,
     verifyTests: false,
     maxConcurrent: 3,
+    maxRevisions: 3,
   };
   const orchestrator = await createOrchestrator(config, {
     tickMs: 10,

@@ -21,7 +21,7 @@
  */
 
 import type { StoredEvent } from "../store/index.js";
-import type { MergeRecord, QueueHint, StartedMerge, WorkerRecord } from "../manager/index.js";
+import type { MergeRecord, QueueHint, RevisionCapReport, RevisionRound, StartedMerge, WorkerRecord } from "../manager/index.js";
 import type { CleanupReport, DiffPage, MergeStep, OverlapReport } from "../workspace/index.js";
 
 // ---------------------------------------------------------------------------
@@ -53,6 +53,12 @@ export const MESSAGE_CHARS_MAX = 8_000;
 export const RUN_REPORT_CHARS = 10_000;
 /** Workers one batched `worker_wait` may name. Past this, wait on a subset. */
 export const WAIT_IDS_MAX = 20;
+/** Claude's feedback to a worker. Generous — like a message, it is not worker output. */
+export const FEEDBACK_CHARS_MAX = 8_000;
+/** How much of one round's feedback the cap report echoes back. */
+const ROUND_FEEDBACK_CHARS = 300;
+/** How much of one round's worker-authored summary the cap report echoes. */
+const ROUND_SUMMARY_CHARS = 200;
 
 /**
  * Marks text the *worker* wrote, as opposed to the orchestrator's own findings.
@@ -136,7 +142,13 @@ function ordinal(n: number): string {
  */
 export function statusLine(r: WorkerRecord, now: number, hint?: QueueHint): string {
   const idle = duration(Math.max(0, now - r.updatedAt));
-  const rev = r.resumes > 0 ? ` · revisions: ${r.resumes}` : "";
+  // Two counters, two labels. Before Phase 6 this line printed `resumes` under
+  // the word "revisions", which was only ever harmless because nothing could
+  // make them disagree. `worker_revise` makes them disagree on its first call:
+  // `resumes` counts §5's blocked→answer→resume — the worker asking a question —
+  // and `revisions` counts §13's rounds, which is the one with the cap on it.
+  const rev =
+    (r.revisions > 0 ? ` · revisions: ${r.revisions}` : "") + (r.resumes > 0 ? ` · resumes: ${r.resumes}` : "");
   const queue = hint ? ` · ${queueNote(hint)}` : "";
   return (
     `${r.workerID} [${r.state}${r.reason ? `: ${r.reason}` : ""}] ${duration(elapsedMs(r, now))} elapsed · ` +
@@ -172,6 +184,10 @@ function nextStep(r: WorkerRecord, hint?: QueueHint): string {
     case "blocked":
       return "worker_result to read the questions, then worker_message to answer";
     case "completed":
+      // Three real options and they are not interchangeable, so the hint names
+      // the fork rather than the first one: read it, then either take the work
+      // or send it back. Nothing here decides that on Claude's behalf.
+      return "worker_result — then workspace_merge to take it, or worker_revise to send it back with feedback";
     case "merged":
       return "worker_result";
     case "interrupted":
@@ -562,4 +578,150 @@ export function renderCleanup(report: CleanupReport): string {
     );
   }
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// The revision loop (§11 Phase 6)
+// ---------------------------------------------------------------------------
+
+/** What a started revision tells Claude, including why it may not be running yet. */
+export function renderReviseStarted(
+  r: WorkerRecord,
+  round: number,
+  maxRevisions: number,
+  hint?: QueueHint,
+): string {
+  const lines: string[] = [];
+  lines.push(
+    `Revision ${round} of ${maxRevisions} requested for ${r.workerID}. Its existing session is being reused, ` +
+      "so it still has everything it read and worked out.",
+  );
+  if (hint) {
+    // A revision is a spawn-shaped thing and waits for a slot like one. Saying
+    // so here is the difference between "the tool did nothing" and "the tool did
+    // exactly what it should and the worker is third in line".
+    lines.push("", `It is not prompting yet: ${queueNote(hint)}. A slot frees when a running worker settles.`);
+  } else {
+    lines.push("", "It is starting now.");
+  }
+  lines.push(
+    "",
+    `Next: worker_wait({ids: ["${r.workerID}"]}) — it has left \`${r.result?.state ?? "its previous state"}\` already, so this waits ` +
+      "for the new round rather than returning the old result.",
+  );
+  return lines.join("\n");
+}
+
+/**
+ * §13's *terminal actionable report* — the whole reason the cap is a cap and not
+ * a wall.
+ *
+ * A revision cap that stops the loop and returns "limit reached" has converted a
+ * runaway into a dead end: Claude knows it may not ask again and knows nothing
+ * else. This says what was tried each round, what actually changed between them,
+ * what is still wrong, and what the remaining options are — because at this
+ * point the decision genuinely is Claude's, and the orchestrator's job is to
+ * hand over everything it measured while getting here.
+ *
+ * Everything the worker wrote is quoted and capped (DD-8); everything git and
+ * the test runner measured is not, and the two are visibly different kinds of
+ * line.
+ */
+export function renderRevisionCap(report: RevisionCapReport): string {
+  const lines: string[] = [];
+  const capped = report.reason === "revision_cap";
+
+  lines.push(
+    capped
+      ? `Revision refused: ${report.workerID} has already taken ${report.revisions} of ${report.maxRevisions} rounds.`
+      : `Revision refused: ${report.workerID} has spent ${report.totalTokens.toLocaleString("en-US")} of its ` +
+        `${report.tokenBudget.toLocaleString("en-US")}-token budget, and a revision re-sends the whole session.`,
+  );
+  lines.push(
+    capped
+      ? "The cap exists because a worker that has not converged in three rounds of specific feedback usually will not converge in a fourth — the instruction is more likely wrong than the worker."
+      : "Its wall clock would reset for a new round but its tokens do not: every round re-sends the accumulated context, so the next one would be killed by the budget mid-turn.",
+  );
+
+  // --- what was tried, round by round ---
+  lines.push("", `## What was tried (${report.rounds.length} round${report.rounds.length === 1 ? "" : "s"})`, "");
+  for (const round of report.rounds) {
+    lines.push(roundLine(round));
+  }
+
+  // --- what changed across them ---
+  const settled = report.rounds.filter((r: RevisionRound) => r.settled);
+  if (settled.length > 1) {
+    const first = settled[0]!;
+    const last = settled[settled.length - 1]!;
+    lines.push("", "## What changed across the rounds", "");
+    lines.push(
+      `- Files touched went from ${first.files ?? 0} to ${last.files ?? 0}; ` +
+        `the diff is now +${last.additions ?? 0}/−${last.deletions ?? 0} against its base.`,
+    );
+    const movedTests =
+      first.testsFailed !== undefined || last.testsFailed !== undefined
+        ? `- Failing tests went from ${first.testsFailed ?? 0} to ${last.testsFailed ?? 0}.`
+        : "- No test command was run for this worker, so nothing measured whether the rounds improved it.";
+    lines.push(movedTests);
+    lines.push(`- Discrepancies between what it claimed and what git shows: ${first.discrepancies ?? 0} → ${last.discrepancies ?? 0}.`);
+    if ((last.files ?? 0) === (first.files ?? 0) && (last.additions ?? 0) === (first.additions ?? 0)) {
+      lines.push(
+        "- **The diff did not move between the first and last round.** Feedback is reaching the worker and not changing what it produces, which usually means the feedback and the worker disagree about what the problem is.",
+      );
+    }
+  }
+
+  // --- what is still failing ---
+  lines.push("", "## What is still failing", "");
+  const result = report.result;
+  if (!result) {
+    lines.push(`- The worker is \`${report.state}\` and has no result recorded, so there is nothing measured to describe.`);
+  } else {
+    lines.push(`- State: \`${report.state}\`${result.reason ? ` (${result.reason})` : ""}.`);
+    if (result.tests?.failed) lines.push(`- Tests: ${result.tests.failed} failing${result.tests.command ? ` under \`${result.tests.command}\`` : ""}.`);
+    else if (result.tests) lines.push("- Tests: nothing reported as failing.");
+    if (result.discrepancies.length === 0) lines.push("- No discrepancies: what it claimed and what git shows agree.");
+    for (const d of result.discrepancies.slice(0, MAX_QUESTIONS)) {
+      lines.push(`- \`${d.kind}\`${d.file ? ` · \`${d.file}\`` : ""} — ${clampChars(d.detail, QUESTION_CHARS)}`);
+    }
+    if (result.risks.length > 0) {
+      lines.push("", "Its own last words about the risks:");
+      for (const risk of result.risks.slice(0, MAX_QUESTIONS)) lines.push(`${QUOTE}${clampChars(risk, QUESTION_CHARS)}`);
+    }
+  }
+
+  // --- what Claude can do ---
+  lines.push("", "## Your options", "");
+  lines.push(
+    `1. **Take it as it is.** Its branch \`${report.branch}\` still holds the work; \`workspace_merge\` gates it against the test suite and rolls back if it is red. Partial work that passes is still work.`,
+    `2. **Read the difference yourself.** \`worker_diff({id: "${report.workerID}"})\` is the whole diff — the rounds above are summaries of it, and a defect three rounds of feedback did not describe is often obvious in the diff.`,
+    "3. **Spawn a replacement with a better brief.** A fresh worker with the failure stated as the *task* rather than as feedback is not the same request, and it starts with none of this one's assumptions. This is usually the right call when the diff stopped moving.",
+    "4. **Fix it yourself.** Three rounds of specific feedback that did not land is evidence about the problem, not only about the worker.",
+  );
+  if (capped) {
+    lines.push(
+      "",
+      `Raising \`ORCHESTRATOR_MAX_REVISIONS\` above ${report.maxRevisions} is possible and is a decision about this repository rather than this worker. Nothing here does it for you.`,
+    );
+  }
+  return lines.join("\n");
+}
+
+/** One round of the loop: what was asked for, and what came back. */
+function roundLine(round: RevisionRound): string {
+  const head = round.round === 0 ? "**Round 0** (the original attempt)" : `**Round ${round.round}**`;
+  const asked =
+    round.feedback === undefined || round.feedback === ""
+      ? round.round === 0
+        ? " — the task as briefed"
+        : " — (the feedback was not recorded)"
+      : `\n  asked: ${QUOTE}${clampChars(round.feedback, ROUND_FEEDBACK_CHARS)}`;
+  if (!round.settled) return `${head}${asked}\n  outcome: still running.`;
+  const measured =
+    `${round.files ?? 0} file${(round.files ?? 0) === 1 ? "" : "s"} changed (+${round.additions ?? 0}/−${round.deletions ?? 0})` +
+    (round.testsFailed === undefined ? "" : `, ${round.testsFailed} test${round.testsFailed === 1 ? "" : "s"} failing`) +
+    (round.discrepancies ? `, ${round.discrepancies} discrepanc${round.discrepancies === 1 ? "y" : "ies"}` : "");
+  const said = round.summary ? `\n  it said: ${QUOTE}${clampChars(round.summary, ROUND_SUMMARY_CHARS)}` : "";
+  return `${head}${asked}\n  outcome: \`${round.state ?? "unknown"}\` — ${measured}.${said}`;
 }

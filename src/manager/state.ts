@@ -62,7 +62,20 @@ export const WORKER_STATES: readonly WorkerState[] = Object.freeze([
 /** States in which the worker may still be doing work of its own. */
 const ACTIVE: ReadonlySet<WorkerState> = new Set<WorkerState>(["spawned", "preparing", "running"]);
 
-/** States from which nothing further can happen. */
+/**
+ * States in which the worker will do nothing further *of its own accord*.
+ *
+ * Not "nothing can ever happen again": `completed --merge--> merged` was always
+ * an act from outside, and **Phase 6 adds `revise`, which is another** — four of
+ * the five states below accept it. What `final` means, precisely, is that no
+ * watchdog will fire, no event will arrive and no run loop is turning; only an
+ * explicit instruction from Claude moves the worker on. Callers rely on exactly
+ * that: `cancel()` returns early on a final worker because there is nothing to
+ * abort, and `dispose()` skips one because there is nothing to wind down.
+ *
+ * `merged` is the one that accepts nothing further at all — see the `revise`
+ * rows below for why.
+ */
 const FINAL: ReadonlySet<WorkerState> = new Set<WorkerState>([
   "merged",
   "failed",
@@ -134,7 +147,9 @@ export type Trigger =
   /** Claude chose "resume monitoring" for an interrupted worker (§9). */
   | "recover"
   /** Phase 4. */
-  | "merge";
+  | "merge"
+  /** §11 Phase 6: Claude sent feedback; the same session takes another turn. */
+  | "revise";
 
 export interface Transition {
   readonly from: WorkerState;
@@ -176,6 +191,24 @@ export const TRANSITIONS: readonly Transition[] = Object.freeze([
   { from: "blocked", trigger: "interrupt", to: "interrupted", note: "manager died with the question outstanding" },
 
   { from: "completed", trigger: "merge", to: "merged", note: "Phase 4's gated merge" },
+
+  // §11 Phase 6's review loop. Every one of these lands in `spawned` rather than
+  // in `running`, and that is the phase's largest structural decision: a
+  // revision is a spawn-shaped thing that has to re-acquire a concurrency slot
+  // (ADR-0004's gate sits between `spawned` and `preparing`), so it re-enters
+  // the lifecycle where a spawn does and reuses `prepare` and `start` from
+  // there. A revision admitted straight to `running` would hold no slot and
+  // would put a session on the shared backend that nothing is counting.
+  // See `docs/adr/0005-the-review-loop.md`.
+  { from: "completed", trigger: "revise", to: "spawned", note: "Claude sent feedback; the same session takes another turn" },
+  { from: "failed", trigger: "revise", to: "spawned", note: "revising a failure: worth it for a dead server, not for a content filter" },
+  { from: "timed_out", trigger: "revise", to: "spawned", note: "the session outlived the deadline; a narrower instruction may not" },
+  { from: "over_budget", trigger: "revise", to: "spawned", note: "a fresh wall clock, but the session's tokens keep accumulating" },
+  { from: "cancelled", trigger: "revise", to: "spawned", note: "redirect a worker that was stopped for going the wrong way" },
+  // `merged` deliberately has no `revise` row. Its commits are already on an
+  // integration branch; a revision would produce a commit that branch does not
+  // have, and the run report would show a merged worker whose branch tip is not
+  // what was merged. Respawn instead.
 
   { from: "interrupted", trigger: "recover", to: "running", note: "§9: resume monitoring a session that is still alive" },
   { from: "interrupted", trigger: "fail", to: "failed", note: "§9: fail-and-cleanup" },

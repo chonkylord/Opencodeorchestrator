@@ -44,11 +44,25 @@ import {
   isBlocking,
   isWorkerEvent,
 } from "../opencode/index.js";
-import { type Brief, REPORT_RETRY_COUNT, REPORT_SCHEMA, buildAnswerPrompt, buildBrief, parseReport, reconcile } from "../briefs/index.js";
+import {
+  type Brief,
+  REPORT_RETRY_COUNT,
+  REPORT_SCHEMA,
+  REVIEW_DIFF_LINES,
+  type ReviewTarget,
+  buildAnswerPrompt,
+  buildBrief,
+  buildReviewPrompt,
+  buildRevisionPrompt,
+  parseReport,
+  reconcile,
+} from "../briefs/index.js";
 import type { Store } from "../store/index.js";
 import {
   changedFiles,
   createWorktree,
+  readCommitDiff,
+  readDiff,
   defaultWorktreeRoot,
   diffStat,
   listManifests,
@@ -58,7 +72,8 @@ import {
   snapshotCommit,
   writeManifest,
 } from "../workspace/index.js";
-import { type Admission, DEFAULT_MAX_CONCURRENT, type QueueHint, Scheduler } from "./scheduler.js";
+import { type Admission, DEFAULT_MAX_CONCURRENT, DependencyError, type QueueHint, Scheduler } from "./scheduler.js";
+import { type RevisionRound, revisionRounds } from "./revisions.js";
 import { WorkerMachine, type WorkerState, isSettled } from "./state.js";
 import type {
   Discrepancy,
@@ -92,6 +107,18 @@ export const DEFAULT_BUDGET: WorkerBudget = Object.freeze({
 
 /** DD-9: task type routes to model. One default until Phase 8 measures better. */
 export const DEFAULT_MODEL = "opencode/muse-spark-1.2-contributor-free";
+
+/**
+ * §5's revision cap, and §13's mitigation for infinite fix loops.
+ *
+ * Three is the number §5 has carried since before Phase 0, and nothing measured
+ * since argues with it: a defect a worker cannot fix in three rounds of specific
+ * feedback is usually one where the instruction, not the worker, is wrong. The
+ * cap is a backstop and not a licence — nothing in this system revises a worker
+ * on its own, and §11 Phase 6 is explicit that Claude decides and the tools
+ * report. `ORCHESTRATOR_MAX_REVISIONS` moves it.
+ */
+export const DEFAULT_MAX_REVISIONS = 3;
 
 /**
  * What an `implement` worker is allowed, on top of the adapter's headless set.
@@ -145,6 +172,14 @@ export interface WorkerManagerOptions {
    * `ORCHESTRATOR_MAX_CONCURRENT`.
    */
   readonly maxConcurrent?: number;
+  /**
+   * How many revision rounds one worker may take (§5, §13).
+   *
+   * Defaults to {@link DEFAULT_MAX_REVISIONS}; the server reads it from
+   * `ORCHESTRATOR_MAX_REVISIONS`. At the cap {@link WorkerManager.revise}
+   * refuses, and the refusal carries the terminal report §13 calls actionable.
+   */
+  readonly maxRevisions?: number;
   /** Watchdog resolution. Small in tests, ~1s in production. */
   readonly tickMs?: number;
   /** How often to poll the backend for token usage. */
@@ -194,6 +229,47 @@ type Disposition =
 
 type AnswerOutcome = { kind: "answer"; text: string } | { kind: "cancel" } | { kind: "timeout" };
 
+/** Why {@link WorkerManager.revise} declined. Both are reports, not errors. */
+export type RevisionRefusal = "revision_cap" | "token_budget";
+
+/** What {@link WorkerManager.revise} answers with. */
+export type ReviseOutcome =
+  | {
+      readonly kind: "started";
+      /** 1-based round number this feedback begins. */
+      readonly round: number;
+      readonly record: WorkerRecord;
+      /** Present when the round is waiting for a concurrency slot. */
+      readonly hint?: QueueHint;
+    }
+  | {
+      readonly kind: "refused";
+      readonly reason: RevisionRefusal;
+      /** §13's *terminal actionable report*. Rendered by `renderRevisionCap`. */
+      readonly report: RevisionCapReport;
+    };
+
+/**
+ * Everything §13's terminal report needs, gathered rather than formatted.
+ *
+ * The manager produces the facts and `src/mcp/render.ts` turns them into prose,
+ * which is the same split every other surface here uses — and it is what lets
+ * the cap be tested on its content rather than on its wording.
+ */
+export interface RevisionCapReport {
+  readonly workerID: string;
+  readonly reason: RevisionRefusal;
+  readonly revisions: number;
+  readonly maxRevisions: number;
+  readonly totalTokens: number;
+  readonly tokenBudget: number;
+  readonly state: WorkerState;
+  readonly branch: string;
+  readonly rounds: readonly RevisionRound[];
+  readonly result?: WorkerResult;
+}
+
+
 /** Everything about one in-flight worker that is not in the database. */
 class ManagedWorker {
   readonly machine: WorkerMachine;
@@ -211,6 +287,17 @@ class ManagedWorker {
   totalTokens = 0;
   cost = 0;
   resumes = 0;
+  /** Revision rounds actually prompted. §13's cap counts this, not `resumes`. */
+  revisions = 0;
+  /**
+   * A revision that has been asked for and has not finished.
+   *
+   * One worker takes one round at a time. Without this, two `worker_revise`
+   * calls in the same tick both find a settled worker, both pass the cap check,
+   * and both start a run loop over one session — two subscriptions, two prompts,
+   * and a `done` that only tracks the second of them.
+   */
+  reviseInFlight = false;
   questions: readonly string[] = [];
   abortIntent: AbortIntent | undefined;
   /** An abort we did not ask for still has to be distinguished from a clean end. */
@@ -264,6 +351,23 @@ class ManagedWorker {
 
 const MAX_REPLY_CHARS = 512 * 1024;
 
+/** How much of Claude's feedback the audit trail keeps, per round. */
+const FEEDBACK_TRAIL_CHARS = 2_000;
+
+/** How much of a worker's own summary each round's trail entry keeps. */
+const SUMMARY_TRAIL_CHARS = 400;
+
+/**
+ * How far back {@link WorkerManager.revisionHistory} reads.
+ *
+ * A worker capped at three rounds has a few dozen events; this is a ceiling that
+ * stops a pathological trail from being loaded whole, not a page size.
+ */
+const REVISION_TRAIL_LIMIT = 2_000;
+
+/** Reconciliation findings handed to a reviewer before it starts. */
+const MAX_REVIEW_DISCREPANCIES = 10;
+
 // ---------------------------------------------------------------------------
 // The manager
 // ---------------------------------------------------------------------------
@@ -300,6 +404,7 @@ export class WorkerManager {
       models: options.models ?? {},
       budget: { ...DEFAULT_BUDGET, ...options.budget },
       maxConcurrent: options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT,
+      maxRevisions: Math.max(0, Math.floor(options.maxRevisions ?? DEFAULT_MAX_REVISIONS)),
       tickMs: options.tickMs ?? 1_000,
       budgetPollMs: options.budgetPollMs ?? 15_000,
       abortGraceMs: options.abortGraceMs ?? 10_000,
@@ -322,6 +427,11 @@ export class WorkerManager {
   /** The cap this manager is enforcing. Configuration, exposed for reporting. */
   get maxConcurrent(): number {
     return this.scheduler.maxConcurrent;
+  }
+
+  /** §5's revision cap. Configuration, exposed so the tools can quote it. */
+  get maxRevisions(): number {
+    return this.opts.maxRevisions;
   }
 
   /**
@@ -357,6 +467,24 @@ export class WorkerManager {
     // Before any row is written: a spawn that cannot ever run leaves nothing
     // behind to explain later.
     this.scheduler.validate(workerID, spec.dependsOn ?? []);
+    // Same rule as `dependsOn`, and for the same reason: ids are minted by
+    // `spawn()`, so one nobody has been handed is a typo, and a typo honoured
+    // here becomes a reviewer that starts, finds nothing to review and reports
+    // an opinion about an empty diff.
+    if (spec.reviewOf !== undefined) {
+      if (spec.reviewOf === workerID) throw new DependencyError(`reviewOf cannot name the reviewer itself (${workerID}).`);
+      if (!this.get(spec.reviewOf)) {
+        throw new DependencyError(
+          `reviewOf names a worker that does not exist: ${spec.reviewOf}. ` +
+            "Worker ids are assigned by worker_spawn, so the worker being reviewed must already have been spawned.",
+        );
+      }
+      if ((spec.mode ?? "implement") !== "review") {
+        throw new DependencyError(
+          `reviewOf was given with mode "${spec.mode ?? "implement"}". It points a review worker at another worker's diff, so it only means anything with mode: "review".`,
+        );
+      }
+    }
     const runID = spec.runID ?? "run-default";
     const mode: WorkerMode = spec.mode ?? "implement";
     const model = spec.model ?? this.opts.models[mode] ?? this.opts.defaultModel;
@@ -380,6 +508,7 @@ export class WorkerManager {
       totalTokens: 0,
       cost: 0,
       resumes: 0,
+      revisions: 0,
       questions: [],
     };
 
@@ -560,6 +689,148 @@ export class WorkerManager {
     w.answer = undefined;
     await resumed;
     return w.record.current;
+  }
+
+  /**
+   * Send Claude's feedback to a settled worker and let it take another turn
+   * (§5's revision path, §11 Phase 6).
+   *
+   * The session is reused, which is the entire point: the worker keeps every
+   * file it read and every conclusion it drew, so feedback costs one turn rather
+   * than a whole respawn. Phase 0 verified the reuse retains context and the
+   * spike still asserts it.
+   *
+   * Returns as soon as the revision is *registered*, not when it has run
+   * (DD-1) — but it moves the worker out of its settled state **before it
+   * returns**, so a `worker_wait` on the next line has something to wait for
+   * rather than coming straight back with the pre-revision record.
+   *
+   * Four things about this are load-bearing and none of them are obvious:
+   *
+   * - **It re-enters the concurrency queue.** A settled worker holds no slot —
+   *   `drive()` releases it after `settle()` — so a revision that skipped the
+   *   gate would put a session on the shared backend that nothing is counting.
+   *   Revise three completed workers while three others run and a cap of three
+   *   is silently six. So a revision acquires, runs, settles and releases, the
+   *   way a spawn does, and while it waits its record says `queued`.
+   * - **The new `done` is installed synchronously**, in the same tick as the
+   *   state change. `dispose()` awaits `w.done`, and a settled worker's `done`
+   *   resolved long ago; a gap here is a shutdown that returns while a revision
+   *   is still prompting a session.
+   * - **The cap counts rounds actually taken**, not rounds asked for. A revision
+   *   that sits in the queue and is cancelled there took no round.
+   * - **At the cap it refuses with a report rather than an error.** §13's
+   *   mitigation for infinite fix loops is a cap *with a terminal actionable
+   *   report*; a cap that stops the loop and produces nothing Claude can act on
+   *   has converted a runaway into a dead end.
+   */
+  revise(workerID: string, feedback: string): ReviseOutcome {
+    const w = this.workers.get(workerID);
+    if (!w) {
+      const stored = this.opts.store.getWorker(workerID);
+      throw new Error(
+        stored
+          ? `worker ${workerID} belongs to a previous manager process; its session is gone, so there is nothing to revise. Spawn a new worker.`
+          : `unknown worker ${workerID}`,
+      );
+    }
+    if (this.halted) throw new Error(`the manager is shutting down; ${workerID} cannot be revised`);
+    if (w.reviseInFlight) {
+      throw new Error(`worker ${workerID} is already revising; wait for that round to settle before sending more feedback`);
+    }
+
+    const rec = w.record.current;
+    if (!w.machine.can("revise")) throw new Error(notRevisable(rec, w.machine.state));
+    // Every revisable state is one this worker reached *after* being prompted,
+    // so a missing session here means the session died with the manager that
+    // owned it — there is nothing to reuse and a respawn is the honest answer.
+    if (!w.session) {
+      throw new Error(
+        `worker ${workerID} has no live session to revise — it never opened one, or it belongs to a previous process. Spawn a new worker instead.`,
+      );
+    }
+
+    const round = w.revisions + 1;
+    const budget = this.budgetFor(rec.spec);
+    if (w.revisions >= this.opts.maxRevisions) {
+      return { kind: "refused", reason: "revision_cap", report: this.capReport(w, "revision_cap") };
+    }
+    // The wall clock is per turn but the tokens are not: they accumulate in the
+    // session, because every round re-sends the whole context. A worker already
+    // at its token ceiling would be admitted, prompted and killed by the first
+    // budget poll, which reads as a revision that silently did nothing.
+    if (rec.totalTokens >= budget.tokens) {
+      return { kind: "refused", reason: "token_budget", report: this.capReport(w, "token_budget") };
+    }
+
+    // --- from here down, nothing awaits until `done` is installed ---
+    w.reviseInFlight = true;
+    // Sticky, and Phase 5 made it load-bearing: `prepareAndRun()` bails at four
+    // step boundaries when it is set, so a worker that was stopped and is now
+    // being deliberately redirected would abandon its round with a reason from
+    // its previous life.
+    w.cancelRequested = undefined;
+    w.machine.apply("revise", { reason: "revision_requested", detail: { round } });
+    this.opts.store.appendEvent(workerID, "revision_requested", {
+      round,
+      maxRevisions: this.opts.maxRevisions,
+      // Claude's own words, capped the way every other quoted string here is.
+      feedback: feedback.slice(0, FEEDBACK_TRAIL_CHARS),
+      feedbackChars: feedback.length,
+    });
+
+    const admission = this.scheduler.enqueue(workerID, []);
+    const hint = this.scheduler.hint(workerID);
+    this.update(w, {
+      state: w.machine.state,
+      reason: hint?.reason ?? "revising",
+      // It has not ended; a stale `endedAt` freezes every elapsed figure at the
+      // moment the previous round finished.
+      endedAt: undefined,
+      questions: [],
+    });
+    if (hint) {
+      this.opts.store.appendEvent(workerID, "queued", {
+        reason: hint.reason,
+        position: hint.position,
+        running: hint.running,
+        maxConcurrent: hint.maxConcurrent,
+        revision: round,
+      });
+    }
+    w.done = this.driveRevision(w, admission, feedback, round).catch(() => {
+      /* driveRevision is total, exactly as drive() is: every failure is a state. */
+    });
+    return { kind: "started", round, record: w.record.current, ...(hint ? { hint } : {}) };
+  }
+
+  /**
+   * Every round this worker has taken, oldest first, rebuilt from the trail.
+   *
+   * Read from the event log rather than kept in a column: the rounds are only
+   * ever needed whole, at the cap or in the run report, and DD-7's rule is that
+   * the index holds nothing whose loss breaks a run. The trail is already the
+   * durable record of what happened and this is a view over it.
+   */
+  revisionHistory(workerID: string): RevisionRound[] {
+    return revisionRounds(this.opts.store.listEvents(workerID, { limit: REVISION_TRAIL_LIMIT }));
+  }
+
+  /** The refusal, as data. {@link renderRevisionCap} turns it into the report. */
+  private capReport(w: ManagedWorker, reason: RevisionRefusal): RevisionCapReport {
+    const rec = w.record.current;
+    return {
+      workerID: rec.workerID,
+      reason,
+      revisions: w.revisions,
+      maxRevisions: this.opts.maxRevisions,
+      totalTokens: rec.totalTokens,
+      tokenBudget: this.budgetFor(rec.spec).tokens,
+      state: rec.state,
+      branch: rec.branch,
+      rounds: this.revisionHistory(rec.workerID),
+      ...(rec.result === undefined ? {} : { result: rec.result }),
+    };
   }
 
   /**
@@ -771,6 +1042,148 @@ export class WorkerManager {
     }
   }
 
+  /**
+   * One revision round, from the queue to a settled row.
+   *
+   * The shape mirrors {@link WorkerManager.drive} deliberately — admission,
+   * turn, settle, release — because a revision *is* a spawn-shaped thing and the
+   * two must not drift apart. What differs is only what happens in the middle:
+   * no worktree is created and no session is opened, because reusing both is the
+   * whole point.
+   */
+  private async driveRevision(w: ManagedWorker, admission: Promise<Admission>, feedback: string, round: number): Promise<void> {
+    const workerID = w.record.current.workerID;
+    const verdict = await admission;
+    if (this.halted) return;
+
+    if (verdict.kind === "refused") {
+      // The round never ran: no prompt went out, no tokens were spent, and the
+      // worktree is exactly as the previous round left it. So this settles the
+      // worker **without rebuilding its result** — re-running the reconciliation
+      // here would overwrite a real result describing real work with one
+      // describing a round that did not happen.
+      w.reviseInFlight = false;
+      w.machine.tryApply("cancel", { reason: verdict.reason, detail: { revision: round, prompted: false } });
+      this.opts.store.appendEvent(workerID, "revision_abandoned", { round, reason: verdict.reason });
+      this.update(w, { state: w.machine.state, reason: verdict.reason, endedAt: this.opts.now() });
+      this.notify(w);
+      return;
+    }
+
+    if (w.record.current.reason !== undefined) this.update(w, { reason: undefined });
+
+    let disposition: Disposition;
+    try {
+      disposition = await this.reviseTurn(w, feedback, round);
+    } catch (e) {
+      const err = e instanceof OpenCodeError ? e : undefined;
+      disposition = {
+        kind: "failed",
+        reason: err ? `backend_${err.code}` : "manager_error",
+        ...(err ? { error: err } : {}),
+      };
+      if (!err) this.opts.store.appendEvent(workerID, "manager_error", { message: String(e) });
+    } finally {
+      // The revision opened its own subscription; it closes here for the same
+      // reason `drive()` closes the first one, and in the same one place.
+      w.stream?.close();
+    }
+    if (this.halted) return;
+    // Cleared *before* settling, not after. The round is over — a disposition
+    // exists — and settling is the manager's own bookkeeping. Clearing it
+    // afterwards would leave the flag set at the moment `settle()` wakes every
+    // waiter, so a caller that did `worker_wait` then `worker_revise` could be
+    // told a revision was in flight when the one it waited for had just ended.
+    w.reviseInFlight = false;
+    try {
+      await this.settle(w, disposition);
+    } finally {
+      this.scheduler.release(workerID);
+    }
+  }
+
+  /**
+   * Prompt the existing session with Claude's feedback and read the turn out.
+   *
+   * Everything before the prompt is the answer to one question: which of
+   * `ManagedWorker`'s fields survived the previous `settle()` and are now
+   * *wrong*? The run loop was written once, for one turn, and a second turn
+   * inherits all of it.
+   */
+  private async reviseTurn(w: ManagedWorker, feedback: string, round: number): Promise<Disposition> {
+    const rec = w.record.current;
+    if (this.halted) return { kind: "cancelled", reason: "manager_halted" };
+    if (w.cancelRequested) return { kind: "cancelled", reason: w.cancelRequested };
+    w.machine.apply("prepare", { reason: "revising", detail: { round } });
+    this.update(w, { state: "preparing" });
+
+    // The report channel. `parseReport` takes the *first* usable object out of
+    // the reply, so an uncleared buffer makes the new report the old one with
+    // the new one stuck to the end of it — and the old one wins.
+    w.replyText = "";
+    w.replyTruncated = false;
+    // Terminal-event discrimination, from Phase 2's facts (1) and (3). A stale
+    // `sawAbort` turns this round's clean finish into `aborted_externally`, and
+    // a stale `abortIntent` settles it on the *previous* round's reason.
+    w.sawAbort = false;
+    w.abortIntent = undefined;
+    w.turnStarted = false;
+    w.retryAt = undefined;
+    w.lastError = undefined;
+    w.questions = [];
+    // `lastTerminalAt` is deliberately KEPT. It is what makes `promptTurn()`
+    // wait out the settle guard, and a revision prompts a session that has just
+    // gone terminal — which on OpenCode 1.18.25 is precisely the prompt that is
+    // accepted with 204 and then silently dropped. Clearing it here would
+    // produce a revision that does nothing at all, for 57 seconds, with no error.
+    // `formatRetried` and `structuredOutputOK` are kept latched too: the
+    // provider has not changed its mind about schema-constrained output.
+
+    // `drive()` closed the previous subscription in its `finally`, so this round
+    // needs a new one — awaited before the prompt goes out, for the reason
+    // `prepareAndRun()` subscribes first: a trivial turn can finish in ~11s and
+    // a late subscriber misses the completion entirely.
+    w.stream = await this.opts.backend.events(w.session!, { deltas: true });
+
+    if (this.halted) return { kind: "cancelled", reason: "manager_halted" };
+    if (w.cancelRequested) return { kind: "cancelled", reason: w.cancelRequested };
+
+    const now = this.opts.now();
+    // A fresh wall clock, set at the prompt rather than at the revise call, for
+    // the same reason queue time is free for a spawn: this is a new turn with a
+    // new instruction, and the deadline exists to stop *this* turn hanging.
+    // Tokens are not reset — they accumulate in the session, because each round
+    // re-sends the whole context, and that cumulative figure is the honest one.
+    w.runningSince = now;
+    w.blockedTotalMs = 0;
+    w.lastWorkerEventAt = now;
+    w.lastBudgetPollAt = now;
+    await this.promptTurn(w, buildRevisionPrompt(feedback, round, this.opts.maxRevisions));
+
+    w.revisions = round;
+    w.machine.apply("start", { reason: "revising", detail: { round } });
+    this.update(w, {
+      state: "running",
+      revisions: round,
+      reason: undefined,
+      endedAt: undefined,
+      questions: [],
+      // Kept at the *first* round's value, so elapsed time in the run report is
+      // the whole of this worker's life rather than only its last turn. The
+      // budget clock is `runningSince` and is a different number on purpose.
+      // The one exception is a worker that was stopped before it was ever
+      // prompted: it has a session but no start, and leaving it unset would make
+      // `buildResult` report this round as `not_started`.
+      ...(rec.startedAt === undefined ? { startedAt: now } : {}),
+    });
+    this.opts.store.appendEvent(rec.workerID, "revision_started", {
+      round,
+      ...(rec.sessionID === undefined ? {} : { sessionID: rec.sessionID }),
+    });
+
+    return this.pump(w);
+  }
+
   private async prepareAndRun(w: ManagedWorker): Promise<Disposition> {
     const rec = w.record.current;
     if (this.halted) return { kind: "cancelled", reason: "manager_halted" };
@@ -780,17 +1193,22 @@ export class WorkerManager {
 
     const repoRoot = await this.resolveRepo();
     const worktreeRoot = await this.resolveWorktreeRoot();
+    // Resolved before the worktree exists, because it decides where the worktree
+    // branches from: a reviewer reading a diff against one base while its own
+    // checkout sits on another is reviewing two different repositories at once.
+    const review = rec.mode === "review" && rec.spec.reviewOf ? await this.reviewTargetOf(rec.spec.reviewOf) : undefined;
+    const baseRef = rec.spec.baseRef ?? review?.baseSha;
     const wt = await createWorktree({
       repoRoot,
       workerID: rec.workerID,
       root: worktreeRoot,
-      ...(rec.spec.baseRef === undefined ? {} : { baseRef: rec.spec.baseRef }),
+      ...(baseRef === undefined ? {} : { baseRef }),
     });
     this.update(w, { worktree: wt.path, branch: wt.branch, baseSha: wt.baseSha });
     this.writeManifest(w);
     if (w.cancelRequested) return { kind: "cancelled", reason: w.cancelRequested };
 
-    const brief = buildBrief({
+    const base = buildBrief({
       workerID: rec.workerID,
       spec: rec.spec,
       mode: rec.mode,
@@ -798,7 +1216,21 @@ export class WorkerManager {
       baseSha: wt.baseSha,
       worktree: wt.path,
     });
+    // A reviewer's standing contract is the same as anyone's; only the turn's
+    // instruction differs, because the thing it is being pointed at is not in
+    // its own worktree. The system half is untouched so the read-only rules and
+    // the report format still arrive with every prompt (ADR-0002).
+    const brief: Brief = review ? { ...base, text: buildReviewPrompt(review.target) } : base;
     w.brief = brief;
+    if (review) {
+      this.opts.store.appendEvent(rec.workerID, "review_target", {
+        target: review.target.workerID,
+        baseSha: review.baseSha,
+        diffLines: review.target.diff.length,
+        truncated: review.target.diffTruncated,
+        source: review.source,
+      });
+    }
 
     const session = await this.opts.backend.createSession({
       cwd: wt.path,
@@ -1273,10 +1705,18 @@ export class WorkerManager {
       result,
       questions: [...result.questions],
     });
+    // The trail is where {@link WorkerManager.revisionHistory} reads a round's
+    // outcome from, so it carries what "what changed this round" needs — and the
+    // round number, without which two settles are indistinguishable.
     this.opts.store.appendEvent(rec.workerID, "settled", {
       state: w.machine.state,
       discrepancies: result.discrepancies.length,
       files: result.changes.files,
+      additions: result.changes.additions,
+      deletions: result.changes.deletions,
+      ...(w.revisions > 0 ? { revision: w.revisions } : {}),
+      ...(result.tests?.failed === undefined ? {} : { testsFailed: result.tests.failed }),
+      ...(result.summary === "" ? {} : { summary: result.summary.slice(0, SUMMARY_TRAIL_CHARS) }),
     });
     this.notify(w);
   }
@@ -1421,6 +1861,53 @@ export class WorkerManager {
 
   // --- plumbing -----------------------------------------------------------
 
+  /**
+   * Assemble what a `review` worker is pointed at (§6.1, §11 Phase 6).
+   *
+   * §6.1 offered two shapes — "no worktree, or a read-only mount of the target
+   * worktree" — and this is the third, which is the one that keeps the
+   * measurements honest: the reviewer gets **its own** worktree at the target's
+   * base, and the target's diff arrives quoted in its brief.
+   *
+   * Mounting the target's worktree would have made every file the *author*
+   * changed show up as a change by the *reviewer*, because `buildResult()`
+   * measures a worker's own directory against its own base — a read-only worker
+   * would have settled with a discrepancy for each of them. With its own
+   * worktree the reviewer's measured diff is genuinely empty, which means a
+   * reviewer that somehow writes something is visible rather than camouflaged.
+   *
+   * The diff is read from the target's worktree while it exists and from its
+   * snapshot commit once it does not, exactly as `worker_diff` does — a review
+   * spawned after a cleanup is still a review.
+   */
+  private async reviewTargetOf(targetID: string): Promise<{ target: ReviewTarget; baseSha: string; source: string }> {
+    const t = this.get(targetID);
+    if (!t) throw new Error(`reviewOf names a worker that does not exist: ${targetID}`);
+
+    let page: Awaited<ReturnType<typeof readDiff>> | undefined;
+    let source = "none";
+    if (t.worktree && existsSync(t.worktree)) {
+      page = await readDiff(t.worktree, { baseSha: t.baseSha, maxLines: REVIEW_DIFF_LINES });
+      source = "worktree";
+    } else if (t.result?.snapshot?.sha) {
+      page = await readCommitDiff(await this.resolveRepo(), t.baseSha, t.result.snapshot.sha, { maxLines: REVIEW_DIFF_LINES });
+      source = "snapshot";
+    }
+
+    const target: ReviewTarget = {
+      workerID: t.workerID,
+      task: t.task,
+      summary: t.result?.summary ?? "",
+      changedPaths: t.result?.changes.paths ?? [],
+      diff: page?.lines ?? ["(the orchestrator could not read a diff for this worker)"],
+      diffTruncated: page?.hasMore ?? false,
+      // The orchestrator's own reconciliation, handed over so the reviewer does
+      // not spend its one round re-deriving findings that are already measured.
+      discrepancies: (t.result?.discrepancies ?? []).slice(0, MAX_REVIEW_DISCREPANCIES).map((d) => `${d.kind}: ${d.detail}`),
+    };
+    return { target, baseSha: t.baseSha, source };
+  }
+
   private budgetFor(spec: WorkerSpec): WorkerBudget {
     return { ...this.opts.budget, ...spec.budget };
   }
@@ -1479,6 +1966,28 @@ function delay(ms: number): { promise: Promise<{ t: "tick" }>; cancel: () => voi
 
 function permissionQuestion(e: { permission: string; patterns: readonly string[] }): string {
   return `the worker needs permission "${e.permission}" for ${e.patterns.join(", ") || "an unspecified target"}`;
+}
+
+/** The refusal a non-revisable state earns, with the way forward named. */
+function notRevisable(rec: WorkerRecord, state: WorkerState): string {
+  const head = `worker ${rec.workerID} is ${state} and cannot be revised`;
+  switch (state) {
+    case "blocked":
+      return `${head}: it is waiting for an answer, not for feedback. Read its questions with worker_result and reply with worker_message — that is the same session too.`;
+    case "merged":
+      return (
+        `${head}: its commits are already on an integration branch. A revision would produce a commit that branch does not have, ` +
+        "so the run report would name a merged worker whose branch tip is not what was merged. Spawn a new worker for the follow-up change."
+      );
+    case "interrupted":
+      return `${head}: the manager restarted while it was mid-flight, so its session did not survive. Its worktree is intact — read it, then spawn a new worker.`;
+    case "spawned":
+    case "preparing":
+    case "running":
+      return `${head}: it is still working. Wait for it to settle (worker_wait), read what it produced, and revise it then.`;
+    default:
+      return head;
+  }
 }
 
 function snapshotMessage(rec: WorkerRecord): string {

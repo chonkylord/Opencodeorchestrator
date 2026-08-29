@@ -49,6 +49,7 @@ import { DIFF_LINES_DEFAULT, DIFF_LINES_MAX, cleanupWorkspace, gitLine, readComm
 import {
   EVENTS_PAGE_DEFAULT,
   EVENTS_PAGE_MAX,
+  FEEDBACK_CHARS_MAX,
   LIST_ROWS_MAX,
   MESSAGE_CHARS_MAX,
   WAIT_IDS_MAX,
@@ -61,6 +62,8 @@ import {
   renderMergeStart,
   renderNoResult,
   renderPending,
+  renderReviseStarted,
+  renderRevisionCap,
   renderRunReport,
   renderWaitMany,
   statusLine,
@@ -170,7 +173,14 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         "command whenever the repository has one: the orchestrator re-runs it itself afterwards, and " +
         "that independent run is what turns 'tests pass' from a claim into a finding.\n\n" +
         "MODES: `implement` may edit files and run commands; `research` and `review` are read-only and " +
-        "cannot write anything, which is what makes them safe to point at unfamiliar code.",
+        "cannot write anything, which is what makes them safe to point at unfamiliar code.\n\n" +
+        "REVIEW WORKERS: pass `reviewOf` with the id of a worker that has settled, and this one reads its " +
+        "diff and critiques it. Worth knowing what that is and is not: every worker here runs on the same " +
+        "model, so a reviewer shares the author's blind spots, and its critique is one more model's OPINION. " +
+        "The orchestrator's own evidence is stronger and you already have it — the diff-versus-report " +
+        "reconciliation in worker_result, and the test command it re-ran itself. Use a reviewer for the " +
+        "judgement those cannot make (is this the right approach, does it handle the cases the task implied), " +
+        "not to confirm what they already measured.",
       inputSchema: {
         task: z
           .string()
@@ -186,6 +196,15 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
           .enum(["implement", "research", "review"])
           .optional()
           .describe("implement (edit+bash, the default) | research | review (both strictly read-only)"),
+        reviewOf: z
+          .string()
+          .max(100)
+          .optional()
+          .describe(
+            "With mode:'review' only — the id of a worker whose diff this one should critique. The reviewer " +
+              "gets that diff, that worker's report, and a read-only checkout of the code as it was BEFORE the " +
+              "change. It cannot edit anything.",
+          ),
         ownedPaths: z
           .array(z.string().max(500))
           .max(100)
@@ -259,6 +278,7 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         ...(args.notes === undefined ? {} : { notes: args.notes }),
         ...(args.budget === undefined ? {} : { budget: args.budget }),
         ...(args.dependsOn === undefined ? {} : { dependsOn: args.dependsOn }),
+        ...(args.reviewOf === undefined ? {} : { reviewOf: args.reviewOf }),
       };
       try {
         const r = await manager.spawn(spec);
@@ -547,6 +567,59 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         `Answer delivered to ${id}. It is resuming its existing session, which takes a moment.\n` +
           `Next: worker_status({ids: ["${id}"]}) — it should return to \`running\`, then settle as usual.`,
       );
+    },
+  );
+
+  // --- worker_revise ------------------------------------------------------
+
+  server.registerTool(
+    "worker_revise",
+    {
+      title: "Send a settled worker back to work with feedback",
+      description:
+        "Give a worker that has finished your feedback and let it take another turn. The SAME session is " +
+        "reused, so it still has every file it read and every decision it made — a revision costs one turn " +
+        "where a replacement costs a whole session, and the replacement would start by rediscovering what " +
+        "this worker already knows.\n\n" +
+        "USE IT WHEN: worker_result shows a discrepancy, a failing test, work that misses part of the task, " +
+        "or an approach you want changed. Say concretely what is wrong and what you want instead — this is " +
+        "the worker's only new information, and vague feedback produces a second round that guesses.\n" +
+        "DO NOT USE IT: to re-run the same instruction (that is a retry, and nothing here retries); on a " +
+        "`blocked` worker (it is waiting for an ANSWER — use worker_message); or on a `merged` worker (its " +
+        "commits are already on the integration branch, so spawn a follow-up worker instead).\n\n" +
+        "CAPPED, deliberately. A worker gets a small number of rounds; at the cap this refuses and returns a " +
+        "report of what was tried each round, what actually changed between them, what is still failing, and " +
+        "your options. That refusal is the useful part — a worker that has not converged after three rounds " +
+        "of specific feedback usually needs a different brief, not a fourth round.\n\n" +
+        "Returns immediately, before the round has started (it may queue behind running workers, exactly as a " +
+        "spawn does). The worker leaves its settled state straight away, so a worker_wait on the next call " +
+        "waits for the new round rather than returning the old result.",
+      inputSchema: {
+        id: z.string().max(100).describe("The settled worker to send back."),
+        feedback: z
+          .string()
+          .min(1)
+          .max(FEEDBACK_CHARS_MAX)
+          .describe(
+            "What is wrong and what you want instead. Concrete: name the file, the case it misses, the test " +
+              "that fails. This is quoted to the worker as the orchestrator's feedback.",
+          ),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ id, feedback }): Promise<ToolResult> => {
+      const r = find(id);
+      if (!r) return unknown(id);
+      try {
+        // Unlike `answer()`, this does not need starting-and-returning: it is
+        // synchronous by construction, precisely so the state change and the new
+        // `done` land before it returns. The turn itself runs detached.
+        const outcome = manager.revise(id, feedback);
+        if (outcome.kind === "refused") return ok(renderRevisionCap(outcome.report));
+        return ok(renderReviseStarted(outcome.record, outcome.round, manager.maxRevisions, outcome.hint));
+      } catch (e) {
+        return fail(message(e));
+      }
     },
   );
 

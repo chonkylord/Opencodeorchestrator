@@ -55,6 +55,7 @@ describe("configuration", () => {
         ORCHESTRATOR_MODEL: "acme/big",
         ORCHESTRATOR_BASE_URL: "http://127.0.0.1:4096",
         ORCHESTRATOR_VERIFY_TESTS: "0",
+        ORCHESTRATOR_MAX_REVISIONS: "5",
       },
       "/ignored",
     );
@@ -65,6 +66,7 @@ describe("configuration", () => {
       baseUrl: "http://127.0.0.1:4096",
       verifyTests: false,
       maxConcurrent: 3,
+      maxRevisions: 5,
     });
     // `:memory:` is a SQLite keyword, not a path, and must survive resolution.
     expect(loadConfig({ ORCHESTRATOR_DB: ":memory:" }, "/x").dbPath).toBe(":memory:");
@@ -80,6 +82,18 @@ describe("configuration", () => {
     expect(loadConfig({ ORCHESTRATOR_MAX_CONCURRENT: "banana" }, "/x").maxConcurrent).toBe(3);
     expect(loadConfig({ ORCHESTRATOR_MAX_CONCURRENT: "" }, "/x").maxConcurrent).toBe(3);
     expect(loadConfig({ ORCHESTRATOR_MAX_CONCURRENT: "9999" }, "/x").maxConcurrent).toBe(32);
+  });
+
+  test("ORCHESTRATOR_MAX_REVISIONS is clamped the same way, and 0 turns revisions off", () => {
+    // §5's default has been 3 since before Phase 0. Zero is a legitimate
+    // setting rather than a typo to correct — a repository that wants Claude to
+    // respawn rather than revise says so this way — so it is clamped to 0 and
+    // not to 1, which is the one place this differs from the concurrency cap.
+    expect(loadConfig({}, "/x").maxRevisions).toBe(3);
+    expect(loadConfig({ ORCHESTRATOR_MAX_REVISIONS: "5" }, "/x").maxRevisions).toBe(5);
+    expect(loadConfig({ ORCHESTRATOR_MAX_REVISIONS: "0" }, "/x").maxRevisions).toBe(0);
+    expect(loadConfig({ ORCHESTRATOR_MAX_REVISIONS: "banana" }, "/x").maxRevisions).toBe(3);
+    expect(loadConfig({ ORCHESTRATOR_MAX_REVISIONS: "9999" }, "/x").maxRevisions).toBe(20);
   });
 });
 
@@ -97,6 +111,7 @@ describe("start-up and recovery (§9)", () => {
       baseUrl: mock.baseUrl,
       verifyTests: false,
       maxConcurrent: 3,
+    maxRevisions: 3,
     };
 
     const first = await createOrchestrator(config, { tickMs: 10, abortGraceMs: 200 });
@@ -144,6 +159,7 @@ describe("start-up and recovery (§9)", () => {
         baseUrl: mock.baseUrl,
         verifyTests: false,
         maxConcurrent: 3,
+    maxRevisions: 3,
       },
       { tickMs: 10, abortGraceMs: 200 },
     );

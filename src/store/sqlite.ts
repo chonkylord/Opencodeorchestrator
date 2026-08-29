@@ -17,7 +17,7 @@ import { Database } from "bun:sqlite";
 import type { MergeRecord } from "../manager/types.js";
 import type { WorkerManifest, WorkerRecord, WorkerResult, WorkerSpec } from "../manager/types.js";
 import { isActive, type WorkerState } from "../manager/state.js";
-import { SCHEMA_SQL, SCHEMA_VERSION } from "./schema.js";
+import { MIGRATIONS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.js";
 
 export interface RunRow {
   readonly id: string;
@@ -62,6 +62,7 @@ interface WorkerRow {
   total_tokens: number;
   cost: number;
   resumes: number;
+  revisions: number;
   reason: string | null;
   questions: string;
   result: string | null;
@@ -97,6 +98,7 @@ export class Store {
     }
     this.db.exec("PRAGMA foreign_keys = ON");
     this.db.exec(SCHEMA_SQL);
+    this.migrate();
     this.db.query("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
   }
 
@@ -107,6 +109,30 @@ export class Store {
 
   close(): void {
     this.db.close();
+  }
+
+  /**
+   * Bring an older file up to {@link SCHEMA_VERSION}.
+   *
+   * `CREATE TABLE IF NOT EXISTS` adds a *table* to an existing database and adds
+   * nothing at all to an existing table, so a column declared in `SCHEMA_SQL`
+   * reaches fresh databases only. Phase 6's `workers.revisions` is the first
+   * column any phase has added, and this is what makes it reach the databases
+   * that already have rows in them.
+   *
+   * Re-running an `ADD COLUMN` that is already there is the expected case, not
+   * an error case — these run on every open — so a duplicate-column failure is
+   * swallowed and everything else is left to throw, because a migration failing
+   * for any other reason is a database this process should not keep writing to.
+   */
+  private migrate(): void {
+    for (const statement of MIGRATIONS) {
+      try {
+        this.db.exec(statement);
+      } catch (e) {
+        if (!/duplicate column name/i.test(String(e))) throw e;
+      }
+    }
   }
 
   // --- runs ---------------------------------------------------------------
@@ -170,14 +196,14 @@ export class Store {
       .query(
         `INSERT INTO workers
            (id, run_id, state, mode, model, task, spec, worktree, branch, base_sha, session_id,
-            created_at, updated_at, started_at, ended_at, total_tokens, cost, resumes, reason, questions, result)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            created_at, updated_at, started_at, ended_at, total_tokens, cost, resumes, revisions, reason, questions, result)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            run_id = excluded.run_id, state = excluded.state, mode = excluded.mode, model = excluded.model,
            task = excluded.task, spec = excluded.spec, worktree = excluded.worktree, branch = excluded.branch,
            base_sha = excluded.base_sha, session_id = excluded.session_id, updated_at = excluded.updated_at,
            started_at = excluded.started_at, ended_at = excluded.ended_at, total_tokens = excluded.total_tokens,
-           cost = excluded.cost, resumes = excluded.resumes, reason = excluded.reason,
+           cost = excluded.cost, resumes = excluded.resumes, revisions = excluded.revisions, reason = excluded.reason,
            questions = excluded.questions, result = excluded.result`,
       )
       .run(
@@ -199,6 +225,7 @@ export class Store {
         record.totalTokens,
         record.cost,
         record.resumes,
+        record.revisions,
         record.reason ?? null,
         JSON.stringify(record.questions),
         record.result ? JSON.stringify(record.result) : null,
@@ -358,6 +385,7 @@ export class Store {
         totalTokens: 0,
         cost: 0,
         resumes: 0,
+        revisions: 0,
         reason: "rebuilt_from_worktree",
         questions: [],
       };
@@ -394,6 +422,11 @@ function toRecord(row: WorkerRow): WorkerRecord {
     totalTokens: row.total_tokens,
     cost: row.cost,
     resumes: row.resumes,
+    // `?? 0` rather than a bare read: a row written by a pre-Phase-6 process and
+    // migrated in place has the column, but a `SELECT *` over a database opened
+    // read-only somewhere else may not, and a counter is exactly the kind of
+    // thing DD-7 says must be cheap to lose.
+    revisions: row.revisions ?? 0,
     ...(row.reason === null ? {} : { reason: row.reason }),
     questions: parseJson<string[]>(row.questions, []),
     ...(row.result === null ? {} : { result: parseJson<WorkerResult>(row.result, undefined as never) }),

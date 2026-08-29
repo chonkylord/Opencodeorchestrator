@@ -44,9 +44,40 @@ describe("the transition table", () => {
     // A state with no exits that is not marked final is a worker that hangs
     // forever with no error — the worst possible failure mode for an orchestrator.
     for (const s of WORKER_STATES) {
-      if (isFinal(s)) expect(triggersFrom(s)).toEqual([]);
-      else expect(triggersFrom(s).length).toBeGreaterThan(0);
+      if (!isFinal(s)) expect(triggersFrom(s).length).toBeGreaterThan(0);
     }
+  });
+
+  test("a final state is left only by an act from outside, never by the run loop", () => {
+    // Phase 6 loosened what `final` means and this is the load-bearing half of
+    // the new definition. A final worker has no loop turning and no watchdog
+    // armed, so nothing *it* does can move it — but `revise` is Claude's
+    // instruction, not the worker's, exactly as `merge` is. The rule that has to
+    // hold is that `revise` is the ONLY way out: a `timeout` or `complete` edge
+    // out of a final state would mean a settled worker could be re-settled by an
+    // event arriving late, which is the corruption the machine exists to stop.
+    for (const s of WORKER_STATES) {
+      if (!isFinal(s)) continue;
+      for (const trigger of triggersFrom(s)) expect(trigger).toBe("revise");
+    }
+  });
+
+  test("`merged` is the one state nothing can leave", () => {
+    // Deliberate, and recorded in ADR-0005 rather than left as an omission: a
+    // revision of a merged worker would put a commit on its branch that the
+    // integration branch does not have, so the run report would name a merged
+    // worker whose branch tip is not what was merged.
+    expect(triggersFrom("merged")).toEqual([]);
+  });
+
+  test("every settled state that can be revised lands back in the queue", () => {
+    // Not in `running`. A revision has to re-acquire a concurrency slot, and the
+    // gate sits between `spawned` and `preparing` (ADR-0004), so a revision
+    // admitted straight to `running` would hold no slot and would put a session
+    // on the shared backend that nothing counts.
+    const revisable = WORKER_STATES.filter((s) => can(s, "revise"));
+    expect(revisable.sort()).toEqual(["cancelled", "completed", "failed", "over_budget", "timed_out"]);
+    for (const s of revisable) expect(peek(s, "revise")).toBe("spawned");
   });
 
   test("every state is reachable from `spawned`", () => {
@@ -101,7 +132,9 @@ describe("illegal transitions are rejected, not tolerated", () => {
     expect(() => next("completed", "resume", "w-001")).toThrow(IllegalTransitionError);
   });
 
-  test("a terminal worker accepts nothing at all", () => {
+  test("a terminal worker accepts nothing the run loop could fire", () => {
+    // `revise` is deliberately not in this list — it is Claude's instruction,
+    // not the run loop's, and the test above pins it as the only exception.
     for (const s of WORKER_STATES.filter(isFinal)) {
       for (const trigger of ["prepare", "start", "resume", "complete", "fail", "cancel"] as Trigger[]) {
         expect(can(s, trigger)).toBe(false);

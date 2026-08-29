@@ -28,6 +28,7 @@ import { dirname, join } from "node:path";
 
 import type { StoredEvent, Store } from "../store/index.js";
 import type { MergeRecord, WorkerRecord } from "./types.js";
+import { revisionRounds } from "./revisions.js";
 import { isFinal, isSettled } from "./state.js";
 
 /** Where `run_report` writes, under the directory git already ignores. */
@@ -36,6 +37,10 @@ export const RUN_REPORT_DIR = join(".orchestrator", "runs");
 /** Caps (§8). Every one of these bounds a field a worker can influence. */
 const SUMMARY_CHARS = 400;
 const ITEM_CHARS = 200;
+/** One round's quoted feedback or summary in the run report. */
+const ROUND_CHARS = 240;
+/** How far back a worker's round reconstruction reads. A ceiling, not a page. */
+const MAX_ROUND_EVENTS = 2_000;
 const MAX_ITEMS = 4;
 const MAX_FILES = 8;
 const MAX_DISCREPANCIES = 20;
@@ -102,7 +107,7 @@ export function buildRunReport(opts: RunReportOptions): RunReport {
   out.push("");
   out.push(...headerLines(run, workers, merges, now, opts.maxConcurrent));
   out.push("");
-  out.push(...workerSection(workers));
+  out.push(...workerSection(workers, store));
   out.push("");
   out.push(...discrepancySection(workers));
   out.push("");
@@ -167,7 +172,7 @@ function headerLines(
   ];
 }
 
-function workerSection(workers: readonly WorkerRecord[]): string[] {
+function workerSection(workers: readonly WorkerRecord[], store: Store): string[] {
   if (workers.length === 0) return ["## Workers", "", "No workers were spawned for this run."];
 
   const rows = workers.map((w) => {
@@ -181,7 +186,7 @@ function workerSection(workers: readonly WorkerRecord[]): string[] {
     return (
       `| ${w.workerID} | ${w.mode} | ${cell(w.model)} | ${w.state}${w.reason ? `<br>${cell(w.reason)}` : ""} | ` +
       `${duration((w.endedAt ?? w.updatedAt) - (w.startedAt ?? w.createdAt))} | ${w.totalTokens.toLocaleString("en-US")} | ` +
-      `${changes} | ${tests} | ${r ? r.discrepancies.length : "—"} |`
+      `${changes} | ${tests} | ${w.revisions === 0 ? "—" : String(w.revisions)} | ${r ? r.discrepancies.length : "—"} |`
     );
   });
 
@@ -190,6 +195,15 @@ function workerSection(workers: readonly WorkerRecord[]): string[] {
     detail.push("", `### ${w.workerID} — ${cell(clamp(w.task, ITEM_CHARS))}`, "");
     detail.push(`- **Branch:** \`${w.branch}\`${w.result?.snapshot?.sha ? ` at \`${w.result.snapshot.sha.slice(0, 10)}\`` : ""}`);
     detail.push(`- **State:** ${w.state}${w.reason ? ` (${cell(w.reason)})` : ""}`);
+    if (w.revisions > 0) {
+      detail.push(
+        `- **Revisions:** ${w.revisions} round${w.revisions === 1 ? "" : "s"} of feedback` +
+          `${w.resumes > 0 ? `, and ${w.resumes} unblock-resume${w.resumes === 1 ? "" : "s"} besides` : ""}` +
+          " — see the rounds below.",
+      );
+    } else if (w.resumes > 0) {
+      detail.push(`- **Resumes:** ${w.resumes} — it blocked and was answered, which is not the same as being revised.`);
+    }
     const r = w.result;
     if (!r) {
       detail.push(
@@ -223,16 +237,52 @@ function workerSection(workers: readonly WorkerRecord[]): string[] {
     detail.push(`- **Discrepancies:** ${r.discrepancies.length === 0 ? "none" : String(r.discrepancies.length)}`);
     const said = quoted(r.summary, r.risks, r.questions, r.followUps);
     if (said.length > 0) detail.push("", "The worker's own words:", "", ...said);
+    // A worker that was revised twice should say what each round changed. The
+    // rounds come from the same event trail the Timeline below renders, so the
+    // two cannot tell different stories about the same worker.
+    if (w.revisions > 0) detail.push("", ...roundLines(w, store));
   }
 
   return [
     "## Workers",
     "",
-    "| id | mode | model | state | elapsed | tokens | changes | tests | discrepancies |",
-    "|---|---|---|---|---|---|---|---|---|",
+    "| id | mode | model | state | elapsed | tokens | changes | tests | revisions | discrepancies |",
+    "|---|---|---|---|---|---|---|---|---|---|",
     ...rows,
     ...detail,
   ];
+}
+
+/**
+ * The revision rounds, one block each (§11 Phase 6).
+ *
+ * What each round was *asked* for is Claude's text; what it *produced* is the
+ * orchestrator's measurement. They are rendered as different kinds of line for
+ * the same reason everything else here is: a reader has to be able to tell a
+ * request from a finding without knowing how the report was assembled.
+ */
+function roundLines(w: WorkerRecord, store: Store): string[] {
+  const rounds = revisionRounds(store.listEvents(w.workerID, { limit: MAX_ROUND_EVENTS }));
+  const lines = ["**Revision rounds**", ""];
+  for (const round of rounds) {
+    const head = round.round === 0 ? "**Round 0** — the original task as briefed" : `**Round ${round.round}**`;
+    // Claude's feedback is *not* rendered as a `>` line. This document's footer
+    // promises that every line beginning with `>` is the worker's own words, and
+    // the feedback is the orchestrator's — quoting both the same way would erase
+    // exactly the distinction the footer exists to draw.
+    const asked = round.feedback ? ` · asked for: ${cell(clamp(round.feedback, ROUND_CHARS))}` : "";
+    if (!round.settled) {
+      lines.push(`${head}${asked} · outcome: still running.`, "");
+      continue;
+    }
+    const measured =
+      `${round.files ?? 0} file${(round.files ?? 0) === 1 ? "" : "s"} (+${round.additions ?? 0}/−${round.deletions ?? 0})` +
+      (round.testsFailed === undefined ? "" : `, ${round.testsFailed} failing test${round.testsFailed === 1 ? "" : "s"}`) +
+      (round.discrepancies ? `, ${round.discrepancies} discrepanc${round.discrepancies === 1 ? "y" : "ies"}` : "");
+    lines.push(`${head}${asked} · outcome: \`${round.state ?? "unknown"}\` — ${measured}.`, "");
+    if (round.summary) lines.push(`> ${cell(clamp(round.summary, ROUND_CHARS))}`, "");
+  }
+  return lines;
 }
 
 /** The worker's claims, quoted and capped, never mixed into the measurements. */

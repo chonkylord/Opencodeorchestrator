@@ -89,6 +89,7 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
     defaultModel: config.defaultModel,
     verifyTests: config.verifyTests,
     maxConcurrent: config.maxConcurrent,
+    maxRevisions: config.maxRevisions,
     ...tuning,
   });
 
@@ -184,7 +185,10 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
   await orchestrator.server.connect(new StdioServerTransport());
-  log(`ready on stdio · db ${config.dbPath} · model ${config.defaultModel} · max ${config.maxConcurrent} concurrent`);
+  log(
+    `ready on stdio · db ${config.dbPath} · model ${config.defaultModel} · ` +
+      `max ${config.maxConcurrent} concurrent · max ${config.maxRevisions} revisions`,
+  );
 }
 
 // Only when launched directly, so the tests can import this module without it

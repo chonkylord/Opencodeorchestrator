@@ -64,6 +64,7 @@ async function harness(
     baseUrl: mock.baseUrl,
     verifyTests: false,
     maxConcurrent: 3,
+    maxRevisions: 3,
     ...configOver,
   };
   const orchestrator = await createOrchestrator(config, {
