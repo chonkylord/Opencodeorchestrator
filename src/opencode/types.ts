@@ -87,6 +87,16 @@ export interface SessionRef {
   readonly directory: string;
 }
 
+/**
+ * What may be said back to a permission request.
+ *
+ * The backend's own vocabulary, kept rather than renamed because these three are
+ * genuinely distinct decisions and a boolean would lose the middle one: `always`
+ * is remembered for the rest of the session, which is the difference between
+ * answering a question and settling it.
+ */
+export type PermissionReply = "once" | "always" | "reject";
+
 export interface SessionHandle extends SessionRef {
   readonly title?: string;
   /** Built-in agent the session was created with, if any. */
@@ -396,6 +406,23 @@ export function isBlocking(e: OCEvent): boolean {
 }
 
 /**
+ * A block the orchestrator can answer **in band**, leaving the turn running.
+ *
+ * The distinction is not cosmetic and it is not the caller's to work out: a
+ * permission request is answered with one of three fixed decisions and the
+ * worker resumes at the tool call it was waiting at, while a question expects a
+ * selection from labels it offered and has already ended its turn. Only the
+ * first can be replied to with {@link OpenCodeBackend.respond}.
+ *
+ * A predicate rather than a `kind` comparison at the call site, because DD-2
+ * puts every event name on this side of the boundary — and the manager asking
+ * "can I answer this?" is the question it actually has.
+ */
+export function isAnswerable(e: OCEvent): e is Extract<OCEvent, { kind: "permission.asked" }> {
+  return e.kind === "permission.asked" && e.requestID !== "";
+}
+
+/**
  * True when the event is evidence the *worker* is making progress, as opposed to
  * evidence the *server* is alive.
  *
@@ -492,6 +519,24 @@ export interface OpenCodeBackend {
    * whatever that turns out to be.
    */
   abort(target: SessionRef): Promise<boolean>;
+
+  /**
+   * Answer a permission request in band, letting the turn carry on.
+   *
+   * **[DEVIATION 7]** Not in the sketch, and the gap `docs/phase0-facts.md`
+   * "Unresolved" 5 carried from Phase 1 to Phase 7. Without it the manager has
+   * to convert a mid-run permission ask into an escalation — abort the turn,
+   * surface the question, deliver the answer as the next prompt — which works
+   * and costs a partial turn every time. Phase 6's v1 demo measured that cost as
+   * real rather than theoretical: three asks in one four-worker run, and the
+   * worker that escalated twice finished on 47,531 tokens against 7,715 for the
+   * one that never did.
+   *
+   * Returns `false` when the request is unknown to the backend, which is the
+   * ordinary outcome of answering one twice or answering one the turn has since
+   * abandoned — a caller should treat it as "already resolved", not as an error.
+   */
+  respond(session: SessionRef, requestID: string, reply: PermissionReply): Promise<boolean>;
 
   /** `null` when the session is unknown to the backend. */
   usage(session: SessionRef): Promise<Usage | null>;

@@ -499,6 +499,73 @@ describe("retries with backoff", () => {
   });
 });
 
+describe("answering a permission in band", () => {
+  test("the turn is never aborted, and the worker carries on from where it stopped", async () => {
+    // `docs/phase0-facts.md` "Unresolved" 5, closed. Before Phase 7 the manager
+    // had to convert a permission ask into an escalation — abort the turn,
+    // surface the question, deliver the answer as the *next* prompt — because
+    // the adapter could raise an ask and not reply to one. Phase 6's demo
+    // measured what that cost: three asks in one four-worker run, and the worker
+    // that escalated twice ended on 47,531 tokens against 7,715 for the one that
+    // never did.
+    const h = await harness({ scenario: "blocked" });
+    const r = await h.manager.spawn(spec());
+    await waitFor(() => h.manager.get(r.workerID)!.state === "blocked", 4_000, "blocked");
+    const blocked = h.manager.get(r.workerID)!;
+    expect(blocked.reason).toBe("permission_required");
+    expect(blocked.questions.length).toBeGreaterThan(0);
+
+    await h.manager.answer(r.workerID, "yes, that is inside its own worktree");
+    const done = await h.manager.wait(r.workerID, 8_000);
+    expect(done.state).toBe("completed");
+
+    const sessionID = done.sessionID!;
+    expect(h.mock.permissionRepliesOf(sessionID)).toEqual(["once"]);
+    const kinds = h.store.listEvents(r.workerID, { limit: 200 }).map((e) => e.kind);
+    expect(kinds).toContain("permission_answered");
+    // The turn was never aborted and never re-prompted — which is the whole
+    // point, and the difference between a partial turn and none.
+    expect(kinds).not.toContain("abort_requested");
+    const prompts = h.mock.requests.filter((q) => q.path.includes("/prompt"));
+    expect(prompts).toHaveLength(1);
+  });
+
+  test("`deny` refuses the request rather than granting it quietly", async () => {
+    // Guessing allow/deny from free text in the permissive direction would
+    // defeat exactly the jail signal §8 keeps `external_directory` at `ask` for.
+    const h = await harness({ scenario: "blocked" });
+    const r = await h.manager.spawn(spec());
+    await waitFor(() => h.manager.get(r.workerID)!.state === "blocked", 4_000, "blocked");
+
+    await h.manager.answer(r.workerID, "no — that is outside your worktree", "deny");
+    const done = await h.manager.wait(r.workerID, 8_000);
+    expect(h.mock.permissionRepliesOf(done.sessionID!)).toEqual(["reject"]);
+  });
+
+  test("a stale request falls back to the escalation rather than wedging", async () => {
+    // The reply can fail for reasons that are nobody's fault: the turn moved on,
+    // or the request was answered twice. The pre-Phase-7 path still works and is
+    // one prompt away, so the fallback is a partial turn rather than a dead
+    // worker — the old cost, paid only when the new route is unavailable.
+    const h = await harness({ scenario: "blocked" });
+    const r = await h.manager.spawn(spec());
+    await waitFor(() => h.manager.get(r.workerID)!.state === "blocked", 4_000, "blocked");
+
+    // Answer it out from under the manager, so its own reply finds nothing.
+    const sessionID = h.manager.get(r.workerID)!.sessionID!;
+    h.mock.resolveBlock(sessionID);
+    // …and stop the mock blocking again on the fallback prompt, or the worker
+    // would legitimately block a second time and this would be testing that.
+    h.mock.setScenario(sessionID, "success");
+
+    await h.manager.answer(r.workerID, "go ahead");
+    const done = await h.manager.wait(r.workerID, 10_000);
+    expect(done.state).toBe("completed");
+    const kinds = h.store.listEvents(r.workerID, { limit: 200 }).map((e) => e.kind);
+    expect(kinds).toContain("permission_stale");
+  });
+});
+
 describe("the metrics log", () => {
   test("a settled worker writes one line, and it is never on the wire", async () => {
     const h = await harness({}, {});

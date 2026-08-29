@@ -188,6 +188,8 @@ interface MockSession {
   dropped: number;
   /** How many prompts this session has failed so far (`failTimes`). */
   failed: number;
+  /** Every in-band permission reply this session accepted, in order. */
+  permissionReplies: string[];
   prompts: unknown[];
 }
 
@@ -328,6 +330,11 @@ export class OCMock {
     return true;
   }
 
+  /** In-band permission replies this session accepted, in order. */
+  permissionRepliesOf(sessionID: string): readonly string[] {
+    return this.sessions.get(sessionID)?.permissionReplies ?? [];
+  }
+
   /** How many prompts this session accepted and silently dropped. */
   droppedPromptsOf(sessionID: string): number {
     return this.sessions.get(sessionID)?.dropped ?? 0;
@@ -408,6 +415,36 @@ export class OCMock {
         res.writeHead(204).end();
         return;
       }
+      // §11 Phase 7's in-band permission reply, on the path verified against
+      // OpenCode 1.18.25: `POST /session/{id}/permissions/{requestID}` with
+      // `{response}`. The v2 path in the OpenAPI document answers 404 for a
+      // request raised this way, and the mock reproduces that too — an adapter
+      // that goes back to the documented-but-wrong endpoint should fail here
+      // rather than in a live run.
+      const perm = /^\/permissions\/([^/]+)$/.exec(sub);
+      if (req.method === "POST" && perm) {
+        const requestID = decodeURIComponent(perm[1] ?? "");
+        if (session.pendingRequestID !== requestID) return json(res, 404, { error: "permission request not found", requestID });
+        const reply = String(asRecord(body)["response"] ?? "once");
+        session.pendingRequestID = undefined;
+        session.permissionReplies.push(reply);
+        this.emit(session, "permission.replied", { sessionID: session.id, requestID, reply });
+        if (reply === "reject") {
+          // A refused permission ends the turn: the tool call cannot proceed.
+          this.reply(session);
+          this.finish(session, this.workMsOf(session));
+        } else {
+          // Granted: the worker carries on from the tool call it was waiting at,
+          // which is the property the whole feature exists for.
+          this.work(session);
+          this.reply(session);
+          this.finish(session, this.workMsOf(session));
+        }
+        return json(res, 200, true);
+      }
+      if (req.method === "POST" && /^\/permission\/[^/]+\/reply$/.test(sub)) {
+        return json(res, 404, { _tag: "PermissionNotFoundError", message: "the v2 endpoint does not answer a v1 request" });
+      }
       if (req.method === "POST" && sub === "/abort") {
         if (this.opts.abortDelayMs > 0) {
           const t = setTimeout(() => json(res, 200, this.abort(session)), this.opts.abortDelayMs);
@@ -454,6 +491,7 @@ export class OCMock {
       prompts: [],
       dropped: 0,
       failed: 0,
+      permissionReplies: [],
       ...(this.opts.report === null || this.opts.report === undefined ? {} : { report: this.opts.report }),
     };
     this.sessions.set(id, session);

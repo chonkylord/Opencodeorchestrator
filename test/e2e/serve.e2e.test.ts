@@ -201,3 +201,66 @@ describe.skipIf(!CONCURRENCY)("one serve process, four concurrent worktree sessi
     RUN_TIMEOUT_MS + 120_000,
   );
 });
+
+/**
+ * §11 Phase 7: answering a permission request in band, against real OpenCode.
+ *
+ * This is the probe that closed `docs/phase0-facts.md` "Unresolved" 5, kept as a
+ * test so the next version bump has to break it out loud rather than quietly.
+ * The fact it pins is not that the endpoint returns 200 — it is that **the
+ * worker carries on and writes the file**, which is the whole reason to reply in
+ * band rather than abort and re-prompt.
+ *
+ * Gated behind `OC_E2E=1 OC_E2E_PERMISSION=1` because it spends real tokens.
+ */
+const PERMISSION_PROBE = ENABLED && process.env["OC_E2E_PERMISSION"] === "1";
+
+describe.skipIf(!PERMISSION_PROBE)("permission replies, in band (§11 Phase 7)", () => {
+  test(
+    "a granted permission lets the turn continue, and the file is written",
+    async () => {
+      const { repo, worktrees } = fixture(1);
+      const cwd = worktrees[0]!;
+      const backend = new ServeBackend({ cwd: repo });
+      await backend.start();
+      try {
+        // `edit: ask` is what produces a request to answer; `bash: deny` stops
+        // the model routing around it, which it will otherwise happily do.
+        const session = await backend.createSession({
+          cwd,
+          title: "permission-probe",
+          model: MODEL,
+          permissions: [
+            { permission: "edit", pattern: "**", action: "ask" },
+            { permission: "bash", pattern: "**", action: "deny" },
+          ],
+        });
+        const stream = await backend.events(session, { deltas: false });
+        await backend.prompt(session, {
+          text: "Use the write tool (bash is denied) to create hello.txt containing exactly PROBE_OK. Then reply done.",
+        });
+
+        const seen = await until(stream, (e) => e.kind === "permission.asked", RUN_TIMEOUT_MS, "a permission request");
+        const ask = seen.at(-1)!;
+        if (ask.kind !== "permission.asked") throw new Error("expected a permission request");
+        expect(ask.requestID).not.toBe("");
+
+        // The call under test.
+        expect(await backend.respond(session, ask.requestID, "once")).toBe(true);
+
+        await until(stream, isTerminal, RUN_TIMEOUT_MS, "the turn to finish after the grant");
+        stream.close();
+
+        // The property that matters: the tool call proceeded.
+        expect(readFileSync(join(cwd, "hello.txt"), "utf8")).toContain("PROBE_OK");
+
+        // And answering a request the backend no longer holds is `false`, not a
+        // throw — the contract `respond()` documents.
+        expect(await backend.respond(session, ask.requestID, "once")).toBe(false);
+      } finally {
+        await backend.dispose();
+      }
+    },
+    RUN_TIMEOUT_MS + 60_000,
+  );
+});

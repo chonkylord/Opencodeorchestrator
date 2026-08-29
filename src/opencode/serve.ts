@@ -24,6 +24,7 @@ import {
   type OCEvent,
   type OpenCodeBackend,
   OpenCodeError,
+  type PermissionReply,
   type PromptRequest,
   type RunHandle,
   type SessionHandle,
@@ -320,6 +321,51 @@ export class ServeBackend implements OpenCodeBackend {
       body: {},
     });
     return result === true;
+  }
+
+  /**
+   * Answer a permission request the worker raised, in band (§11 Phase 7).
+   *
+   * Closes `docs/phase0-facts.md` "Unresolved" 5, and the answer is not the one
+   * the fact sheet expected. Three shapes for this exist in the OpenAPI document
+   * and the row listed the v2 one, on the strength of having read it:
+   *
+   * ```
+   * POST /api/session/{id}/permission/{requestID}/reply  {reply}      -> 404
+   * POST /session/{id}/permissions/{permissionID}        {response}   -> 200
+   * ```
+   *
+   * Measured on the wire against OpenCode 1.18.25 on 2026-08-29: a request
+   * raised as `permission.asked` is **not found** by the v2 endpoint — it belongs
+   * to a different registry — and is answered by the v1 session-scoped one. The
+   * probe let the worker carry on and write its file, which is the property that
+   * matters: the turn continues rather than being abandoned.
+   *
+   * This is why the fact sheet distinguishes "verified (schema)" from
+   * "verified": the first means somebody read the document.
+   */
+  async respond(session: SessionRef, requestID: string, reply: PermissionReply): Promise<boolean> {
+    await this.start();
+    try {
+      const result = await this.request<unknown>(
+        "POST",
+        `/session/${encodeURIComponent(session.sessionID)}/permissions/${encodeURIComponent(requestID)}`,
+        {
+          query: { directory: normalizeDirectory(session.directory) },
+          body: { response: reply },
+        },
+      );
+      return result === true || result === null || result === undefined;
+    } catch (e) {
+      // A request the backend no longer knows is the ordinary outcome of
+      // answering one twice, or of answering one the turn has already abandoned.
+      // `false` rather than a throw, for the same reason `usage()` answers `null`
+      // on a 404: "it is not there" is an answer to the question that was asked,
+      // and a caller that has to catch an exception to learn it will eventually
+      // catch one that meant something else.
+      if (e instanceof OpenCodeError && e.detail["status"] === 404) return false;
+      throw e;
+    }
   }
 
   async usage(session: SessionRef): Promise<Usage | null> {

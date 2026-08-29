@@ -35,12 +35,14 @@ import { join } from "node:path";
 
 import {
   HEADLESS_PERMISSIONS,
+  type PermissionReply,
   type OCEvent,
   type OpenCodeBackend,
   OpenCodeError,
   type PermissionRule,
   type EventStream,
   type SessionHandle,
+  isAnswerable,
   isBlocking,
   isWorkerEvent,
 } from "../opencode/index.js";
@@ -305,7 +307,24 @@ type Disposition =
   | { kind: "over_budget"; reason: string }
   | { kind: "cancelled"; reason: string };
 
-type AnswerOutcome = { kind: "answer"; text: string } | { kind: "cancel" } | { kind: "timeout" };
+type AnswerOutcome =
+  | {
+      kind: "answer";
+      text: string;
+      /**
+       * What to say to an outstanding *permission* request, when there is one.
+       *
+       * Free text cannot be turned into `once`/`reject` reliably, and guessing
+       * wrong in the permissive direction is exactly the failure §8's jail signal
+       * exists to prevent. So the decision is carried explicitly and defaults to
+       * allowing — because Claude choosing to answer a permission ask at all is
+       * already the decision to let the worker proceed, and `worker_stop` is how
+       * it says no to the whole worker.
+       */
+      decision?: "allow" | "deny";
+    }
+  | { kind: "cancel" }
+  | { kind: "timeout" };
 
 /**
  * §8's global run cap, refused at spawn.
@@ -413,6 +432,16 @@ class ManagedWorker {
   abortIntent: AbortIntent | undefined;
   /** An abort we did not ask for still has to be distinguished from a clean end. */
   sawAbort = false;
+  /**
+   * The permission request the worker is waiting on, if it is waiting on one.
+   *
+   * Set when the adapter reports an answerable block (`isAnswerable`) and
+   * cleared once it is answered. Its presence is what lets §11 Phase 7 answer
+   * **in band** — leaving the turn running and the tool call to proceed —
+   * instead of Phase 2's escalation, which had to abort the turn because there
+   * was no way to reply at all.
+   */
+  pendingPermission: { requestID: string; permission: string } | undefined;
   /** This turn's instruction, kept so a turn can be re-sent unchanged. */
   lastPromptText = "";
   /** Was this turn's reply schema-constrained? */
@@ -866,7 +895,7 @@ export class WorkerManager {
    * own context — Phase 0 verified that reuse retains it. This is the only way a
    * worker gets help, and the only way `blocked` is left.
    */
-  async answer(workerID: string, text: string): Promise<WorkerRecord> {
+  async answer(workerID: string, text: string, decision?: "allow" | "deny"): Promise<WorkerRecord> {
     const w = this.workers.get(workerID);
     if (!w) throw new Error(`unknown worker ${workerID}`);
     if (w.machine.state !== "blocked" || !w.answer) {
@@ -879,7 +908,7 @@ export class WorkerManager {
     const resumed = new Promise<void>((resolve, reject) => {
       w.resumeSignal = { resolve, reject };
     });
-    w.answer({ kind: "answer", text });
+    w.answer({ kind: "answer", text, ...(decision === undefined ? {} : { decision }) });
     w.answer = undefined;
     await resumed;
     return w.record.current;
@@ -1927,13 +1956,25 @@ export class WorkerManager {
     }
 
     if (isBlocking(e)) {
-      // The worker asked mid-run. The adapter has no way to answer it in band,
-      // so the turn is stopped and the question becomes an escalation: the
-      // session survives, and the answer arrives as its next prompt. That is
-      // also the §8 jail signal — a worker reaching outside its worktree raises
-      // one of these rather than silently writing.
       const questions = "questions" in e ? [...e.questions] : "permission" in e ? [permissionQuestion(e)] : ["the worker is blocked"];
       this.opts.store.appendEvent(w.record.current.workerID, "escalation", { questions });
+
+      // §11 Phase 7: a *permission* request can now be answered in band, so the
+      // turn is left running and the worker simply waits at its tool call. Phase
+      // 2 had to abort here — the adapter could surface an ask and not reply to
+      // one — and the cost was a partial turn on every escalation, which Phase
+      // 6's demo measured rather than estimated: three asks in one four-worker
+      // run, and the worker that escalated twice ended on 47,531 tokens against
+      // 7,715 for the one that never did.
+      //
+      // A *question* still escalates the old way. Its reply shape is a selection
+      // from offered labels rather than free text (verified on the wire), so
+      // forcing Claude's prose into it would answer something nobody asked.
+      if (isAnswerable(e)) {
+        w.pendingPermission = { requestID: e.requestID, permission: e.permission };
+        return this.enterBlocked(w, questions, "permission_required");
+      }
+
       await this.requestAbort(w, {
         disposition: "blocked",
         reason: "questions" in e ? "worker_asked" : "permission_required",
@@ -2095,11 +2136,59 @@ export class WorkerManager {
     // Time spent waiting on Claude is not time the worker spent working, so it
     // does not count against the worker's wall-clock budget.
     w.blockedTotalMs += this.opts.now() - w.blockedAt;
+    w.resumes += 1;
+    w.lastWorkerEventAt = this.opts.now();
+
+    // §11 Phase 7's in-band reply. The turn was never aborted, so there is
+    // nothing to re-prompt: answering the request lets the tool call it was
+    // waiting on proceed, and the worker carries on mid-thought. Everything the
+    // turn has produced so far — `replyText` included — is still the *current*
+    // turn's, so unlike the re-prompt path below, none of it is cleared.
+    const pending = w.pendingPermission;
+    if (pending) {
+      w.pendingPermission = undefined;
+      const decision: PermissionReply = outcome.decision === "deny" ? "reject" : "once";
+      try {
+        const answered = await this.opts.backend.respond(w.session!, pending.requestID, decision);
+        this.opts.store.appendEvent(w.record.current.workerID, "permission_answered", {
+          requestID: pending.requestID,
+          permission: pending.permission,
+          reply: decision,
+          accepted: answered,
+        });
+        if (answered) {
+          w.machine.apply("resume", { reason: "permission_answered" });
+          this.update(w, { state: "running", resumes: w.resumes, questions: [] });
+          w.resumeSignal?.resolve();
+          w.resumeSignal = undefined;
+          return undefined;
+        }
+        // The backend does not know the request any more — the turn moved on, or
+        // it was answered twice. Fall through to the escalation path, which
+        // works from a session rather than from a live request.
+        this.opts.store.appendEvent(w.record.current.workerID, "permission_stale", { requestID: pending.requestID });
+      } catch (e) {
+        // An adapter that cannot answer is not a worker that has to die: the
+        // pre-Phase-7 path still works and is one prompt away.
+        this.opts.store.appendEvent(w.record.current.workerID, "permission_reply_failed", { message: String(e) });
+      }
+      // Deliberately **no abort** before falling through, and the reason is
+      // worth stating because the instinct is wrong. `respond()` answering
+      // `false` means the backend does not know the request — which is what it
+      // says when the turn that raised it is already over. There is nothing left
+      // to abort, and aborting anyway is actively harmful: the pump is paused
+      // here, so the abort's own error and idle arrive *after* the re-prompt has
+      // reset `sawAbort`, and the run loop reads them as an abort nobody asked
+      // for and fails the worker `aborted_externally`. (Measured, not reasoned:
+      // the first version of this did exactly that.)
+      //
+      // If a turn somehow *is* still live with a request the backend has lost,
+      // the idle watchdog is the backstop, which is what it is for.
+    }
+
     w.replyText = "";
     w.replyTruncated = false;
     w.sawAbort = false;
-    w.resumes += 1;
-    w.lastWorkerEventAt = this.opts.now();
     try {
       await this.promptTurn(w, buildAnswerPrompt(questions, outcome.text));
     } catch (e) {

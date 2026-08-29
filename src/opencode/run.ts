@@ -47,6 +47,7 @@ import {
   type EventStream,
   type EventStreamOptions,
   NotImplementedError,
+  type PermissionReply,
   type OpenCodeBackend,
   type PromptRequest,
   type RunHandle,
@@ -96,6 +97,10 @@ export class RunBackend implements OpenCodeBackend {
 
   abort(_target: SessionRef): Promise<boolean> {
     throw new NotImplementedError("RunBackend.abort", WHY);
+  }
+
+  respond(_session: SessionRef, _requestID: string, _reply: PermissionReply): Promise<boolean> {
+    throw new NotImplementedError("RunBackend.respond", WHY);
   }
 
   usage(_session: SessionRef): Promise<Usage | null> {

@@ -533,7 +533,12 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         "reused, so the worker keeps everything it has already read and worked out — this is a reply, " +
         "not a restart, and it is far cheaper than spawning a replacement.\n\n" +
         "This is the only way out of `blocked` other than worker_stop. A worker nobody answers waits, " +
-        "and is eventually timed out with its work half-done, so answer promptly or stop it deliberately.\n" +
+        "and is eventually timed out with its work half-done, so answer promptly or stop it deliberately.\n\n" +
+        "TWO KINDS OF BLOCK, and the difference costs the worker a turn. A worker stopped by a PERMISSION " +
+        "wall (`permission_required` — usually reaching outside its worktree) is still mid-turn: answering " +
+        "releases the tool call it is waiting at and it carries straight on, keeping everything it was in " +
+        "the middle of. Pass `decision: \"deny\"` to refuse it instead. A worker that stopped to ASK YOU " +
+        "something has ended its turn, and your answer arrives as its next prompt.\n" +
         "Returns immediately, before the worker has actually resumed: poll worker_status until it is " +
         "`running` again. Answer the question as concretely as you can — the worker cannot ask a " +
         "follow-up without blocking a second time, and each round trip costs it a turn.",
@@ -544,10 +549,18 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
           .min(1)
           .max(MESSAGE_CHARS_MAX)
           .describe("The answer. Specific and decisive — this is the worker's only new information."),
+        decision: z
+          .enum(["allow", "deny"])
+          .optional()
+          .describe(
+            "Only meaningful when the worker is waiting on a PERMISSION (its status says " +
+              "`permission_required`): whether to grant it. Defaults to allow. Deny when the worker is " +
+              "reaching somewhere it should not — that is what the permission wall is for.",
+          ),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ id, message: text }): Promise<ToolResult> => {
+    async ({ id, message: text, decision }): Promise<ToolResult> => {
       const r = find(id);
       if (!r) return unknown(id);
       if (r.state !== "blocked") {
@@ -561,7 +574,7 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
       // DD-1. `answer()` resolves only once the follow-up prompt is away, which
       // means waiting out the settle guard the session needs before it will
       // accept another prompt — seconds, not milliseconds. Start it and return.
-      void manager.answer(id, text).catch((e: unknown) => {
+      void manager.answer(id, text, decision).catch((e: unknown) => {
         log(`[orchestrator] worker_message(${id}) failed after returning: ${message(e)}`);
         store.appendEvent(id, "answer_failed", { message: message(e) });
       });
