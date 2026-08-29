@@ -256,6 +256,27 @@ Risks: JWT expiry not configurable yet
 
 **Revision path:** `worker_revise(id, feedback)` sends feedback to the same session (worker retains full context of its own work). Revision counter per worker; at `maxRevisions` (default 3) the manager refuses and reports — prevents infinite fix loops.
 
+> **Phase 6, as built.** This line predates every phase and survived all of them;
+> what it could not say is where a revision *re-enters* the lifecycle. Since
+> Phase 5, the concurrency gate sits between `spawned` and `preparing`, and a
+> settled worker holds no slot — so a revision has to go back through the queue
+> or it silently un-caps the whole system. The `revise` edges therefore land in
+> **`spawned`**, not in `running`, and a revision that has to wait says `queued`
+> on its record exactly as a queued spawn does.
+>
+> Two more things the line implies and does not state. **"Refuses and reports" is
+> one act, not two:** at the cap the refusal *is* the report — what was tried each
+> round, what changed between rounds, what is still failing, and Claude's options
+> — because a cap that stops the loop and produces nothing to act on has converted
+> a runaway into a dead end (§13). And **the revision counter is not `resumes`**:
+> `resumes` counts the blocked→answer→resume path above, which is the worker
+> asking a question, and until Phase 6 the status line rendered one under the
+> other's name. They are separate counters now.
+>
+> `completed`, `failed`, `timed_out`, `over_budget` and `cancelled` may all be
+> revised; `merged` may not, and neither may `blocked` (that is what the path
+> above is for). See [ADR-0005](docs/adr/0005-the-review-loop.md).
+
 ---
 
 ## 6. Workspace Isolation & Merge Pipeline
@@ -278,6 +299,17 @@ Worker `cwd` = worktree root, set via `POST /session?directory=<worktree>`.
 On completion the manager runs `git add -A && git commit` to snapshot everything, then computes diffs.
 
 Research/review workers: no worktree, or a read-only mount of the target worktree.
+
+*(Resolved in Phase 6, and it is neither of those two.* A `review` worker gets its
+**own** worktree at the target's base commit, with the target's diff quoted in its
+brief. A mount of the target's worktree would make `buildResult()` measure the
+*author's* changes as the reviewer's, so a read-only worker would settle with a
+discrepancy for every file the author touched; no worktree at all would leave
+`changedFiles("")` to manufacture a discrepancy about a diff the reviewer was
+never supposed to have, and would give it nowhere to read the surrounding code
+from. With its own checkout the reviewer's measured diff is genuinely empty, which
+is what makes a reviewer that somehow writes something visible rather than
+camouflaged. See [ADR-0005](docs/adr/0005-the-review-loop.md).)
 
 ### 6.2 Overlap detection (before merge)
 
@@ -324,14 +356,14 @@ it used to claim. Rows marked ✅ are built and tested
 
 | Tool | Params | Returns | Notes |
 |------|--------|---------|-------|
-| `worker_spawn` ✅ | `task`, `scope?`, `mode` (implement/research/review), `model?`, `ownedPaths?` (file paths/globs), `acceptance?`, `testCommand?`, `baseRef?`, `runID?`, `notes?`, `budget?`, `dependsOn?` | `{workerID, branch, runID}` + whether it started or QUEUED | Returns in <2s; runs in background. **Corrected:** the param was `owns?` (renamed to match `WorkerSpec.ownedPaths`), and the return used to promise `worktree` — which DD-1 makes impossible, because the worktree is created in the background *after* spawn returns. It appears in `worker_status` once it exists. **Phase 5:** `dependsOn` is implemented, and the reply says whether the worker started or is queued — behind the cap, or behind a dependency — because "spawned" alone cannot tell those apart. A `dependsOn` that names an id nobody was handed is rejected at spawn, before a row is written. |
+| `worker_spawn` ✅ | `task`, `scope?`, `mode` (implement/research/review), `model?`, `ownedPaths?` (file paths/globs), `acceptance?`, `testCommand?`, `baseRef?`, `runID?`, `notes?`, `budget?`, `dependsOn?`, `reviewOf?` | `{workerID, branch, runID}` + whether it started or QUEUED | Returns in <2s; runs in background. **Corrected:** the param was `owns?` (renamed to match `WorkerSpec.ownedPaths`), and the return used to promise `worktree` — which DD-1 makes impossible, because the worktree is created in the background *after* spawn returns. It appears in `worker_status` once it exists. **Phase 5:** `dependsOn` is implemented, and the reply says whether the worker started or is queued — behind the cap, or behind a dependency — because "spawned" alone cannot tell those apart. A `dependsOn` that names an id nobody was handed is rejected at spawn, before a row is written. **Phase 6:** `reviewOf` points a `review` worker at another worker's diff — it gets its own worktree at that worker's base plus the diff quoted in its brief, and is rejected at spawn under the same rule as `dependsOn` if it names a worker nobody was handed or is passed without `mode: "review"`. There is no separate `worker_review` tool: a reviewer is a worker. |
 | `worker_status` ✅ | `ids?` | state, elapsed, last-activity age, revision count, ~cost, and the suggested next call | Cheap; safe to poll. With no `ids`, reports what is still active or blocked. |
 | `worker_wait` ✅ | `id` **or** `ids`, `mode?` (any/all), `timeoutMs?` (≤30,000) | same as status, one line per worker | Bounded block; reduces polling chatter. Resolves on any settled state, `blocked` included. A timeout is not an error. **Corrected twice:** the param was `ids`, and Phase 3 narrowed it to one id because batched waits were Phase 5; **Phase 5 restored `ids`** — with a `mode`, because "wait for any" and "wait for all" are different questions and a wave needs both. It is one tool rather than two: a `worker_wait_all` beside it would differ only by a suffix. The 30,000 cap was a guess when written, is now half a measured host ceiling, and **does not move for a batch**; see [`docs/phase3-notes.md`](docs/phase3-notes.md). |
 | `worker_result` ✅ | `id` | structured result (§4.3) | The default thing Claude reads. On a `blocked` worker it renders the *record* — there is no result until a worker settles, and blocking is not settling. |
 | `worker_diff` ✅ | `id`, `paths?`, `cursor?`, `maxLines?` (default 400) | paginated unified diff | On-demand detail; **built in Phase 4** ([`src/workspace/diff.ts`](src/workspace/diff.ts)), where Phase 3 said the reader belonged. Pages by **line**, not by file — a cap that rounds up to whole files is not a cap. Untracked files are included, so a worker's diff does not go empty just because DD-5's snapshot has not run yet; a worker whose worktree has been cleaned up is diffed from its snapshot commit instead. |
 | `worker_output` ✅ | `id`, `cursor?`, `limit?` (default 50 events) | paginated event log tail | Debugging only. Lifecycle-grained, never the transcript — that is what the firewall keeps out. |
 | `worker_message` ✅ | `id`, `message` | confirmation; poll `worker_status` | Answers a blocked worker; session reused. **Corrected:** it does not return a "new run id" — no run is created, because the point is that the *same* session continues. It also returns before the worker has resumed (DD-1): `manager.answer()` waits out the session settle guard, which is seconds. |
-| `worker_revise` | `id`, `feedback` | revision number | Review-loop entry point; session reused; capped. **Phase 6** (§11), not Phase 3. |
+| `worker_revise` ✅ | `id`, `feedback` | revision number, or the terminal report at the cap | Review-loop entry point; session reused; capped (`ORCHESTRATOR_MAX_REVISIONS`, default 3). **Built in Phase 6.** **Corrected:** it does not simply return "a revision number" — at the cap it returns §13's *terminal actionable report* instead, which is the half that mattered, and the row as written made the refusal sound like an error. Two other things this row could not have known: a revision **re-enters the concurrency queue** (a settled worker holds no slot, so a revision that skipped the gate would silently un-cap the system), so a revised worker goes back to `spawned` before it runs and the reply says whether it started or queued, exactly as `worker_spawn`'s does; and the worker leaves its settled state *before the call returns*, so a following `worker_wait` waits for the new round rather than returning the pre-revision record. See [ADR-0005](docs/adr/0005-the-review-loop.md). |
 | `run_report` ✅ | `runID?`, `write?` | markdown audit trail — workers, models, spend, tests, discrepancies, merge outcomes, timeline | **Added in Phase 5**, and required by §8's "every run emits a markdown audit trail". §7 never listed it because §8 described it as a by-product rather than a tool; it is a tool, because a run has to be *asked* for its report. Written to `.orchestrator/runs/<runID>.md` and excerpted on the wire — a full report over six workers is the largest thing this surface produces. Worker claims are quoted and capped; the measurements are not. |
 | `worker_stop` ✅ | `id`, `reason?` | confirmation; poll `worker_status` | Graceful abort + snapshot. Returns before the worker has stopped, for the same DD-1 reason as `worker_message`. |
 | `worker_list` ✅ | `state?`, `runID?` | worker summaries | |
