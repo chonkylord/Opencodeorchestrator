@@ -17,10 +17,19 @@
  * continue without. `store.rebuildFromWorktrees()` is the proof.
  */
 
-// Bumped by Phase 4's `merges` table. Purely additive — every statement below is
-// `IF NOT EXISTS`, so a version-1 database on disk gains the table and keeps its
-// rows. Nothing reads the number to gate behaviour; it is there to date a file.
-export const SCHEMA_VERSION = 2;
+// Bumped by Phase 4's `merges` table, and again by Phase 6's `workers.revisions`
+// column. Nothing reads the number to gate behaviour; it is there to date a file.
+//
+// **A new table and a new column are not the same migration, and Phase 6 found
+// that out.** Every `CREATE TABLE` below is `IF NOT EXISTS`, so Phase 4's
+// `merges` really did land on a version-1 database on disk simply by running
+// this script again. A *column* added to an existing `CREATE TABLE` statement
+// does not: SQLite sees the table already exists, skips the statement whole, and
+// the new column silently never appears — after which every `INSERT` naming it
+// fails at runtime on exactly the databases that already had data worth keeping.
+// So `revisions` is declared below for fresh databases *and* added by
+// {@link MIGRATIONS} for existing ones, and the two must agree.
+export const SCHEMA_VERSION = 3;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -57,6 +66,7 @@ CREATE TABLE IF NOT EXISTS workers (
   total_tokens INTEGER NOT NULL DEFAULT 0,
   cost         REAL    NOT NULL DEFAULT 0,
   resumes      INTEGER NOT NULL DEFAULT 0,
+  revisions    INTEGER NOT NULL DEFAULT 0,
   reason       TEXT,
   questions    TEXT NOT NULL DEFAULT '[]',
   result       TEXT
@@ -92,3 +102,22 @@ CREATE TABLE IF NOT EXISTS merges (
 
 CREATE INDEX IF NOT EXISTS merges_by_run ON merges(run_id);
 `;
+
+/**
+ * Statements that bring an older database up to {@link SCHEMA_VERSION}.
+ *
+ * Each one must be safe to run against a database that already has the change,
+ * because they run unconditionally on every open — there is no migration
+ * bookkeeping and there should not be one at this size. `ALTER TABLE … ADD
+ * COLUMN` is not idempotent (it errors with "duplicate column name"), so the
+ * store swallows exactly that failure; anything else is a real problem and is
+ * left to throw.
+ *
+ * DD-7 keeps this cheap: the worktrees are the durable state and this database
+ * is an index, so the worst case for a migration nobody can run is
+ * `rebuildFromWorktrees()`.
+ */
+export const MIGRATIONS: readonly string[] = Object.freeze([
+  // Phase 6: the revision counter, separate from `resumes` (§11 Phase 6).
+  "ALTER TABLE workers ADD COLUMN revisions INTEGER NOT NULL DEFAULT 0",
+]);

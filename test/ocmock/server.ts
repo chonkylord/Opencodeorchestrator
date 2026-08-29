@@ -19,7 +19,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { AddressInfo } from "node:net";
 import type { Socket } from "node:net";
 
@@ -124,6 +124,13 @@ export interface OCMockOptions {
   readonly abortDelayMs?: number;
 }
 
+/** A file a scripted turn actually puts on disk. See {@link OCMock.setWrite}. */
+export interface ScriptedWrite {
+  /** Path relative to the session's directory. */
+  readonly path: string;
+  readonly content: string;
+}
+
 export interface RecordedRequest {
   readonly method: string;
   readonly path: string;
@@ -153,6 +160,8 @@ interface MockSession {
   claim?: string;
   /** Per-session reply, overriding the mock-wide default. */
   report?: unknown;
+  /** Files this session writes on its next turn, overriding the default write. */
+  writes?: readonly ScriptedWrite[];
   /** When this session last emitted a terminal event. */
   lastIdleAt?: number;
   /** Prompts accepted and dropped, for tests that assert on the guard. */
@@ -256,6 +265,32 @@ export class OCMock {
   setReport(sessionID: string, report: unknown): void {
     const s = this.sessions.get(sessionID);
     if (s) s.report = report;
+  }
+
+  /**
+   * Script what this session's next turn actually writes to disk.
+   *
+   * The other half of {@link OCMock.setReport}, and Phase 6 needs both together:
+   * a revision that fixes something is exactly two scripted reports and **a real
+   * file write**. Without this a "fixed" worker can only claim to have fixed
+   * something, so the manager's independent test re-run — the thing that turns
+   * "it passes now" from a claim into a finding — has nothing to measure.
+   *
+   * The writes apply to the next turn and to every turn after it, until this is
+   * called again: a worker that fixed the file does not un-fix it by being asked
+   * something else.
+   */
+  setWrite(sessionID: string, writes: readonly ScriptedWrite[]): void {
+    const s = this.sessions.get(sessionID);
+    if (s) s.writes = writes;
+  }
+
+  /** The session a worker id is using, so a test can script it by worker. */
+  sessionForDirectory(stem: string): string | undefined {
+    for (const [id, s] of this.sessions) {
+      if (s.directory.split("/").filter(Boolean).pop() === stem) return id;
+    }
+    return undefined;
   }
 
   /** `blocked`: answer the outstanding request so the run resumes and finishes. */
@@ -578,8 +613,22 @@ export class OCMock {
       },
     });
     const stem = session.directory.split("/").filter(Boolean).pop() ?? "worker";
-    const fileName = this.opts.perWorktreeFileName ? `${stem}.txt` : "hello.txt";
-    if (this.opts.writeFiles) {
+    const scripted = session.writes;
+    const fileName = scripted?.[0]?.path ?? (this.opts.perWorktreeFileName ? `${stem}.txt` : "hello.txt");
+    if (scripted) {
+      // A scripted turn writes exactly what it was told to, wherever it was told
+      // to — which is what lets a revision round repair a file the previous
+      // round broke, in a real worktree, for a real `npm test` to notice.
+      for (const w of scripted) {
+        try {
+          const target = join(session.directory, w.path);
+          mkdirSync(dirname(target), { recursive: true });
+          writeFileSync(target, w.content);
+        } catch {
+          /* the test did not give us a real directory; the events are the point */
+        }
+      }
+    } else if (this.opts.writeFiles) {
       // A real file, so `git diff` has something to agree or disagree with.
       try {
         mkdirSync(session.directory, { recursive: true });

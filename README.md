@@ -8,23 +8,33 @@ The full design is in [`projectplan.md`](projectplan.md).
 
 ## Status
 
-**Phases 0 through 5 complete.** The architecture's OpenCode assumptions are
-verified against a live server, the backend decision is recorded, the adapter that
-isolates those assumptions is built, a worker goes from a one-line task to a
+**v1 is complete — phases 0 through 6.** The architecture's OpenCode assumptions
+are verified against a live server, the backend decision is recorded, the adapter
+that isolates those assumptions is built, a worker goes from a one-line task to a
 committed worktree and a structured result without a human in the loop, Claude can
 drive that from a Claude Code session over MCP, the work a worker produces can be
 **taken** — merged one at a time into an integration branch behind a test gate,
-and rolled back to the exact sha it started from when the gate goes red — and
-several workers now run **at once**, under a cap, with a queue, dependencies
-between them, and a markdown run report at the end.
+and rolled back to the exact sha it started from when the gate goes red — several
+workers run **at once**, under a cap, with a queue and dependencies between them,
+and Claude can now tell a worker it got something wrong: `worker_revise` sends
+feedback to a worker's existing session, capped, with a read-only reviewer that
+can be pointed at another worker's diff.
 
-What is still missing is the review loop: nothing can yet tell a worker it got
-something wrong. That is Phase 6.
+**What v1 is not.** Phase 7 (hardening: budget *enforcement* beyond a per-worker
+abort, retries with backoff, orphan pruning, richer crash-recovery flows, a
+metrics log) and Phase 8 (optimization: model-routing presets, worker priorities,
+cross-model review diversity, shared-workspace mode, container sandboxing) are
+both real work and neither is here. Four smaller things are still open and are
+listed under "Unresolved" in [`docs/phase0-facts.md`](docs/phase0-facts.md): no
+in-band reply to a permission or question request (a mid-run ask costs a partial
+turn), `cost` unverified on a paid provider, `RunBackend` never exercised, and
+`.orchestrator/` visible in `git status` until some worker prepares a worktree.
 
 - [`docs/adr/0001-serve-vs-run-backend.md`](docs/adr/0001-serve-vs-run-backend.md) — ServeBackend accepted, with costs
 - [`docs/adr/0002-worker-contract-channel.md`](docs/adr/0002-worker-contract-channel.md) — how the brief goes out and the report comes back
 - [`docs/adr/0003-integration-worktree.md`](docs/adr/0003-integration-worktree.md) — where the merge runs, and why not OpenCode's own worktrees
 - [`docs/adr/0004-queue-and-dependencies.md`](docs/adr/0004-queue-and-dependencies.md) — the queue across a restart, and what a failed dependency does to its dependents
+- [`docs/adr/0005-the-review-loop.md`](docs/adr/0005-the-review-loop.md) — why a revision re-enters the queue, which failure states may be revised, and what a reviewer is pointed at
 - [`docs/phase0-facts.md`](docs/phase0-facts.md) — verified API facts, and what is still unresolved
 - [`src/opencode/`](src/opencode/) — the adapter. **The only code that knows OpenCode exists** (DD-2)
 - [`src/manager/`](src/manager/) — the lifecycle: state machine, run loop, watchdogs, budgets, recovery, and the admission gate
@@ -65,8 +75,34 @@ The work is on integration/m-001. Review it (worker_diff per worker), then land 
 the orchestrator never writes to your branch or your working tree.
 ```
 
-**Phase 5 (parallelism: the concurrency semaphore, the queue, `dependsOn` and
-batched waits) is next** — see [`projectplan.md`](projectplan.md) §11.
+A worker that got something wrong goes back to the same session rather than being
+replaced, so it keeps everything it read and worked out. The rounds are capped,
+and the cap is where the interesting part is: at it, `worker_revise` refuses with
+a report of what was tried, what changed between rounds and what is still failing,
+because a cap that stops the loop and says only "limit reached" has turned a
+runaway into a dead end.
+
+```
+Revision refused: w-002 has already taken 3 of 3 rounds.
+
+## What was tried (4 rounds)
+
+**Round 0** (the original attempt) — the task as briefed
+  outcome: `completed` — 1 file changed (+22/−1), 2 tests failing, 1 discrepancy
+**Round 1**
+  asked: » npm test still fails: sum([1,2,3,4]) returns 11, not 10.
+  outcome: `completed` — 1 file changed (+22/−1), 2 tests failing
+
+## What changed across the rounds
+
+- Files touched went from 1 to 1; the diff is now +22/−1 against its base.
+- Failing tests went from 2 to 2.
+- **The diff did not move between the first and last round.** Feedback is reaching
+  the worker and not changing what it produces, which usually means the feedback
+  and the worker disagree about what the problem is.
+```
+
+**Phase 7 (hardening) is next** — see [`projectplan.md`](projectplan.md) §11.
 
 ## Requirements
 
@@ -142,6 +178,7 @@ is one more thing to find.
 | `ORCHESTRATOR_BASE_URL` | *(unset — spawn a server)* | Attach to an OpenCode server something else already owns, instead of spawning one. |
 | `ORCHESTRATOR_VERIFY_TESTS` | `1` | Re-run the brief's test command after a worker finishes. Set `0` to turn the independent verification off; DD-4 is worth less without it. |
 | `ORCHESTRATOR_MAX_CONCURRENT` | `3` | How many workers may run at once — counting `preparing`, `running` and `blocked`. Spawns past it are **queued**, not rejected. Phase 1 measured four concurrent sessions on one server completing with no cross-talk; that is one run on one free-tier model, so the default leaves headroom inside it. Raise it after measuring your own provider under load, not before. Clamped to 1–32; an unparseable value falls back to the default rather than refusing to start. |
+| `ORCHESTRATOR_MAX_REVISIONS` | `3` | How many rounds of feedback one worker may take through `worker_revise`. At the cap the tool refuses with a report of what was tried, what changed between rounds and what is still failing — the refusal is the deliverable, not an error. `0` turns revisions off entirely, which is a legitimate setting rather than a typo, so it is clamped to 1–20 only at the top. An unparseable value falls back to the default. |
 
 ```bash
 claude mcp add orchestrator \
@@ -163,6 +200,7 @@ uncommitted, because your `.gitignore` is yours.
 | `worker_result` | The §4.3 result — the default thing to read. |
 | `worker_output` | The lifecycle audit trail, paginated. Debugging only. |
 | `worker_message` | Answer a blocked worker; the session is reused. |
+| `worker_revise` | Send a settled worker back with feedback; same session, capped, with a terminal report at the cap. |
 | `worker_stop` | Graceful abort, with the worktree snapshotted. |
 | `worker_list` | Inventory, filterable by state and run. |
 | `worker_diff` | The unified diff a worker produced, paginated under a 400-line cap. |
@@ -185,8 +223,10 @@ reliably reads.
 surface: it is the instrument that measured the host's tool-call ceiling
 `worker_wait`'s cap sits under. See [`docs/phase3-notes.md`](docs/phase3-notes.md).
 
-Phase 6's `worker_revise` is deliberately absent rather than half-built — a tool
-that promises a review loop that does not exist is worse than no tool.
+There is no `worker_review` tool, deliberately: a reviewer *is* a worker, so it is
+spawned by `worker_spawn({mode: "review", reviewOf: "w-001"})` like any other. A
+second spawn tool differing only in its mode would be the mistake a
+`worker_wait_all` beside `worker_wait` would have been.
 
 ### Running several workers at once
 

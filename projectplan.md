@@ -256,6 +256,27 @@ Risks: JWT expiry not configurable yet
 
 **Revision path:** `worker_revise(id, feedback)` sends feedback to the same session (worker retains full context of its own work). Revision counter per worker; at `maxRevisions` (default 3) the manager refuses and reports — prevents infinite fix loops.
 
+> **Phase 6, as built.** This line predates every phase and survived all of them;
+> what it could not say is where a revision *re-enters* the lifecycle. Since
+> Phase 5, the concurrency gate sits between `spawned` and `preparing`, and a
+> settled worker holds no slot — so a revision has to go back through the queue
+> or it silently un-caps the whole system. The `revise` edges therefore land in
+> **`spawned`**, not in `running`, and a revision that has to wait says `queued`
+> on its record exactly as a queued spawn does.
+>
+> Two more things the line implies and does not state. **"Refuses and reports" is
+> one act, not two:** at the cap the refusal *is* the report — what was tried each
+> round, what changed between rounds, what is still failing, and Claude's options
+> — because a cap that stops the loop and produces nothing to act on has converted
+> a runaway into a dead end (§13). And **the revision counter is not `resumes`**:
+> `resumes` counts the blocked→answer→resume path above, which is the worker
+> asking a question, and until Phase 6 the status line rendered one under the
+> other's name. They are separate counters now.
+>
+> `completed`, `failed`, `timed_out`, `over_budget` and `cancelled` may all be
+> revised; `merged` may not, and neither may `blocked` (that is what the path
+> above is for). See [ADR-0005](docs/adr/0005-the-review-loop.md).
+
 ---
 
 ## 6. Workspace Isolation & Merge Pipeline
@@ -278,6 +299,17 @@ Worker `cwd` = worktree root, set via `POST /session?directory=<worktree>`.
 On completion the manager runs `git add -A && git commit` to snapshot everything, then computes diffs.
 
 Research/review workers: no worktree, or a read-only mount of the target worktree.
+
+*(Resolved in Phase 6, and it is neither of those two.* A `review` worker gets its
+**own** worktree at the target's base commit, with the target's diff quoted in its
+brief. A mount of the target's worktree would make `buildResult()` measure the
+*author's* changes as the reviewer's, so a read-only worker would settle with a
+discrepancy for every file the author touched; no worktree at all would leave
+`changedFiles("")` to manufacture a discrepancy about a diff the reviewer was
+never supposed to have, and would give it nowhere to read the surrounding code
+from. With its own checkout the reviewer's measured diff is genuinely empty, which
+is what makes a reviewer that somehow writes something visible rather than
+camouflaged. See [ADR-0005](docs/adr/0005-the-review-loop.md).)
 
 ### 6.2 Overlap detection (before merge)
 
@@ -324,14 +356,14 @@ it used to claim. Rows marked ✅ are built and tested
 
 | Tool | Params | Returns | Notes |
 |------|--------|---------|-------|
-| `worker_spawn` ✅ | `task`, `scope?`, `mode` (implement/research/review), `model?`, `ownedPaths?` (file paths/globs), `acceptance?`, `testCommand?`, `baseRef?`, `runID?`, `notes?`, `budget?`, `dependsOn?` | `{workerID, branch, runID}` + whether it started or QUEUED | Returns in <2s; runs in background. **Corrected:** the param was `owns?` (renamed to match `WorkerSpec.ownedPaths`), and the return used to promise `worktree` — which DD-1 makes impossible, because the worktree is created in the background *after* spawn returns. It appears in `worker_status` once it exists. **Phase 5:** `dependsOn` is implemented, and the reply says whether the worker started or is queued — behind the cap, or behind a dependency — because "spawned" alone cannot tell those apart. A `dependsOn` that names an id nobody was handed is rejected at spawn, before a row is written. |
+| `worker_spawn` ✅ | `task`, `scope?`, `mode` (implement/research/review), `model?`, `ownedPaths?` (file paths/globs), `acceptance?`, `testCommand?`, `baseRef?`, `runID?`, `notes?`, `budget?`, `dependsOn?`, `reviewOf?` | `{workerID, branch, runID}` + whether it started or QUEUED | Returns in <2s; runs in background. **Corrected:** the param was `owns?` (renamed to match `WorkerSpec.ownedPaths`), and the return used to promise `worktree` — which DD-1 makes impossible, because the worktree is created in the background *after* spawn returns. It appears in `worker_status` once it exists. **Phase 5:** `dependsOn` is implemented, and the reply says whether the worker started or is queued — behind the cap, or behind a dependency — because "spawned" alone cannot tell those apart. A `dependsOn` that names an id nobody was handed is rejected at spawn, before a row is written. **Phase 6:** `reviewOf` points a `review` worker at another worker's diff — it gets its own worktree at that worker's base plus the diff quoted in its brief, and is rejected at spawn under the same rule as `dependsOn` if it names a worker nobody was handed or is passed without `mode: "review"`. There is no separate `worker_review` tool: a reviewer is a worker. |
 | `worker_status` ✅ | `ids?` | state, elapsed, last-activity age, revision count, ~cost, and the suggested next call | Cheap; safe to poll. With no `ids`, reports what is still active or blocked. |
 | `worker_wait` ✅ | `id` **or** `ids`, `mode?` (any/all), `timeoutMs?` (≤30,000) | same as status, one line per worker | Bounded block; reduces polling chatter. Resolves on any settled state, `blocked` included. A timeout is not an error. **Corrected twice:** the param was `ids`, and Phase 3 narrowed it to one id because batched waits were Phase 5; **Phase 5 restored `ids`** — with a `mode`, because "wait for any" and "wait for all" are different questions and a wave needs both. It is one tool rather than two: a `worker_wait_all` beside it would differ only by a suffix. The 30,000 cap was a guess when written, is now half a measured host ceiling, and **does not move for a batch**; see [`docs/phase3-notes.md`](docs/phase3-notes.md). |
 | `worker_result` ✅ | `id` | structured result (§4.3) | The default thing Claude reads. On a `blocked` worker it renders the *record* — there is no result until a worker settles, and blocking is not settling. |
 | `worker_diff` ✅ | `id`, `paths?`, `cursor?`, `maxLines?` (default 400) | paginated unified diff | On-demand detail; **built in Phase 4** ([`src/workspace/diff.ts`](src/workspace/diff.ts)), where Phase 3 said the reader belonged. Pages by **line**, not by file — a cap that rounds up to whole files is not a cap. Untracked files are included, so a worker's diff does not go empty just because DD-5's snapshot has not run yet; a worker whose worktree has been cleaned up is diffed from its snapshot commit instead. |
 | `worker_output` ✅ | `id`, `cursor?`, `limit?` (default 50 events) | paginated event log tail | Debugging only. Lifecycle-grained, never the transcript — that is what the firewall keeps out. |
 | `worker_message` ✅ | `id`, `message` | confirmation; poll `worker_status` | Answers a blocked worker; session reused. **Corrected:** it does not return a "new run id" — no run is created, because the point is that the *same* session continues. It also returns before the worker has resumed (DD-1): `manager.answer()` waits out the session settle guard, which is seconds. |
-| `worker_revise` | `id`, `feedback` | revision number | Review-loop entry point; session reused; capped. **Phase 6** (§11), not Phase 3. |
+| `worker_revise` ✅ | `id`, `feedback` | revision number, or the terminal report at the cap | Review-loop entry point; session reused; capped (`ORCHESTRATOR_MAX_REVISIONS`, default 3). **Built in Phase 6.** **Corrected:** it does not simply return "a revision number" — at the cap it returns §13's *terminal actionable report* instead, which is the half that mattered, and the row as written made the refusal sound like an error. Two other things this row could not have known: a revision **re-enters the concurrency queue** (a settled worker holds no slot, so a revision that skipped the gate would silently un-cap the system), so a revised worker goes back to `spawned` before it runs and the reply says whether it started or queued, exactly as `worker_spawn`'s does; and the worker leaves its settled state *before the call returns*, so a following `worker_wait` waits for the new round rather than returning the pre-revision record. See [ADR-0005](docs/adr/0005-the-review-loop.md). |
 | `run_report` ✅ | `runID?`, `write?` | markdown audit trail — workers, models, spend, tests, discrepancies, merge outcomes, timeline | **Added in Phase 5**, and required by §8's "every run emits a markdown audit trail". §7 never listed it because §8 described it as a by-product rather than a tool; it is a tool, because a run has to be *asked* for its report. Written to `.orchestrator/runs/<runID>.md` and excerpted on the wire — a full report over six workers is the largest thing this surface produces. Worker claims are quoted and capped; the measurements are not. |
 | `worker_stop` ✅ | `id`, `reason?` | confirmation; poll `worker_status` | Graceful abort + snapshot. Returns before the worker has stopped, for the same DD-1 reason as `worker_message`. |
 | `worker_list` ✅ | `state?`, `runID?` | worker summaries | |
@@ -501,7 +533,7 @@ Four things worth knowing before Phase 5 builds on this:
 **AC — corrected.** This row read: *"v1 demo: 'Add a settings page' — 3 concurrent workers (UI / API / tests, mixed models), review, **revisions**, gated merges, final validation, run report. This is the project's definition of done for v1."* Revisions are `worker_revise`, which is Phase 6 — the AC as written spanned both phases and could not be met by this one. It is split rather than reinterpreted, in the same house style as the four §7 rows and the §6 lines corrected before it:
 
 - **Phase 5's AC** is *three workers run concurrently under the cap, a dependent worker waits for its dependency, and the wave reaches a gated merge and a run report.*
-- **The full v1 demo, revisions included, is Phase 6's**, and is run once, at the end of Phase 6. It remains the project's definition of done for v1.
+- **The full v1 demo, revisions included, is Phase 6's**, and is run once, at the end of Phase 6. It remains the project's definition of done for v1. *(Run on 2026-08-29 — see Phase 6 below.)*
 
 **Phase 5's AC met**, each with the test that shows it:
 
@@ -522,13 +554,38 @@ Four things worth knowing before Phase 6 builds on this:
 - **The run report caught a defect nothing else had.** `markMerged` wrote `state:merged` twice per worker — once from the state machine's own hook and once beside it, with different detail — and every previous rendering was paginated or filtered enough to hide it. The trail now has one writer per transition, and extra context rides on the transition's `detail`. A run report is a debugging tool for the orchestrator as much as for a run.
 - **A worker that never started must not render as one that achieved nothing.** `WorkerResult.reportSource` gained `not_started` for exactly this: zeroes everywhere, no discrepancies, and a line saying no prompt was ever sent. Running the reconciliation machinery over a worktree that does not exist manufactures a report-parse discrepancy about a report nobody asked for.
 
-### Phase 6 — Review loop (3–4 days)
+### Phase 6 — Review loop ✅ COMPLETE
+
+> Outcome: `worker_revise` in [`src/mcp/tools.ts`](src/mcp/tools.ts) and `WorkerManager.revise()` in [`src/manager/worker.ts`](src/manager/worker.ts) — session reuse, a revision cap with §13's terminal actionable report, and a re-entrant run loop that re-acquires a concurrency slot; the `revise` edges in [`src/manager/state.ts`](src/manager/state.ts); `reviewOf` on `worker_spawn`, pointing a read-only `review` worker at another worker's diff; [`src/manager/revisions.ts`](src/manager/revisions.ts) — the rounds, reconstructed from the event trail for both the cap report and the run report. `revisions` is a new column with the project's first real migration ([`src/store/schema.ts`](src/store/schema.ts)), and `render.ts`'s status line stopped printing `resumes` under the label "revisions". `ORCHESTRATOR_MAX_REVISIONS` joins the [README](README.md#configuration)'s table. Decisions in [ADR-0005](docs/adr/0005-the-review-loop.md). §7's `worker_revise` and `worker_spawn` rows, §5's revision path and §6.1's review-worker line are all corrected in place above. Tests: 43 new, **302 total green** (4 skipped) — [`test/manager/revise.test.ts`](test/manager/revise.test.ts), [`test/mcp/revise.test.ts`](test/mcp/revise.test.ts). `bun run spike` still green against OpenCode 1.18.25.
 
 - `worker_revise` with session reuse, revision caps, optional read-only reviewer worker critiquing another worker's diff.
 
-**AC:** seeded failing worker receives feedback, fixes, passes; loop terminates at cap with an actionable report to Claude.
+**AC met:** *seeded failing worker receives feedback, fixes, passes; loop terminates at cap with an actionable report to Claude.*
 
-**Plus the v1 demo**, which Phase 5's AC used to claim and could not meet (see the correction above): *"Add a settings page" — 3 concurrent workers (UI / API / tests, mixed models), review, revisions, gated merges, final validation, run report*, driven by Claude from a live session with the `tool_result` blocks as the evidence. **This is the project's definition of done for v1**, and Phase 6 is the phase that reaches it. Run it once, at the end.
+- **The seeded failing worker** — [`test/mcp/revise.test.ts`](test/mcp/revise.test.ts), over real JSON-RPC. The golden repo is seeded so `npm test` fails on a real assertion (`breakGoldenRepo`), the worker "fixes" it wrongly on round 0 and correctly on round 1, and **it claims success both times** — so the only thing that can tell the rounds apart is the orchestrator re-running the suite itself (§4.3). Round 0 settles with a `test_claim_unverified` discrepancy; round 1 settles clean, and the fix is on disk in the worktree rather than in the report.
+- **The cap's report is asserted on its content, not on the refusal** — it names every round and the feedback actually sent, what changed between rounds (files, diff size, failing tests, discrepancies, all measured), what is still failing, and four options with the calls that take them. A test that only checked that the refusal happened would have tested the half that was never the risk.
+- **The session is reused, provably** — one `POST /session` per worker and N prompts, same `sessionID` across every round, asserted directly against the mock's request log.
+- **A revision never exceeds the concurrency cap** — asserted by observation, the way Phase 5's is: with the cap full a revision sits in `spawned` with `reason: "queued"`, `queueHint` says `2/2 slots busy`, and its round counter is still 0 because the cap counts rounds *taken*.
+- **`worker_revise` then `worker_wait` waits** — the state leaves `completed` synchronously, before the call returns.
+- **`dispose()` and `cancel()` work on a revising worker** — no hang, and `dispose()` does not return with a prompt in flight.
+- **A revised worker merges its new commit** — the branch tip, so the merged tree carries the post-revision content — **and the §6.2 overlap warning is computed from the post-revision diff**: two workers that were disjoint stop being disjoint the moment a revision makes one of them touch the other's file. That second half is the one that does not come for free (the check reads `result.changes.paths`, the measurement taken at the *previous* settle), and it holds only because a revision re-runs `settle()` before the merge starts — an ordering the test pins rather than assumes. A revision cancelled in the queue keeps the result of the round that did run rather than rebuilding one for a round that never happened.
+- **One defect found by re-reading the diff rather than by a failing test:** the scheduler's `refused` set was sticky, which was sound only while a refusal was permanent. A revision can be refused at the queue and the worker revised again to `completed`, after which the scheduler went on answering "failed" about it — and the next dependent was rejected with "will never complete: w-001 (completed)". Fixed in `enqueue()`, with the old message reproduced in the test before the new behaviour is asserted.
+
+**The v1 demo was run** on **2026-08-29**, once, at the end — driven by Claude from a live `claude -p --strict-mcp-config` session with only orchestrator tools allowed, against real OpenCode 1.18.25 on the free `opencode/muse-spark-1.2-contributor-free`, on a throwaway golden repo. **This is the project's definition of done for v1, and it is met.** The `tool_result` blocks and the store's `events` table are the evidence:
+
+- **Three workers, one wave, under the cap.** `worker_status` returned `w-001 [running]`, `w-002 [running]` and `w-003 [spawned: waiting_on_dependencies] · waiting for w-001, w-002`, with the trailer `(1 of these have not started: 2/3 slots busy, 1 queued)`. The event trail records `admitted running=1` and `running=2` and never 3 concurrent past the cap.
+- **A review worker critiqued another worker's diff.** `w-004` (mode `review`, `reviewOf: w-001`) got `review_target {"target":"w-001","diffLines":13,"source":"worktree"}` and returned three concrete defects naming the file — including that `w-001`'s claim of "npm test (3 pass)" does not validate the new module at all, because the suite only covers `src/stats.js`. It changed **0 files** and produced **0 discrepancies**: read-only held, measured rather than asserted.
+- **Four revision rounds across three workers, and Claude chose every one.** `w-003` produced no changes at all with an unparseable report and was revised twice; `w-001` was revised once **on the reviewer's findings**; `w-004` — the reviewer — wedged on its first attempt and was revised out of `timed_out`, whose reply read *"it has left `timed_out` already"*. Nothing revised anything automatically.
+- **A revision really does re-enter the queue.** `w-001`'s trail: `state:spawned {from: completed, trigger: revise}` → `admitted` → `state:preparing {reason: revising}` → `state:running` → `revision_started`. The second `admitted` row per revised worker is the property trap 1 exists for, in production rather than in a test.
+- **`revisions` and `resumes` diverged on the same worker, live.** `w-003` finished with `revisions: 2, resumes: 2` — two rounds of feedback and two permission escalations answered. Before Phase 6 the status line would have printed one under the other's name.
+- **The gated merge took the post-revision commit.** `Merge m-001 — MERGED GREEN`, `npm test` green after each step, `w-001: merged → 7d74c2ce · tests green`. `w-001`'s branch carries two snapshot commits and the merge resolved its **tip**: `integration/m-001:src/settings.js` contains `...(overrides ?? {})` and `settings?.[key]` — the exact fixes the reviewer asked for. `w-003` came through as `nothing_to_merge — the worker committed nothing`, which is the honest answer and not an error.
+- **The run report** landed at `.orchestrator/runs/v1-demo.md` (15 KB), with a per-worker **Revision rounds** block showing round 0's outcome, the feedback each later round was given, and what each round measured.
+
+Three observations from the run, recorded rather than smoothed over:
+
+- **The reviewer wedged once.** `w-004` hit the idle watchdog on its first attempt and timed out at ~14k tokens; a revision recovered it and it produced its critique. That is `timed_out --revise--> spawned` earning its place on its first live outing — but it is also one more data point that a read-only worker handed a diff can stall, and nobody has root-caused why. Phase 7's.
+- **`external_directory` escalated three times**, on `<repo>/.orchestrator/*` twice and `/tmp/*` once, costing a partial turn and a `worker_message` round trip each. `w-003` ended on 47,531 tokens against 7,715 for the worker that never escalated. The fact sheet's "Unresolved" 5 now carries that measurement.
+- **A second merge failed, correctly.** Claude asked for `m-002` on the same `integrationBranch` name as `m-001`; the pipeline refused with `fatal: a branch named 'integration/m-001' already exists` and rolled nothing. Claude retried as `m-003` and it merged green. Not a Phase 6 regression — but re-using an integration branch name is a sharp edge a friendlier error could blunt, and §5 explicitly kept merge-pipeline redesign out of this phase.
 
 ### Phase 7 — Hardening (3–5 days)
 
@@ -577,7 +634,7 @@ Model-routing presets with automatic selection, worker priorities, smarter summa
 2. ~~Exact SSE event shapes for run completion?~~ **Resolved:** `session.idle`, `{id, type, properties:{sessionID}}` — and the stream is **directory-scoped**. Serve-vs-run parity still unverified.
 3. ~~Session resume semantics?~~ **Resolved:** yes, context is retained across prompts to the same session.
 4. ~~Permission config granularity — sufficient for headless?~~ **Resolved:** yes — inline per-session ruleset, or CLI `--auto`. A full edit+bash run completed with zero pending permission requests.
-5. ~~Can one serve instance handle 4+ concurrent sessions without degradation?~~ **Resolved in Phase 1:** yes at 4 — four worktree sessions on one server all completed with no cross-talk, at ~1.4–1.9× single-session latency. One run, one free-tier model; re-measure before going past 4. **Re-measured twice in Phase 5** (2026-08-29, OpenCode 1.18.25): the four-session probe again (11.4–15.3 s, zero foreign-session events), and the first end-to-end measurement *through the orchestrator* — three concurrent workers plus a queued dependent, driven by a live Claude Code session on the free tier, all four completing with no rate limiting and no cross-talk. The §11 Phase 5 default is **3**; more than four, paid providers under rate limits, and minutes-long workers are all still unmeasured. See `docs/phase0-facts.md`.
+5. ~~Can one serve instance handle 4+ concurrent sessions without degradation?~~ **Resolved in Phase 1:** yes at 4 — four worktree sessions on one server all completed with no cross-talk, at ~1.4–1.9× single-session latency. One run, one free-tier model; re-measure before going past 4. **Re-measured twice in Phase 5** (2026-08-29, OpenCode 1.18.25): the four-session probe again (11.4–15.3 s, zero foreign-session events), and the first end-to-end measurement *through the orchestrator* — three concurrent workers plus a queued dependent, driven by a live Claude Code session on the free tier, all four completing with no rate limiting and no cross-talk. The §11 Phase 5 default is **3**; more than four, paid providers under rate limits, and minutes-long workers are all still unmeasured. See `docs/phase0-facts.md`. **Phase 6's v1 demo closed the last of those three** (2026-08-29): a revision round ran 212 s to a clean completion, an order of magnitude past Phase 5's 23.8–48.7 s, with the watchdogs and the token polling holding throughout. More than four concurrent, and paid providers under rate limits, are still unmeasured; the default stays at 3.
 6. ~~Claude Code's actual MCP tool timeout in the target environment?~~ **Resolved in Phase 3: 60 seconds.** Measured on Claude Code 2.1.251 with the orchestrator registered as a real MCP server — 55,000 ms returns, 60,000 ms fails, and the host states its own limit in the error. `worker_wait`'s 30,000 ms cap is now half a measured ceiling instead of a guess. See `docs/phase0-facts.md` §7.
 
 Everything above is structured so that wrong answers to any of these change **one adapter file or one config default** — not the architecture.

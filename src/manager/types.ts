@@ -61,6 +61,17 @@ export interface WorkerSpec {
    * waiting forever. See `docs/adr/0004-queue-and-dependencies.md`.
    */
   readonly dependsOn?: readonly string[];
+  /**
+   * The worker whose diff a `review` worker is to critique (§11 Phase 6, §6.1).
+   *
+   * Only meaningful with `mode: "review"`. The reviewer gets **its own** worktree
+   * at the target's base commit and the target's diff quoted in its brief, rather
+   * than a mount of the target's worktree — so the reviewer's own measured diff
+   * stays empty and a reviewer that writes anything is visible as a discrepancy
+   * rather than hidden inside the author's changes. See
+   * `docs/adr/0005-the-review-loop.md`.
+   */
+  readonly reviewOf?: string;
 }
 
 /** One claimed file change, straight from the worker's report (§4.2). */
@@ -176,6 +187,19 @@ export interface WorkerRecord {
   readonly cost: number;
   /** How many times this worker has been unblocked and resumed. */
   readonly resumes: number;
+  /**
+   * How many revision rounds this worker has actually taken (§11 Phase 6).
+   *
+   * Deliberately **not** `resumes`: that counts §5's blocked→answer→resume, which
+   * is the worker asking a question, and this counts Claude sending feedback to a
+   * settled worker. Before Phase 6 the status line printed `resumes` under the
+   * label "revisions", which was harmless only while the two could not diverge.
+   * They diverge now. This is the one §13's cap counts.
+   *
+   * Incremented when a round is genuinely prompted, not when one is requested —
+   * a revision that sits in the queue and is then cancelled took no round.
+   */
+  readonly revisions: number;
   readonly reason?: string;
   /** Outstanding questions while `blocked`. Untrusted text (DD-8). */
   readonly questions: readonly string[];

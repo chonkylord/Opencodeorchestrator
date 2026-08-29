@@ -24,7 +24,16 @@ export {
 
 export { type RenderOptions, renderResult } from "./result.js";
 
-export { DEFAULT_BUDGET, DEFAULT_MODEL, WorkerManager, type WorkerManagerOptions } from "./worker.js";
+export {
+  DEFAULT_BUDGET,
+  DEFAULT_MAX_REVISIONS,
+  DEFAULT_MODEL,
+  type ReviseOutcome,
+  type RevisionCapReport,
+  type RevisionRefusal,
+  WorkerManager,
+  type WorkerManagerOptions,
+} from "./worker.js";
 
 export {
   type Admission,
@@ -39,6 +48,8 @@ export {
   clampConcurrency,
   findCycle,
 } from "./scheduler.js";
+
+export { type RevisionRound, revisionRounds } from "./revisions.js";
 
 export { RUN_REPORT_DIR, type RunReport, buildRunReport, writeRunReport } from "./runreport.js";
 

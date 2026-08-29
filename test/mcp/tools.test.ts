@@ -69,6 +69,7 @@ async function harness(
     baseUrl: mock.baseUrl,
     verifyTests: false,
     maxConcurrent: 3,
+    maxRevisions: 3,
     ...configOver,
   };
   const orchestrator = await createOrchestrator(config, {
@@ -155,6 +156,7 @@ describe("registration", () => {
       "worker_message",
       "worker_output",
       "worker_result",
+      "worker_revise",
       "worker_spawn",
       "worker_status",
       "worker_stop",
@@ -182,18 +184,25 @@ describe("registration", () => {
     expect(result.description).toMatch(/discrepanc/i);
   });
 
-  test("Phase 6 tools are absent rather than half-built", async () => {
+  test("tools that were never designed stay absent rather than half-built", async () => {
     // Phase 4 moved `worker_diff`, `workspace_merge` and `workspace_cleanup` out
     // of this list by building them; Phase 5 took the batched wait out by
     // building it *into* `worker_wait` rather than beside it — one tool that
-    // takes `id` or `ids` beats two that differ by a suffix. What is left is the
-    // review loop's revision entry point, which is genuinely Phase 6.
+    // takes `id` or `ids` beats two that differ by a suffix. **Phase 6 took
+    // `worker_revise` out by building it**, and deliberately did not add a
+    // `worker_review` beside it: a reviewer is a worker, so it is spawned by
+    // `worker_spawn({mode: "review", reviewOf})` like every other worker, and a
+    // second spawn tool that differed only in its mode would be the same mistake
+    // `worker_wait_all` would have been.
     const { client } = await harness();
     const tools = (await client.listTools()).tools;
     const names = tools.map((t) => t.name);
-    for (const absent of ["worker_revise", "worker_wait_all", "worker_review", "workspace_status"]) {
+    expect(names).toContain("worker_revise");
+    for (const absent of ["worker_wait_all", "worker_review", "workspace_status"]) {
       expect(names).not.toContain(absent);
     }
+    const spawn = tools.find((t) => t.name === "worker_spawn")!;
+    expect(Object.keys((spawn.inputSchema as { properties: Record<string, unknown> }).properties)).toContain("reviewOf");
     const wait = tools.find((t) => t.name === "worker_wait")!;
     expect(Object.keys((wait.inputSchema as { properties: Record<string, unknown> }).properties)).toContain("ids");
   });

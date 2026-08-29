@@ -13,7 +13,7 @@
 
 import { resolve } from "node:path";
 
-import { clampConcurrency } from "../manager/index.js";
+import { DEFAULT_MAX_REVISIONS, clampConcurrency } from "../manager/index.js";
 
 export interface ServerConfig {
   /** The repository the workers branch from. */
@@ -41,6 +41,16 @@ export interface ServerConfig {
    * see `docs/phase0-facts.md` "Unresolved" 2.
    */
   readonly maxConcurrent: number;
+  /**
+   * How many revision rounds one worker may take (§5, §13).
+   *
+   * Defaults to 3, which is the number §5 has carried since before Phase 0. The
+   * cap is what keeps a review loop from becoming an infinite fix loop, and at
+   * it `worker_revise` hands Claude a report of what was tried rather than an
+   * error — so raising this trades a longer loop for a later decision, and 0
+   * turns revisions off entirely.
+   */
+  readonly maxRevisions: number;
 }
 
 /** `.orchestrator/` is already git-excluded for the worktrees; the index joins it. */
@@ -67,6 +77,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     // the server on the default, not refuse to launch. A host that will not come
     // up because of a typo in one env var is worse than one that runs at 3.
     maxConcurrent: clampConcurrency(numberOr(env["ORCHESTRATOR_MAX_CONCURRENT"])),
+    // Clamped, not validated, for the same reason as the cap above: a typo in an
+    // env var should start the server on the default rather than refuse to launch.
+    maxRevisions: clampRevisions(numberOr(env["ORCHESTRATOR_MAX_REVISIONS"])),
   };
 }
 
@@ -74,4 +87,12 @@ function numberOr(raw: string | undefined): number | undefined {
   if (raw === undefined || raw.trim() === "") return undefined;
   const n = Number(raw);
   return Number.isFinite(n) ? n : undefined;
+}
+
+/** A ceiling that is a sanity limit, not a measurement — as with concurrency. */
+export const MAX_REVISIONS_LIMIT = 20;
+
+export function clampRevisions(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_MAX_REVISIONS;
+  return Math.max(0, Math.min(MAX_REVISIONS_LIMIT, Math.floor(value)));
 }

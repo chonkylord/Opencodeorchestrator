@@ -44,6 +44,7 @@ const worker = (over: Partial<WorkerRecord> = {}): WorkerRecord => ({
   totalTokens: 12_345,
   cost: 0,
   resumes: 0,
+  revisions: 0,
   questions: [],
   ...over,
 });
