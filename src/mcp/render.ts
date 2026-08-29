@@ -21,7 +21,7 @@
  */
 
 import type { StoredEvent } from "../store/index.js";
-import type { MergeRecord, StartedMerge, WorkerRecord } from "../manager/index.js";
+import type { MergeRecord, QueueHint, StartedMerge, WorkerRecord } from "../manager/index.js";
 import type { CleanupReport, DiffPage, MergeStep, OverlapReport } from "../workspace/index.js";
 
 // ---------------------------------------------------------------------------
@@ -42,6 +42,17 @@ export const MAX_QUESTIONS = 6;
 export const LIST_ROWS_MAX = 100;
 /** Claude's own message to a blocked worker. Generous — it is not worker output. */
 export const MESSAGE_CHARS_MAX = 8_000;
+/**
+ * How much of a run report goes on the wire.
+ *
+ * The document is the artifact and lives on disk; this is the excerpt. ~10k
+ * characters is ~2.5k tokens — more than §8's per-round target, and deliberately
+ * so, because a run report is asked for once at the end of a run rather than
+ * polled, and the whole point of asking is to read it.
+ */
+export const RUN_REPORT_CHARS = 10_000;
+/** Workers one batched `worker_wait` may name. Past this, wait on a subset. */
+export const WAIT_IDS_MAX = 20;
 
 /**
  * Marks text the *worker* wrote, as opposed to the orchestrator's own findings.
@@ -73,10 +84,42 @@ function spend(totalTokens: number, cost: number): string {
   return cost > 0 ? `~$${cost.toFixed(2)}` : `~${totalTokens.toLocaleString("en-US")} tok`;
 }
 
-/** How long this worker has been alive, excluding nothing. */
+/**
+ * How long this worker has been alive, excluding nothing.
+ *
+ * `startedAt ?? createdAt` means a *queued* worker's elapsed time includes the
+ * time it spent in the queue, which is correct and desirable — a human wants to
+ * know a worker has been waiting eight minutes. It is deliberately **not** the
+ * number its wall-clock budget is measured against: that clock starts in
+ * `prepareAndRun()`, after admission, so queue time is free. The two are
+ * different numbers on purpose and a reader who assumes they agree will be
+ * wrong about a queued worker.
+ */
 function elapsedMs(r: WorkerRecord, now: number): number {
   const from = r.startedAt ?? r.createdAt;
   return (r.endedAt ?? now) - from;
+}
+
+/**
+ * The queue, in the fewest characters that answer "why is nothing happening".
+ *
+ * Two workers in `spawned` are indistinguishable on the record alone — one is
+ * about to start and one is behind three others — and they want different next
+ * calls from Claude. This is what tells them apart.
+ */
+function queueNote(hint: QueueHint): string {
+  if (hint.waitingFor.length > 0) {
+    const shown = hint.waitingFor.slice(0, 3).join(", ");
+    const more = hint.waitingFor.length > 3 ? `, +${hint.waitingFor.length - 3}` : "";
+    return `waiting for ${shown}${more}`;
+  }
+  return `queued ${ordinal(hint.position)} of ${hint.queueLength} · ${hint.running}/${hint.maxConcurrent} slots busy`;
+}
+
+function ordinal(n: number): string {
+  const rest = n % 100;
+  if (rest >= 11 && rest <= 13) return `${n}th`;
+  return `${n}${["th", "st", "nd", "rd"][n % 10] ?? "th"}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -91,12 +134,13 @@ function elapsedMs(r: WorkerRecord, now: number): number {
  * state whose follow-up is obvious to whoever wrote the state machine is not
  * obvious to a model three tool calls into a task it is also reasoning about.
  */
-export function statusLine(r: WorkerRecord, now: number): string {
+export function statusLine(r: WorkerRecord, now: number, hint?: QueueHint): string {
   const idle = duration(Math.max(0, now - r.updatedAt));
   const rev = r.resumes > 0 ? ` · revisions: ${r.resumes}` : "";
+  const queue = hint ? ` · ${queueNote(hint)}` : "";
   return (
     `${r.workerID} [${r.state}${r.reason ? `: ${r.reason}` : ""}] ${duration(elapsedMs(r, now))} elapsed · ` +
-    `${idle} since last activity${rev} · ${spend(r.totalTokens, r.cost)} · next: ${nextStep(r)}\n` +
+    `${idle} since last activity${rev} · ${spend(r.totalTokens, r.cost)}${queue} · next: ${nextStep(r, hint)}\n` +
     `  task: ${clampChars(r.task, TASK_CHARS)}`
   );
 }
@@ -111,9 +155,17 @@ export function listRow(r: WorkerRecord, now: number): string {
 }
 
 /** What a caller should do next, given where the worker is. */
-function nextStep(r: WorkerRecord): string {
+function nextStep(r: WorkerRecord, hint?: QueueHint): string {
   switch (r.state) {
     case "spawned":
+      // The one place the state alone gives the wrong advice. `worker_wait` on a
+      // worker that has not been admitted burns its whole timeout waiting for a
+      // worker that is not running, and comes back saying "still working".
+      if (hint?.waitingFor.length) {
+        return `worker_wait({ids: ${JSON.stringify(hint.waitingFor)}, mode: "all"}) — it starts when they complete`;
+      }
+      if (hint) return "worker_status — it has not started; a slot frees when a running worker settles";
+      return "worker_wait, or worker_status again";
     case "preparing":
     case "running":
       return "worker_wait, or worker_status again";
@@ -165,12 +217,78 @@ export function renderBlocked(r: WorkerRecord, now: number): string {
  * status line rather than an error: "not yet" is information, and an error would
  * teach Claude to avoid a tool that was working correctly.
  */
-export function renderPending(r: WorkerRecord, now: number): string {
+export function renderPending(r: WorkerRecord, now: number, hint?: QueueHint): string {
   return [
     `Worker ${r.workerID} is ${r.state} — no result yet.`,
-    statusLine(r, now),
+    statusLine(r, now, hint),
     "",
-    "A result exists only once a worker settles. Use worker_wait to block until it does.",
+    hint
+      ? "It has not started: it is queued behind the concurrency cap or waiting on a dependency,\n" +
+        "so nothing has been allocated and no budget has been spent. See `next:` above."
+      : "A result exists only once a worker settles. Use worker_wait to block until it does.",
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: the batched wait and the run report
+// ---------------------------------------------------------------------------
+
+/**
+ * What a batched `worker_wait` says when it comes back.
+ *
+ * The verdict line first, then one status line each, because the question a
+ * caller asked was "which of these needs me now" and the answer to that is a
+ * *set*, not a table to read carefully. `any` that timed out and `all` that
+ * timed out mean different things and say so: with `any`, nothing has moved;
+ * with `all`, some have and the rest have not.
+ */
+export function renderWaitMany(
+  records: readonly WorkerRecord[],
+  settled: readonly string[],
+  mode: "any" | "all",
+  waitedMs: number,
+  now: number,
+  hintOf: (workerID: string) => QueueHint | undefined,
+): string {
+  const waited = `${Math.round(waitedMs / 1000)}s`;
+  const pending = records.filter((r) => !settled.includes(r.workerID));
+  const head =
+    mode === "any"
+      ? settled.length > 0
+        ? `${settled.length} of ${records.length} worker(s) have settled after ${waited}: ${settled.join(", ")}.`
+        : `None of the ${records.length} workers settled within ${waited} — not an error. They are still working.`
+      : pending.length === 0
+        ? `All ${records.length} worker(s) have settled after ${waited}.`
+        : `${settled.length} of ${records.length} settled after ${waited}; still working: ${pending.map((r) => r.workerID).join(", ")}.`;
+  return [
+    head,
+    ...records.map((r) => statusLine(r, now, hintOf(r.workerID))),
+    pending.length > 0
+      ? "Call worker_wait again to keep waiting, or go and do something else and come back to worker_status."
+      : "Next: worker_result on each, then workspace_merge for the ones you want to land.",
+  ].join("\n");
+}
+
+/**
+ * A run report, capped for the wire with the whole document on disk.
+ *
+ * §8's context budget applies to a tool result whatever it contains, and a run
+ * report over six workers is the largest thing this surface produces. So the
+ * full markdown is a file — that is what "every run emits a markdown audit
+ * trail" asks for anyway — and what comes back here is bounded, with the path
+ * to the rest.
+ */
+export function renderRunReport(report: { runID: string; markdown: string; path?: string }): string {
+  const body =
+    report.markdown.length <= RUN_REPORT_CHARS
+      ? report.markdown
+      : `${report.markdown.slice(0, RUN_REPORT_CHARS)}\n…(truncated for this tool result; the whole report is the file above)`;
+  return [
+    report.path
+      ? `Run report for ${report.runID}, written to ${report.path}.`
+      : `Run report for ${report.runID} (not written to disk).`,
+    "",
+    body,
   ].join("\n");
 }
 

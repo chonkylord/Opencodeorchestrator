@@ -13,6 +13,8 @@
 
 import { resolve } from "node:path";
 
+import { clampConcurrency } from "../manager/index.js";
+
 export interface ServerConfig {
   /** The repository the workers branch from. */
   readonly repoRoot: string;
@@ -29,6 +31,16 @@ export interface ServerConfig {
   readonly baseUrl?: string;
   /** Re-run the brief's test command after a worker completes (§4.3). */
   readonly verifyTests: boolean;
+  /**
+   * How many workers may be past `spawned` at once (§11 Phase 5).
+   *
+   * Defaults to 3. Phase 1 measured four concurrent sessions on one server
+   * completing with no cross-talk — one run, one free-tier model — so three is
+   * headroom inside a measurement nobody has repeated rather than a limit
+   * anybody hit. Raise it only after measuring your own provider under load;
+   * see `docs/phase0-facts.md` "Unresolved" 2.
+   */
+  readonly maxConcurrent: number;
 }
 
 /** `.orchestrator/` is already git-excluded for the worktrees; the index joins it. */
@@ -51,5 +63,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     // Opt-out rather than opt-in: the manager's own test run is the evidence
     // behind a worker's "tests pass", and DD-4 is worth less without it.
     verifyTests: env["ORCHESTRATOR_VERIFY_TESTS"] !== "0",
+    // Clamped rather than validated: an unparseable or absurd value should start
+    // the server on the default, not refuse to launch. A host that will not come
+    // up because of a typo in one env var is worse than one that runs at 3.
+    maxConcurrent: clampConcurrency(numberOr(env["ORCHESTRATOR_MAX_CONCURRENT"])),
   };
+}
+
+function numberOr(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : undefined;
 }

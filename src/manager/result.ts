@@ -45,7 +45,12 @@ export function renderResult(r: WorkerResult, opts: RenderOptions = {}): string 
   lines.push("");
 
   if (r.summary) lines.push(`Summary: ${clampWords(r.summary, SUMMARY_WORDS)}`);
-  else lines.push("Summary: (the worker produced no usable report)");
+  else if (r.reportSource === "not_started") {
+    // "The worker produced no usable report" would be true and misleading: it
+    // was never asked for one. Everything below this line is zero because
+    // nothing happened, not because a worker ran and achieved nothing.
+    lines.push("Summary: (this worker never started — nothing was allocated and nothing was lost)");
+  } else lines.push("Summary: (the worker produced no usable report)");
 
   const c = r.changes;
   const sign = `+${c.additions}/−${c.deletions}`;
@@ -79,6 +84,9 @@ export function renderResult(r: WorkerResult, opts: RenderOptions = {}): string 
   if (r.snapshot?.committed && r.snapshot.sha) lines.push(`Snapshot: ${r.snapshot.sha.slice(0, 10)} on the worker's branch`);
   if (r.reportSource === "none") lines.push("Report: the worker never produced one — every claim above is the orchestrator's own measurement");
   else if (r.reportSource === "report_file") lines.push("Report: recovered from the worktree, not from the reply");
+  else if (r.reportSource === "not_started") {
+    lines.push("Report: none, because no prompt was ever sent. Respawning this task costs nothing that was already spent.");
+  }
 
   return lines.join("\n");
 }

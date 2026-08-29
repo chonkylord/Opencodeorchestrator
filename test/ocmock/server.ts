@@ -41,6 +41,18 @@ export interface OCMockOptions {
   /** Delay from first worker event to `session.idle`. Default 30ms. */
   readonly workMs?: number;
   /**
+   * Per-worker work time, keyed by the last segment of the session's directory
+   * — which is the worker id, because that is what `createWorktree` names the
+   * directory. Anything not named here uses {@link OCMockOptions.workMs}.
+   *
+   * Phase 5 needs this the way Phase 3 needed `abortDelayMs`. A semaphore test
+   * has to know which worker is still running when another is admitted, and a
+   * dependency test has to know its dependency is *still going* when the
+   * dependent is skipped over. Racing real latency to arrange that is how a
+   * concurrency suite becomes the flaky one everybody re-runs.
+   */
+  readonly workMsFor?: Readonly<Record<string, number>>;
+  /**
    * Heartbeat period. The real server ticks every 10s; tests want milliseconds.
    * Default 25ms. Set 0 to disable and simulate a wedged/dead server.
    */
@@ -158,6 +170,7 @@ const DEFAULTS = {
   scenario: "success" as Scenario,
   latencyMs: 10,
   workMs: 30,
+  workMsFor: {} as Readonly<Record<string, number>>,
   heartbeatMs: 25,
   coldStartEvents: 0,
   tokensPerPrompt: 1000,
@@ -252,7 +265,7 @@ export class OCMock {
     const requestID = s.pendingRequestID;
     s.pendingRequestID = undefined;
     this.emit(s, "permission.replied", { sessionID: s.id, requestID, reply: "once" });
-    this.finish(s, this.opts.workMs);
+    this.finish(s, this.workMsOf(s));
     return true;
   }
 
@@ -420,7 +433,7 @@ export class OCMock {
         case "success":
           this.work(session);
           this.reply(session);
-          this.finish(session, this.opts.workMs);
+          this.finish(session, this.workMsOf(session));
           return;
         case "lying_report":
           // Claims edits; the diff says otherwise. That gap is the whole point.
@@ -441,7 +454,7 @@ export class OCMock {
           });
           this.emitText(session, session.claim);
           this.emit(session, "session.diff", { sessionID: session.id, diff: [] });
-          this.finish(session, this.opts.workMs);
+          this.finish(session, this.workMsOf(session));
           return;
         case "hang":
           // One tool call that starts and never completes. Heartbeats keep
@@ -480,7 +493,7 @@ export class OCMock {
           this.burn(session);
           return;
         case "crash":
-          this.after(session, this.opts.workMs, () => this.crash());
+          this.after(session, this.workMsOf(session), () => this.crash());
           return;
         case "format_unsupported": {
           // Observed on OpenCode 1.18.25 against a free-tier model: schema-
@@ -516,7 +529,7 @@ export class OCMock {
           }
           this.work(session);
           this.reply(session);
-          this.finish(session, this.opts.workMs);
+          this.finish(session, this.workMsOf(session));
           return;
         }
       }
@@ -542,6 +555,12 @@ export class OCMock {
         delta: text.slice(i, i + 64),
       });
     }
+  }
+
+  /** This session's work time: its worker id's, or the mock-wide default. */
+  private workMsOf(session: MockSession): number {
+    const stem = session.directory.split("/").filter(Boolean).pop() ?? "";
+    return this.opts.workMsFor[stem] ?? this.opts.workMs;
   }
 
   private work(session: MockSession): void {

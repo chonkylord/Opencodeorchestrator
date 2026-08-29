@@ -33,13 +33,16 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import {
+  DependencyError,
   type MergeCoordinator,
   MergeStartError,
   type WorkerManager,
   type WorkerRecord,
   type WorkerSpec,
+  buildRunReport,
   isSettled,
   renderResult,
+  writeRunReport,
 } from "../manager/index.js";
 import type { Store } from "../store/index.js";
 import { DIFF_LINES_DEFAULT, DIFF_LINES_MAX, cleanupWorkspace, gitLine, readCommitDiff, readDiff } from "../workspace/index.js";
@@ -48,6 +51,7 @@ import {
   EVENTS_PAGE_MAX,
   LIST_ROWS_MAX,
   MESSAGE_CHARS_MAX,
+  WAIT_IDS_MAX,
   listRow,
   renderBlocked,
   renderCleanup,
@@ -57,6 +61,8 @@ import {
   renderMergeStart,
   renderNoResult,
   renderPending,
+  renderRunReport,
+  renderWaitMany,
   statusLine,
 } from "./render.js";
 
@@ -153,6 +159,11 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         "implementation).\n" +
         "BATCH related work into one worker to amortize session warm-up, and prefer 2-5 workers in " +
         "parallel — merge pain grows superlinearly past that.\n\n" +
+        "CONCURRENCY: the orchestrator runs a fixed number of workers at once (see the reply this " +
+        "returns) and QUEUES the rest, in spawn order. Spawning six is fine and costs nothing extra — " +
+        "the queued ones sit in `spawned` having allocated nothing, and their time limits do not start " +
+        "until they actually run. Use `dependsOn` when one worker's work has to land before another " +
+        "starts; a worker waiting on a dependency does not hold a slot.\n\n" +
         "The brief is the whole contract: a worker gets `task`, `scope`, `ownedPaths`, `acceptance` and " +
         "`testCommand` and nothing else — it cannot ask you a clarifying question without stopping and " +
         "waiting (see worker_message). A vague task produces a worker that guesses. Name the test " +
@@ -223,20 +234,18 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
           .array(z.string().max(100))
           .max(20)
           .optional()
-          .describe("NOT IMPLEMENTED until Phase 5. Passing it is rejected rather than ignored."),
+          .describe(
+            "Worker ids that must reach `completed` before this one starts, e.g. ['w-001']. They must " +
+              "already have been spawned — ids come from this tool — and a worker waiting on one holds no " +
+              "concurrency slot, so a dependency never queues behind its own dependent. If a dependency " +
+              "ends in any other state (failed, timed_out, over_budget, cancelled) this worker is " +
+              "CANCELLED with a reason naming it, rather than waiting forever for something that will " +
+              "never finish.",
+          ),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async (args): Promise<ToolResult> => {
-      if (args.dependsOn && args.dependsOn.length > 0) {
-        // Scheduling is Phase 5. Silently ignoring this would make a worker that
-        // ran too early look like a worker that failed for no reason.
-        return fail(
-          "`dependsOn` is not implemented until Phase 5 (there is no queue or semaphore yet), and it is " +
-            "rejected rather than ignored so you do not get a worker that silently ran before its " +
-            "dependency. Spawn the dependency, worker_wait on it, then spawn this one.",
-        );
-      }
       const spec: WorkerSpec = {
         task: args.task,
         ...(args.scope === undefined ? {} : { scope: args.scope }),
@@ -249,17 +258,37 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         ...(args.runID === undefined ? {} : { runID: args.runID }),
         ...(args.notes === undefined ? {} : { notes: args.notes }),
         ...(args.budget === undefined ? {} : { budget: args.budget }),
+        ...(args.dependsOn === undefined ? {} : { dependsOn: args.dependsOn }),
       };
       try {
         const r = await manager.spawn(spec);
+        const hint = manager.queueHint(r.workerID);
+        const head = `Spawned ${r.workerID} (${r.mode}, ${r.model}) on branch ${r.branch}, run ${r.runID}.`;
+        if (!hint) {
+          return ok(
+            `${head}\n` +
+              "It is preparing its worktree and session now; the worktree path appears in worker_status " +
+              `once it exists. ${hintSlots(manager)}\n` +
+              `Next: worker_wait({id: "${r.workerID}"}) to block until it settles, then worker_result.`,
+          );
+        }
         return ok(
-          `Spawned ${r.workerID} (${r.mode}, ${r.model}) on branch ${r.branch}, run ${r.runID}.\n` +
-            "It is preparing its worktree and session now; the worktree path appears in worker_status " +
-            "once it exists.\n" +
-            `Next: worker_wait({id: "${r.workerID}"}) to block until it settles, then worker_result.`,
+          `${head}\n` +
+            (hint.waitingFor.length > 0
+              ? `QUEUED, waiting for ${hint.waitingFor.join(", ")} to complete. Nothing has been allocated and ` +
+                "its time limits have not started — they begin when it actually runs.\n" +
+                `Next: worker_wait({ids: ${JSON.stringify([...hint.waitingFor, r.workerID])}, mode: "all"}).`
+              : `QUEUED ${hint.position} deep — ${hint.running}/${hint.maxConcurrent} slots are busy. It starts when ` +
+                "one of them settles. Nothing has been allocated and its time limits have not started.\n" +
+                `Next: worker_wait on the workers that are running, or worker_status({ids: ["${r.workerID}"]}).`),
         );
       } catch (e) {
-        return fail(`Could not spawn a worker: ${message(e)}`);
+        // A rejected `dependsOn` is a *usable* answer — it names the worker or
+        // the cycle — so it is an error result rather than a thrown exception
+        // the host renders as a transport failure.
+        return fail(
+          e instanceof DependencyError ? `Worker not spawned: ${e.message}` : `Could not spawn a worker: ${message(e)}`,
+        );
       }
     },
   );
@@ -277,6 +306,9 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         "usually want; pass ids to include settled ones.\n\n" +
         "Prefer worker_wait over polling this in a loop: it returns the moment a worker settles instead " +
         "of at your next poll, and costs one tool call instead of ten.\n" +
+        "A `spawned` worker may be QUEUED rather than starting: the row then says how deep it is, or " +
+        "which dependencies it is waiting for, and how many concurrency slots are busy. Waiting on a " +
+        "queued worker is waiting for whatever is ahead of it, so the `next:` hint names that instead.\n" +
         "STATES: spawned/preparing/running = working. blocked = it asked you something and is waiting " +
         "(answer it with worker_message, or it eventually times out). completed = finished and " +
         "snapshotted. failed/timed_out/over_budget/cancelled = it stopped; the distinction matters, " +
@@ -297,7 +329,7 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         const lines: string[] = [];
         for (const id of ids) {
           const r = find(id);
-          lines.push(r ? statusLine(r, t) : `${id} [unknown] — no such worker`);
+          lines.push(r ? statusLine(r, t, manager.queueHint(id)) : `${id} [unknown] — no such worker`);
         }
         return ok(lines.join("\n"));
       }
@@ -312,7 +344,10 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
             : `No workers are active. ${all.length} settled worker${all.length === 1 ? "" : "s"} — worker_list to see them.`,
         );
       }
-      return ok(active.slice(0, LIST_ROWS_MAX).map((r) => statusLine(r, t)).join("\n"));
+      const shown = active.slice(0, LIST_ROWS_MAX);
+      const queued = shown.filter((r) => manager.queueHint(r.workerID) !== undefined).length;
+      const trailer = queued > 0 ? `\n(${queued} of these have not started: ${hintSlots(manager)})` : "";
+      return ok(shown.map((r) => statusLine(r, t, manager.queueHint(r.workerID))).join("\n") + trailer);
     },
   );
 
@@ -323,17 +358,34 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
     {
       title: "Block until a worker settles",
       description:
-        `Wait for one worker to stop needing attention, up to ${WAIT_TIMEOUT_MAX_MS / 1000} seconds. Returns the ` +
-        "moment it settles — completed, failed, timed_out, over_budget, cancelled, or BLOCKED (a worker " +
+        `Wait for workers to stop needing attention, up to ${WAIT_TIMEOUT_MAX_MS / 1000} seconds. Returns the ` +
+        "moment they do — completed, failed, timed_out, over_budget, cancelled, or BLOCKED (a worker " +
         "waiting on an answer has stopped, as far as you are concerned) — or when the timeout expires, " +
         "whichever comes first.\n\n" +
-        "A timeout is not an error and the worker is not affected: 'still running' is a legitimate " +
+        "ONE OR MANY: pass `id` for one worker, or `ids` for a wave. With `ids`, `mode: \"any\"` (the " +
+        "default) returns as soon as ONE of them settles — use it while a wave runs, because a worker " +
+        "that blocked on a question is the event worth waking for and waiting for the slowest would " +
+        "leave it unanswered. `mode: \"all\"` returns when none of them is still working — use it " +
+        "before workspace_merge.\n\n" +
+        "A timeout is not an error and the workers are not affected: 'still running' is a legitimate " +
         "answer, and calling again resumes waiting. Use this instead of a polling loop. It is the one " +
-        "tool here that does not return immediately, which is why it is bounded; a worker that needs " +
-        "fifteen minutes needs several of these calls, or one worker_wait followed by occasional " +
-        "worker_status while you do something else.",
+        "tool here that does not return immediately, which is why it is bounded; a wave that needs " +
+        "fifteen minutes needs several of these calls.\n\n" +
+        "Waiting on a QUEUED worker waits for whatever is ahead of it, which may be a long time and is " +
+        "not that worker running. worker_status says whether a worker has started; if it has not, wait " +
+        "on the workers that are running instead.",
       inputSchema: {
-        id: z.string().max(100).describe("The worker to wait for. One at a time; batched waits arrive in Phase 5."),
+        id: z.string().max(100).optional().describe("One worker to wait for. Use `ids` for several."),
+        ids: z
+          .array(z.string().max(100))
+          .min(1)
+          .max(WAIT_IDS_MAX)
+          .optional()
+          .describe(`Several workers to wait for, at most ${WAIT_IDS_MAX}. Combine with \`mode\`.`),
+        mode: z
+          .enum(["any", "all"])
+          .optional()
+          .describe("With `ids`: 'any' (default) returns on the first to settle; 'all' waits for every one."),
         timeoutMs: z
           .number()
           .int()
@@ -344,22 +396,35 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async ({ id, timeoutMs }): Promise<ToolResult> => {
-      if (!find(id)) return unknown(id);
+    async ({ id, ids, mode, timeoutMs }): Promise<ToolResult> => {
+      const targets = [...new Set([...(ids ?? []), ...(id === undefined ? [] : [id])])];
+      if (targets.length === 0) {
+        return fail("worker_wait needs `id` (one worker) or `ids` (several). Use worker_list to find them.");
+      }
+      const missing = targets.filter((t) => !find(t));
+      if (missing.length > 0) return unknown(missing[0]!);
+      // The cap is half a *measured* host ceiling (60s on Claude Code 2.1.251),
+      // not a guess, and it does not move for a batch: the other half pays for
+      // this tool's own work and the transport, whichever way it is called.
       const budget = Math.min(timeoutMs ?? WAIT_TIMEOUT_DEFAULT_MS, WAIT_TIMEOUT_MAX_MS);
       const started = now();
       try {
-        const r = await manager.wait(id, budget);
-        const waited = now() - started;
-        const line = statusLine(r, now());
-        return ok(
-          isSettled(r.state)
-            ? `${line}\n(settled after ${Math.round(waited / 1000)}s of waiting)`
-            : `${line}\n(still working after ${Math.round(waited / 1000)}s — not an error. Call worker_wait again, ` +
-              "or go do something else and come back to worker_status.)",
-        );
+        if (targets.length === 1) {
+          const r = await manager.wait(targets[0]!, budget);
+          const waited = now() - started;
+          const line = statusLine(r, now(), manager.queueHint(r.workerID));
+          return ok(
+            isSettled(r.state)
+              ? `${line}\n(settled after ${Math.round(waited / 1000)}s of waiting)`
+              : `${line}\n(still working after ${Math.round(waited / 1000)}s — not an error. Call worker_wait again, ` +
+                "or go do something else and come back to worker_status.)",
+          );
+        }
+        const chosen = mode ?? "any";
+        const { records, settled } = await manager.waitMany(targets, { mode: chosen, timeoutMs: budget });
+        return ok(renderWaitMany(records, settled, chosen, now() - started, now(), (w) => manager.queueHint(w)));
       } catch (e) {
-        return fail(`Could not wait on ${id}: ${message(e)}`);
+        return fail(`Could not wait on ${targets.join(", ")}: ${message(e)}`);
       }
     },
   );
@@ -389,7 +454,7 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
       // The order matters. `blocked` is settled but has no result, because the
       // result is built at settle and blocking is not settling.
       if (r.state === "blocked") return ok(renderBlocked(r, t));
-      if (!isSettled(r.state)) return ok(renderPending(r, t));
+      if (!isSettled(r.state)) return ok(renderPending(r, t, manager.queueHint(id)));
       if (!r.result) return ok(renderNoResult(r, t));
       return ok(renderResult(r.result));
     },
@@ -647,6 +712,61 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
     },
   );
 
+  // --- run_report ---------------------------------------------------------
+
+  server.registerTool(
+    "run_report",
+    {
+      title: "The run's markdown audit trail",
+      description:
+        "One markdown document for a whole run: every worker with its model, state, elapsed time, " +
+        "spend, changed files and independently-verified tests; every discrepancy the orchestrator " +
+        "found; every merge with its per-step outcome and the sha it rolled back to; and a " +
+        "lifecycle timeline across all of them.\n\n" +
+        "This is the artifact to produce when a wave is finished — for a human to read, for a " +
+        "post-mortem, or as the record of what a run actually did. It is WRITTEN TO A FILE under " +
+        ".orchestrator/runs/ and an excerpt comes back here; read the file for the whole thing.\n\n" +
+        "It measures nothing itself: every number comes from a result the orchestrator built when a " +
+        "worker settled. A worker's summary, risks and follow-ups appear in their own quoted block, " +
+        "marked as the worker's own words; the changed-file lists, the test runs and the " +
+        "discrepancies are the orchestrator's measurements. Where the two disagree, the discrepancies " +
+        "are the finding.",
+      inputSchema: {
+        runID: z
+          .string()
+          .max(200)
+          .optional()
+          .describe("The run to report on — the runID you passed to worker_spawn. Omit for the most recent run."),
+        write: z.boolean().optional().describe("Write the document to .orchestrator/runs/. Default true."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ runID, write }): Promise<ToolResult> => {
+      const runs = store.listRuns();
+      if (runID === undefined && runs.length === 0) return ok("No runs exist yet — nothing has been spawned.");
+      // `listRuns` is newest-first; the most recent run is the one a caller who
+      // did not name one is almost certainly asking about.
+      const target = runID ?? runs[0]!.id;
+      if (runID !== undefined && !runs.some((r) => r.id === runID)) {
+        return fail(
+          `No run ${JSON.stringify(runID)}. Known runs: ${runs.slice(0, 10).map((r) => r.id).join(", ") || "(none)"}.`,
+        );
+      }
+      const opts = {
+        store,
+        runID: target,
+        now: now(),
+        maxConcurrent: manager.maxConcurrent,
+      };
+      try {
+        const report = deps.repoRoot && write !== false ? writeRunReport(deps.repoRoot, opts) : buildRunReport(opts);
+        return ok(renderRunReport(report));
+      } catch (e) {
+        return fail(`Could not build the run report for ${target}: ${message(e)}`);
+      }
+    },
+  );
+
   if (!deps.merges) return;
   const merges = deps.merges;
 
@@ -835,4 +955,11 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
 
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/** "2 of 3 slots busy, 1 queued" — the one sentence that explains a queue. */
+function hintSlots(manager: WorkerManager): string {
+  const busy = manager.list({ states: ["preparing", "running", "blocked"] }).length;
+  const queued = manager.list({ states: ["spawned"] }).filter((r) => manager.queueHint(r.workerID) !== undefined).length;
+  return `${busy}/${manager.maxConcurrent} slots busy${queued > 0 ? `, ${queued} queued` : ""}`;
 }

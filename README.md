@@ -8,21 +8,26 @@ The full design is in [`projectplan.md`](projectplan.md).
 
 ## Status
 
-**Phases 0, 1, 2, 3 and 4 complete.** The architecture's OpenCode assumptions are
+**Phases 0 through 5 complete.** The architecture's OpenCode assumptions are
 verified against a live server, the backend decision is recorded, the adapter that
 isolates those assumptions is built, a worker goes from a one-line task to a
 committed worktree and a structured result without a human in the loop, Claude can
-drive that from a Claude Code session over MCP — and the work a worker produces
-can now be **taken**: merged one at a time into an integration branch behind a
-test gate, and rolled back to the exact sha it started from when the gate goes
-red.
+drive that from a Claude Code session over MCP, the work a worker produces can be
+**taken** — merged one at a time into an integration branch behind a test gate,
+and rolled back to the exact sha it started from when the gate goes red — and
+several workers now run **at once**, under a cap, with a queue, dependencies
+between them, and a markdown run report at the end.
+
+What is still missing is the review loop: nothing can yet tell a worker it got
+something wrong. That is Phase 6.
 
 - [`docs/adr/0001-serve-vs-run-backend.md`](docs/adr/0001-serve-vs-run-backend.md) — ServeBackend accepted, with costs
 - [`docs/adr/0002-worker-contract-channel.md`](docs/adr/0002-worker-contract-channel.md) — how the brief goes out and the report comes back
 - [`docs/adr/0003-integration-worktree.md`](docs/adr/0003-integration-worktree.md) — where the merge runs, and why not OpenCode's own worktrees
+- [`docs/adr/0004-queue-and-dependencies.md`](docs/adr/0004-queue-and-dependencies.md) — the queue across a restart, and what a failed dependency does to its dependents
 - [`docs/phase0-facts.md`](docs/phase0-facts.md) — verified API facts, and what is still unresolved
 - [`src/opencode/`](src/opencode/) — the adapter. **The only code that knows OpenCode exists** (DD-2)
-- [`src/manager/`](src/manager/) — the lifecycle: state machine, run loop, watchdogs, budgets, recovery
+- [`src/manager/`](src/manager/) — the lifecycle: state machine, run loop, watchdogs, budgets, recovery, and the admission gate
 - [`src/mcp/`](src/mcp/) — the tool surface. **The whole of what Claude ever sees**
 - [`docs/phase3-notes.md`](docs/phase3-notes.md) — the measurements Phase 3 took, and how to repeat them
 
@@ -136,6 +141,7 @@ is one more thing to find.
 | `ORCHESTRATOR_MODEL` | `opencode/muse-spark-1.2-contributor-free` | `provider/model` for workers that do not name one. The default is free-tier and needs no credentials. |
 | `ORCHESTRATOR_BASE_URL` | *(unset — spawn a server)* | Attach to an OpenCode server something else already owns, instead of spawning one. |
 | `ORCHESTRATOR_VERIFY_TESTS` | `1` | Re-run the brief's test command after a worker finishes. Set `0` to turn the independent verification off; DD-4 is worth less without it. |
+| `ORCHESTRATOR_MAX_CONCURRENT` | `3` | How many workers may run at once — counting `preparing`, `running` and `blocked`. Spawns past it are **queued**, not rejected. Phase 1 measured four concurrent sessions on one server completing with no cross-talk; that is one run on one free-tier model, so the default leaves headroom inside it. Raise it after measuring your own provider under load, not before. Clamped to 1–32; an unparseable value falls back to the default rather than refusing to start. |
 
 ```bash
 claude mcp add orchestrator \
@@ -153,7 +159,7 @@ uncommitted, because your `.gitignore` is yours.
 |---|---|
 | `worker_spawn` | Delegate a task. Returns an id immediately; the work runs in the background. |
 | `worker_status` | Where workers are. Cheap, safe to poll. |
-| `worker_wait` | Block until one settles, capped. Cheaper than polling. |
+| `worker_wait` | Block until one — or any, or all, of several — settles, capped. Cheaper than polling. |
 | `worker_result` | The §4.3 result — the default thing to read. |
 | `worker_output` | The lifecycle audit trail, paginated. Debugging only. |
 | `worker_message` | Answer a blocked worker; the session is reused. |
@@ -163,6 +169,7 @@ uncommitted, because your `.gitignore` is yours.
 | `workspace_merge` | Start a gated merge of completed workers into an integration branch. |
 | `workspace_merge_status` | Poll it: which workers merged, which one broke it, where it rolled back to. |
 | `workspace_cleanup` | Prune worktrees and branches — and refuse, by default, to delete unmerged work. |
+| `run_report` | The run's markdown audit trail: workers, spend, tests, discrepancies, merges, timeline. Written to `.orchestrator/runs/`. |
 
 Every one of them returns in under two seconds (DD-1); `worker_wait` is the
 single bounded exception. `workspace_merge` is no exception either: it runs a
@@ -178,22 +185,37 @@ reliably reads.
 surface: it is the instrument that measured the host's tool-call ceiling
 `worker_wait`'s cap sits under. See [`docs/phase3-notes.md`](docs/phase3-notes.md).
 
-Phase 5's `dependsOn` and Phase 6's `worker_revise` are deliberately absent
-rather than half-built — a tool that promises a review loop that does not exist
-is worse than no tool. `worker_spawn` *rejects* `dependsOn` by name rather than
-ignoring it, so a worker that ran too early cannot look like a worker that failed
-for no reason.
+Phase 6's `worker_revise` is deliberately absent rather than half-built — a tool
+that promises a review loop that does not exist is worse than no tool.
+
+### Running several workers at once
+
+`worker_spawn` accepts more workers than the cap and **queues** the extras, in
+spawn order, in the `spawned` state: nothing is allocated, no session is opened,
+and — the part that is easy to get wrong — a queued worker's time limits do not
+start until it actually runs. `worker_status` says which of two `spawned` workers
+is about to start and which is third in line, because "next: worker_wait" is the
+wrong advice for one of them.
+
+`dependsOn` holds a worker back until the workers it names reach `completed`, and
+a worker waiting on a dependency holds **no** slot — so a dependency can never be
+queued behind its own dependent. A dependency that ends any other way (failed,
+timed out, over budget, cancelled) **cancels** its dependents with a reason naming
+it, and the cancellation cascades down the chain: waiting forever for something
+that will never finish is the one outcome nothing in the system would report.
+[ADR-0004](docs/adr/0004-queue-and-dependencies.md) has the reasoning, including
+what happens to the queue across a restart (it does not survive one, and says so).
 
 ## Layout
 
 ```
 spike/          Phase 0 verification script — the reference for adapter behavior
 src/opencode/   The OpenCode adapter: interface, ServeBackend, RunBackend stub
-src/manager/    Worker lifecycle: state machine, run loop, watchdogs, results
+src/manager/    Worker lifecycle: state machine, run loop, watchdogs, results, the queue
 src/briefs/     Task brief out, report in, and the reconciliation between them
 src/workspace/  Worktrees, snapshot commits, diffs, overlap, the gated merge, cleanup
 src/store/      SQLite — an index over worktrees that carry their own manifests
-src/mcp/        The MCP server and its twelve tools — what Claude sees
+src/mcp/        The MCP server and its thirteen tools — what Claude sees
 test/ocmock/    Scriptable fake OpenCode server
 test/fixtures/  The golden repo
 docs/adr/       Decision records

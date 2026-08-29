@@ -58,6 +58,7 @@ import {
   snapshotCommit,
   writeManifest,
 } from "../workspace/index.js";
+import { type Admission, DEFAULT_MAX_CONCURRENT, type QueueHint, Scheduler } from "./scheduler.js";
 import { WorkerMachine, type WorkerState, isSettled } from "./state.js";
 import type {
   Discrepancy,
@@ -135,6 +136,15 @@ export interface WorkerManagerOptions {
   /** DD-9 presets, per mode. */
   readonly models?: Partial<Record<WorkerMode, string>>;
   readonly budget?: Partial<WorkerBudget>;
+  /**
+   * How many workers may be past `spawned` at once (§11 Phase 5).
+   *
+   * Counts `preparing`, `running` and `blocked` — every state in which a worker
+   * holds a session on the shared backend. Defaults to
+   * {@link DEFAULT_MAX_CONCURRENT}; the server reads it from
+   * `ORCHESTRATOR_MAX_CONCURRENT`.
+   */
+  readonly maxConcurrent?: number;
   /** Watchdog resolution. Small in tests, ~1s in production. */
   readonly tickMs?: number;
   /** How often to poll the backend for token usage. */
@@ -214,6 +224,16 @@ class ManagedWorker {
   /** Set when a re-send is pending; cleared when it goes out. */
   retryAt: number | undefined;
   /**
+   * A cancellation that arrived before there was anything to abort.
+   *
+   * The queue widened a window that always existed: between `spawn()` returning
+   * and the session existing there is nothing for `abort()` to act on, so a
+   * cancel in that window used to be recorded and then ignored, and the worker
+   * ran to completion anyway. `prepareAndRun()` checks this flag at every step
+   * boundary instead.
+   */
+  cancelRequested: string | undefined;
+  /**
    * Has the turn we most recently prompted actually begun?
    *
    * Terminal events are session-scoped, not prompt-scoped, so an idle carries no
@@ -255,6 +275,8 @@ export class WorkerManager {
     budget: WorkerBudget;
   };
   private readonly workers = new Map<string, ManagedWorker>();
+  /** §11 Phase 5's cap, queue and `dependsOn`. See {@link Scheduler}. */
+  private readonly scheduler: Scheduler;
   /**
    * Does this backend's provider actually support schema-constrained replies?
    *
@@ -277,6 +299,7 @@ export class WorkerManager {
       defaultModel: options.defaultModel ?? DEFAULT_MODEL,
       models: options.models ?? {},
       budget: { ...DEFAULT_BUDGET, ...options.budget },
+      maxConcurrent: options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT,
       tickMs: options.tickMs ?? 1_000,
       budgetPollMs: options.budgetPollMs ?? 15_000,
       abortGraceMs: options.abortGraceMs ?? 10_000,
@@ -287,6 +310,29 @@ export class WorkerManager {
       newWorkerID: options.newWorkerID ?? (() => `w-${(++this.seq).toString().padStart(3, "0")}`),
     };
     this.structuredOutputOK = this.opts.structuredOutput;
+    this.scheduler = new Scheduler({
+      maxConcurrent: this.opts.maxConcurrent,
+      // Live, never cached: a dependency's satisfaction is decided when the
+      // queue is pumped, and the index lags the record by a write.
+      stateOf: (id) => this.workers.get(id)?.record.current.state ?? this.opts.store.getWorker(id)?.state,
+      onEvent: (id, kind, detail) => this.opts.store.appendEvent(id, kind, detail),
+    });
+  }
+
+  /** The cap this manager is enforcing. Configuration, exposed for reporting. */
+  get maxConcurrent(): number {
+    return this.scheduler.maxConcurrent;
+  }
+
+  /**
+   * Why a worker has not started yet, or `undefined` if it has.
+   *
+   * `worker_status` needs this because a worker that is `spawned` because three
+   * others are running looks identical, on the record alone, to one that is
+   * about to start — and "next: worker_wait" is the wrong advice for the first.
+   */
+  queueHint(workerID: string): QueueHint | undefined {
+    return this.scheduler.hint(workerID);
   }
 
   // --- public surface -----------------------------------------------------
@@ -297,10 +343,20 @@ export class WorkerManager {
    * Never blocks on the work: MCP hosts time out long tool calls, so everything
    * above this is spawn-and-poll. The returned record is in `spawned` or
    * `preparing`; use {@link wait} to find out how it ended.
+   *
+   * Phase 5 put a queue behind this and deliberately did not put it in front:
+   * a worker over the concurrency cap is *accepted* and sits in `spawned` — the
+   * state already documented as "accepted, nothing allocated yet" — while the
+   * gate waits inside the detached run loop. Only an unsatisfiable `dependsOn`
+   * is rejected here, because a rejected spawn is legible and a wedged run is
+   * not.
    */
   async spawn(spec: WorkerSpec): Promise<WorkerRecord> {
     const now = this.opts.now();
     const workerID = this.opts.newWorkerID();
+    // Before any row is written: a spawn that cannot ever run leaves nothing
+    // behind to explain later.
+    this.scheduler.validate(workerID, spec.dependsOn ?? []);
     const runID = spec.runID ?? "run-default";
     const mode: WorkerMode = spec.mode ?? "implement";
     const model = spec.model ?? this.opts.models[mode] ?? this.opts.defaultModel;
@@ -337,12 +393,34 @@ export class WorkerManager {
     });
     this.workers.set(workerID, w);
     this.opts.store.putWorker(record);
-    this.opts.store.appendEvent(workerID, "spawned", { task: spec.task, mode, model });
+    this.opts.store.appendEvent(workerID, "spawned", {
+      task: spec.task,
+      mode,
+      model,
+      ...(spec.dependsOn && spec.dependsOn.length > 0 ? { dependsOn: [...spec.dependsOn] } : {}),
+    });
 
-    w.done = this.drive(w).catch(() => {
+    const admission = this.scheduler.enqueue(workerID, spec.dependsOn ?? []);
+    // Written to the record straight away, so a status line taken one
+    // millisecond after `worker_spawn` returns already says why nothing is
+    // happening. The position and the outstanding dependencies are in-process
+    // (`queueHint`) — a queue position is not durable state.
+    const hint = this.scheduler.hint(workerID);
+    if (hint) {
+      this.opts.store.appendEvent(workerID, "queued", {
+        reason: hint.reason,
+        position: hint.position,
+        running: hint.running,
+        maxConcurrent: hint.maxConcurrent,
+        ...(hint.waitingFor.length > 0 ? { waitingFor: [...hint.waitingFor] } : {}),
+      });
+      this.update(w, { reason: hint.reason });
+    }
+
+    w.done = this.drive(w, admission).catch(() => {
       /* drive() is total: every failure is already a state. */
     });
-    return record;
+    return w.record.current;
   }
 
   get(workerID: string): WorkerRecord | undefined {
@@ -384,6 +462,75 @@ export class WorkerManager {
   }
 
   /**
+   * Wait for a *set* of workers (§11 Phase 5's batched wait).
+   *
+   * Two modes, and both are needed. `any` returns the moment one of them stops
+   * needing the manager's attention, which is what a caller supervising a wave
+   * wants: a worker that blocked on a question is the event worth waking for,
+   * and waiting for the whole wave would leave it unanswered until the slowest
+   * worker finished. `all` returns when none of them is still working, which is
+   * what a caller wants before it merges.
+   *
+   * Resolves rather than throwing on timeout, like {@link wait}: "still running"
+   * is an answer, and `worker_wait`'s cap is measured against a host ceiling it
+   * must not race. The returned records are every id asked about, in the order
+   * they were asked about, whichever mode ended the wait.
+   */
+  async waitMany(
+    ids: readonly string[],
+    opts: { mode?: "any" | "all"; timeoutMs?: number } = {},
+  ): Promise<{ records: WorkerRecord[]; settled: string[] }> {
+    const mode = opts.mode ?? "any";
+    const timeoutMs = opts.timeoutMs ?? 30_000;
+    if (ids.length === 0) throw new Error("waitMany needs at least one worker id");
+
+    const live: ManagedWorker[] = [];
+    // A worker this process does not hold is one a previous process spawned. It
+    // is not going to move under us, so it counts as settled rather than as
+    // something to wait for — which is what `wait` does for the same case.
+    let inertSettled = 0;
+    for (const id of [...new Set(ids)]) {
+      const w = this.workers.get(id);
+      if (w) {
+        live.push(w);
+        continue;
+      }
+      if (!this.opts.store.getWorker(id)) throw new Error(`unknown worker ${id}`);
+      inertSettled += 1;
+    }
+
+    const satisfied = (): boolean => {
+      const settled = live.filter((w) => isSettled(w.machine.state)).length + inertSettled;
+      return mode === "any" ? settled > 0 : settled === live.length + inertSettled;
+    };
+
+    if (!satisfied()) {
+      await new Promise<void>((resolve) => {
+        let done = false;
+        const finish = (): void => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          for (const w of live) w.waiters.delete(check);
+          resolve();
+        };
+        const check = (): void => {
+          if (satisfied()) finish();
+        };
+        const timer = setTimeout(finish, timeoutMs);
+        for (const w of live) w.waiters.add(check);
+        // One more look: a worker can settle between the guard above and the
+        // registration above, and a waiter that missed its own event waits out
+        // the full timeout for something that already happened.
+        check();
+      });
+    }
+
+    const records = ids.map((id) => this.get(id)).filter((r): r is WorkerRecord => r !== undefined);
+    return { records, settled: records.filter((r) => isSettled(r.state)).map((r) => r.workerID) };
+  }
+
+  /**
    * Answer a blocked worker (§5's escalation channel).
    *
    * The same session is prompted again, so the worker still has every bit of its
@@ -409,17 +556,30 @@ export class WorkerManager {
     return w.record.current;
   }
 
-  /** Stop a worker. Safe at any point; a settled worker is left alone. */
+  /**
+   * Stop a worker. Safe at any point; a settled worker is left alone.
+   *
+   * Four places a worker can be, and only one of them has a session to abort.
+   * A *queued* worker is the Phase 5 addition and the one that matters for
+   * shutdown: its `done` is parked on the admission promise, so refusing it is
+   * the only thing that lets `dispose()` return at all.
+   */
   async cancel(workerID: string, reason = "cancelled_by_request"): Promise<WorkerRecord> {
     const w = this.workers.get(workerID);
     if (!w) throw new Error(`unknown worker ${workerID}`);
     if (w.machine.final) return w.record.current;
-    if (w.answer) {
+    w.cancelRequested = reason;
+    if (this.scheduler.reject(workerID, reason)) {
+      // Queued: nothing was allocated, so there is nothing to abort and the
+      // run loop settles it as `spawned → cancel → cancelled`.
+    } else if (w.answer) {
       w.answer({ kind: "cancel" });
       w.answer = undefined;
-    } else {
+    } else if (w.session) {
       await this.requestAbort(w, { disposition: "cancelled", reason, at: this.opts.now() });
     }
+    // Admitted but still preparing: no session exists yet, so there is nothing
+    // to abort and `prepareAndRun` picks the flag up at its next step boundary.
     // Return when it has genuinely stopped, not when the request was sent.
     await w.done;
     return w.record.current;
@@ -483,10 +643,19 @@ export class WorkerManager {
       const change = machine.tryApply("interrupt", { reason: "manager_restart" });
       if (!change) continue;
       const worktreeIntact = row.worktree !== "" && existsSync(row.worktree);
+      // The queue is in-process and does not survive a restart (ADR-0004). A row
+      // that never got as far as a worktree was queued, not mid-flight, and
+      // saying so is the difference between "inspect the worktree" and "just
+      // spawn it again, nothing was spent".
+      const neverStarted = row.state === "spawned" && row.worktree === "";
       const updated: WorkerRecord = {
         ...row,
         state: "interrupted",
-        reason: worktreeIntact ? "manager_restart" : "manager_restart_worktree_missing",
+        reason: neverStarted
+          ? "manager_restart_while_queued"
+          : worktreeIntact
+            ? "manager_restart"
+            : "manager_restart_worktree_missing",
         updatedAt: this.opts.now(),
       };
       this.opts.store.putWorker(updated);
@@ -529,6 +698,9 @@ export class WorkerManager {
    */
   halt(): void {
     this.halted = true;
+    // Settle every parked admission too: a `done` still waiting for a slot is a
+    // promise nothing will ever resolve, and every test awaiting one hangs.
+    this.scheduler.halt();
     for (const w of this.workers.values()) {
       w.stream?.close();
       w.answer?.({ kind: "cancel" });
@@ -539,7 +711,27 @@ export class WorkerManager {
 
   // --- the run loop -------------------------------------------------------
 
-  private async drive(w: ManagedWorker): Promise<void> {
+  /**
+   * The whole of one worker's life, from the queue to a settled row.
+   *
+   * The first `await` is the concurrency gate. Nothing before it costs anything
+   * — no worktree, no session, no clock — which is what makes a queued worker
+   * genuinely free and its wall-clock budget genuinely untouched by the wait.
+   */
+  private async drive(w: ManagedWorker, admission: Promise<Admission>): Promise<void> {
+    const workerID = w.record.current.workerID;
+    const verdict = await admission;
+    // A halted manager writes nothing, by definition — that is the difference
+    // between a shutdown and the crash §9's recovery has to survive.
+    if (this.halted) return;
+    if (verdict.kind === "refused") {
+      await this.settle(w, { kind: "cancelled", reason: verdict.reason });
+      return;
+    }
+    // Admitted: the `queued` / `waiting_on_dependencies` reason has stopped
+    // being true, and a stale one would render as the reason it is preparing.
+    if (w.record.current.reason !== undefined) this.update(w, { reason: undefined });
+
     let disposition: Disposition;
     try {
       disposition = await this.prepareAndRun(w);
@@ -558,11 +750,22 @@ export class WorkerManager {
       w.stream?.close();
     }
     if (this.halted) return;
-    await this.settle(w, disposition);
+    try {
+      await this.settle(w, disposition);
+    } finally {
+      // After settling, never before. A dependent may only start once its
+      // dependency is genuinely `completed`, and `completed` is a fact only
+      // once the snapshot, the independent test re-run and the reconciliation
+      // have happened. One release point keeps the slot and the dependency
+      // edge from disagreeing about when this worker finished.
+      this.scheduler.release(workerID);
+    }
   }
 
   private async prepareAndRun(w: ManagedWorker): Promise<Disposition> {
     const rec = w.record.current;
+    if (this.halted) return { kind: "cancelled", reason: "manager_halted" };
+    if (w.cancelRequested) return { kind: "cancelled", reason: w.cancelRequested };
     w.machine.apply("prepare");
     this.update(w, { state: "preparing" });
 
@@ -576,6 +779,7 @@ export class WorkerManager {
     });
     this.update(w, { worktree: wt.path, branch: wt.branch, baseSha: wt.baseSha });
     this.writeManifest(w);
+    if (w.cancelRequested) return { kind: "cancelled", reason: w.cancelRequested };
 
     const brief = buildBrief({
       workerID: rec.workerID,
@@ -598,6 +802,7 @@ export class WorkerManager {
     this.writeManifest(w);
 
     if (this.halted) return { kind: "cancelled", reason: "manager_halted" };
+    if (w.cancelRequested) return { kind: "cancelled", reason: w.cancelRequested };
 
     // Subscribe *before* prompting: a trivial task can finish in ~11s and a late
     // subscriber misses the completion entirely. `events()` resolves only once
@@ -1015,13 +1220,18 @@ export class WorkerManager {
     const rec = w.record.current;
     const extra: Discrepancy[] = [];
 
+    // A worker refused at the queue has no worktree, and "the manager could not
+    // snapshot the worktree" would be a discrepancy about a directory that was
+    // never meant to exist.
     let snapshot: WorkerResult["snapshot"];
-    try {
-      const snap = await snapshotCommit(rec.worktree, snapshotMessage(rec));
-      snapshot = { committed: snap.committed, ...(snap.sha === undefined ? {} : { sha: snap.sha }) };
-    } catch (e) {
-      extra.push({ kind: "unparseable_report", detail: `the manager could not snapshot the worktree: ${String(e)}` });
-      if (disposition.kind === "complete") disposition = { kind: "failed", reason: "snapshot_failed" };
+    if (rec.worktree) {
+      try {
+        const snap = await snapshotCommit(rec.worktree, snapshotMessage(rec));
+        snapshot = { committed: snap.committed, ...(snap.sha === undefined ? {} : { sha: snap.sha }) };
+      } catch (e) {
+        extra.push({ kind: "unparseable_report", detail: `the manager could not snapshot the worktree: ${String(e)}` });
+        if (disposition.kind === "complete") disposition = { kind: "failed", reason: "snapshot_failed" };
+      }
     }
 
     const trigger =
@@ -1069,6 +1279,34 @@ export class WorkerManager {
     extra: readonly Discrepancy[],
   ): Promise<WorkerResult> {
     const rec = w.record.current;
+
+    if (rec.startedAt === undefined) {
+      // Never prompted — refused at the queue, or cancelled before the session
+      // existed. There is no report to parse, no diff to measure and no usage to
+      // read; running the machinery anyway would manufacture a report-parse
+      // discrepancy about a report nobody was ever asked for, and render as a
+      // worker that ran and achieved nothing. `not_started` is the honest word.
+      return {
+        workerID: rec.workerID,
+        runID: rec.runID,
+        state: w.machine.state,
+        mode: rec.mode,
+        model: rec.model,
+        task: rec.task,
+        durationMs: 0,
+        usage: { totalTokens: 0, cost: 0 },
+        summary: "",
+        changes: { files: 0, additions: 0, deletions: 0, paths: [] },
+        tests: null,
+        discrepancies: [...extra],
+        risks: [],
+        questions: [],
+        followUps: [],
+        ...(disposition.kind === "complete" ? {} : { reason: disposition.reason }),
+        reportSource: "not_started",
+      };
+    }
+
     const parsed = this.readReport(w);
 
     let actual: string[] = [];

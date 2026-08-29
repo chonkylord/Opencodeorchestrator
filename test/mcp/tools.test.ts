@@ -68,6 +68,7 @@ async function harness(
     defaultModel: "ocmock/test-model",
     baseUrl: mock.baseUrl,
     verifyTests: false,
+    maxConcurrent: 3,
     ...configOver,
   };
   const orchestrator = await createOrchestrator(config, {
@@ -148,6 +149,7 @@ describe("registration", () => {
 
     expect(names).toEqual([
       "orchestrator_timeout_probe",
+      "run_report",
       "worker_diff",
       "worker_list",
       "worker_message",
@@ -180,17 +182,20 @@ describe("registration", () => {
     expect(result.description).toMatch(/discrepanc/i);
   });
 
-  test("Phase 5 and 6 tools are absent rather than half-built", async () => {
+  test("Phase 6 tools are absent rather than half-built", async () => {
     // Phase 4 moved `worker_diff`, `workspace_merge` and `workspace_cleanup` out
-    // of this list by building them. What is left is what is genuinely not here:
-    // the review loop's revision entry point (Phase 6), and the batched wait the
-    // queue needs (Phase 5). `worker_spawn` still *rejects* `dependsOn` by name
-    // rather than ignoring it, which is the same principle at argument level.
+    // of this list by building them; Phase 5 took the batched wait out by
+    // building it *into* `worker_wait` rather than beside it — one tool that
+    // takes `id` or `ids` beats two that differ by a suffix. What is left is the
+    // review loop's revision entry point, which is genuinely Phase 6.
     const { client } = await harness();
-    const names = (await client.listTools()).tools.map((t) => t.name);
-    for (const absent of ["worker_revise", "worker_wait_all", "workspace_status"]) {
+    const tools = (await client.listTools()).tools;
+    const names = tools.map((t) => t.name);
+    for (const absent of ["worker_revise", "worker_wait_all", "worker_review", "workspace_status"]) {
       expect(names).not.toContain(absent);
     }
+    const wait = tools.find((t) => t.name === "worker_wait")!;
+    expect(Object.keys((wait.inputSchema as { properties: Record<string, unknown> }).properties)).toContain("ids");
   });
 
   test("workspace_merge says it returns before the merge finishes, and that it is gated", async () => {
@@ -478,13 +483,17 @@ describe("errors are answers, not exceptions", () => {
     expect((await call(client, "worker_result", { id: "w-999" })).isError).toBe(true);
   });
 
-  test("dependsOn is rejected rather than silently ignored", async () => {
-    // Scheduling is Phase 5. A worker that quietly ran before its dependency
-    // would look like a worker that failed for no reason.
+  test("a dependsOn naming a worker that does not exist is rejected, and leaves no row", async () => {
+    // Phase 5 implemented `dependsOn`; what is still rejected is a dependency
+    // that could never be satisfied. Ids are minted by worker_spawn, so an id
+    // nobody has been handed is a typo, and honouring it would produce a worker
+    // that never starts and never says why. The `worker_list` assertion is the
+    // load-bearing half: a rejected spawn must not leave a row behind to explain.
     const { client } = await harness();
-    const rejected = await call(client, "worker_spawn", spawnArgs({ dependsOn: ["w-001"] }));
+    const rejected = await call(client, "worker_spawn", spawnArgs({ dependsOn: ["w-999"] }));
     expect(rejected.isError).toBe(true);
-    expect(rejected.text).toMatch(/Phase 5/);
+    expect(rejected.text).toMatch(/w-999/);
+    expect(rejected.text).toMatch(/do not exist/);
     expect((await call(client, "worker_list", {})).text).toMatch(/No workers/);
   });
 

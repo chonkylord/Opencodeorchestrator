@@ -37,7 +37,7 @@ import { type ServerConfig, loadConfig } from "./config.js";
 import { registerWorkerTools } from "./tools.js";
 
 export const SERVER_NAME = "opencode-orchestrator";
-export const SERVER_VERSION = "0.4.0";
+export const SERVER_VERSION = "0.5.0";
 
 const log = (line: string): void => console.error(`[orchestrator] ${line}`);
 
@@ -88,6 +88,7 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
     repoRoot: config.repoRoot,
     defaultModel: config.defaultModel,
     verifyTests: config.verifyTests,
+    maxConcurrent: config.maxConcurrent,
     ...tuning,
   });
 
@@ -183,7 +184,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
   await orchestrator.server.connect(new StdioServerTransport());
-  log(`ready on stdio · db ${config.dbPath} · model ${config.defaultModel}`);
+  log(`ready on stdio · db ${config.dbPath} · model ${config.defaultModel} · max ${config.maxConcurrent} concurrent`);
 }
 
 // Only when launched directly, so the tests can import this module without it

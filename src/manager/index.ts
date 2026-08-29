@@ -27,6 +27,22 @@ export { type RenderOptions, renderResult } from "./result.js";
 export { DEFAULT_BUDGET, DEFAULT_MODEL, WorkerManager, type WorkerManagerOptions } from "./worker.js";
 
 export {
+  type Admission,
+  DEFAULT_MAX_CONCURRENT,
+  DependencyError,
+  type DependencyOutcome,
+  MAX_CONCURRENT_LIMIT,
+  type QueueHint,
+  type QueueReason,
+  Scheduler,
+  type SchedulerOptions,
+  clampConcurrency,
+  findCycle,
+} from "./scheduler.js";
+
+export { RUN_REPORT_DIR, type RunReport, buildRunReport, writeRunReport } from "./runreport.js";
+
+export {
   MergeCoordinator,
   type MergeCoordinatorOptions,
   MergeStartError,

@@ -51,6 +51,16 @@ export interface WorkerSpec {
   readonly budget?: Partial<WorkerBudget>;
   /** Extra constraints appended to the brief verbatim. */
   readonly notes?: readonly string[];
+  /**
+   * Worker ids that must reach `completed` before this one starts (§11 Phase 5).
+   *
+   * The ids must already exist — they are minted by `spawn()`, so a dependency
+   * is always something already spawned — and a worker waiting on one holds no
+   * concurrency slot. If a dependency ends in any state it cannot come back
+   * from, this worker is cancelled with a reason naming it rather than left
+   * waiting forever. See `docs/adr/0004-queue-and-dependencies.md`.
+   */
+  readonly dependsOn?: readonly string[];
 }
 
 /** One claimed file change, straight from the worker's report (§4.2). */
@@ -134,8 +144,14 @@ export interface WorkerResult {
    * Which channel the report came from. `reply` is the worker's own final
    * message (schema-constrained where the provider allows it); `report_file` is
    * §5's secondary signal; `none` means the worker never reported at all.
+   *
+   * `not_started` is the Phase 5 case and is a different fact from `none`: the
+   * worker was never prompted — cancelled while queued, or cancelled because a
+   * dependency ended in a state it could not come back from — so there is no
+   * report, no diff and no usage, and every number below is zero because nothing
+   * happened rather than because a worker achieved nothing.
    */
-  readonly reportSource: "reply" | "report_file" | "none";
+  readonly reportSource: "reply" | "report_file" | "none" | "not_started";
 }
 
 /** The manager's row for one worker. The SQLite `workers` table mirrors it. */

@@ -64,9 +64,22 @@ describe("configuration", () => {
       defaultModel: "acme/big",
       baseUrl: "http://127.0.0.1:4096",
       verifyTests: false,
+      maxConcurrent: 3,
     });
     // `:memory:` is a SQLite keyword, not a path, and must survive resolution.
     expect(loadConfig({ ORCHESTRATOR_DB: ":memory:" }, "/x").dbPath).toBe(":memory:");
+  });
+
+  test("ORCHESTRATOR_MAX_CONCURRENT is clamped rather than trusted, and a typo does not stop the server", () => {
+    // A host that refuses to launch because of a typo in one env var is worse
+    // than one that runs at the default. Phase 1 measured 4 concurrent sessions
+    // on one server; 3 is the default because that measurement is one run.
+    expect(loadConfig({}, "/x").maxConcurrent).toBe(3);
+    expect(loadConfig({ ORCHESTRATOR_MAX_CONCURRENT: "6" }, "/x").maxConcurrent).toBe(6);
+    expect(loadConfig({ ORCHESTRATOR_MAX_CONCURRENT: "0" }, "/x").maxConcurrent).toBe(1);
+    expect(loadConfig({ ORCHESTRATOR_MAX_CONCURRENT: "banana" }, "/x").maxConcurrent).toBe(3);
+    expect(loadConfig({ ORCHESTRATOR_MAX_CONCURRENT: "" }, "/x").maxConcurrent).toBe(3);
+    expect(loadConfig({ ORCHESTRATOR_MAX_CONCURRENT: "9999" }, "/x").maxConcurrent).toBe(32);
   });
 });
 
@@ -83,6 +96,7 @@ describe("start-up and recovery (§9)", () => {
       defaultModel: "ocmock/test-model",
       baseUrl: mock.baseUrl,
       verifyTests: false,
+      maxConcurrent: 3,
     };
 
     const first = await createOrchestrator(config, { tickMs: 10, abortGraceMs: 200 });
@@ -129,6 +143,7 @@ describe("start-up and recovery (§9)", () => {
         defaultModel: "ocmock/test-model",
         baseUrl: mock.baseUrl,
         verifyTests: false,
+        maxConcurrent: 3,
       },
       { tickMs: 10, abortGraceMs: 200 },
     );
