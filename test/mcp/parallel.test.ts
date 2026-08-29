@@ -383,6 +383,14 @@ describe("§11 Phase 5 AC", () => {
     const settled = await pollMerge(client, mergeID);
     expect(settled).toContain("MERGED GREEN");
 
+    // Phase 4 wrote `state:merged` twice per worker — once from the state
+    // machine's own hook and once beside it, with different detail. The run
+    // report is what made it visible, as two identical timeline rows, so the
+    // regression test lives next to the thing that caught it.
+    const trail = await call(client, "worker_output", { id: ui, limit: 200 });
+    expect(trail.text.split("\n").filter((l) => l.includes("state:merged"))).toHaveLength(1);
+    expect(trail.text).toContain(mergeID);
+
     const report = await call(client, "run_report", { runID: "run-1" });
     expect(report.isError).toBe(false);
     for (const id of [ui, api, tests, docs]) expect(report.text).toContain(id);

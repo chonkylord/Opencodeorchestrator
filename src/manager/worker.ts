@@ -256,7 +256,7 @@ class ManagedWorker {
   constructor(
     readonly record: { current: WorkerRecord },
     now: () => number,
-    onChange: (change: { from: WorkerState; to: WorkerState; trigger: string; reason?: string }) => void,
+    onChange: (change: { from: WorkerState; to: WorkerState; trigger: string; reason?: string; detail?: Readonly<Record<string, unknown>> }) => void,
   ) {
     this.machine = new WorkerMachine({ workerID: record.current.workerID, now, onChange });
   }
@@ -385,10 +385,15 @@ export class WorkerManager {
 
     const box = { current: record };
     const w = new ManagedWorker(box, this.opts.now, (change) => {
+      // The machine's own hook is the *only* writer of `state:*`. A second,
+      // richer append beside a transition writes the same event twice, which
+      // the run report renders as two identical timeline rows — so a caller
+      // with extra context passes it as `detail` and it lands here.
       this.opts.store.appendEvent(workerID, `state:${change.to}`, {
         from: change.from,
         trigger: change.trigger,
         ...(change.reason === undefined ? {} : { reason: change.reason }),
+        ...(change.detail ?? {}),
       });
     });
     this.workers.set(workerID, w);
@@ -484,12 +489,13 @@ export class WorkerManager {
     const timeoutMs = opts.timeoutMs ?? 30_000;
     if (ids.length === 0) throw new Error("waitMany needs at least one worker id");
 
+    const unique = [...new Set(ids)];
     const live: ManagedWorker[] = [];
     // A worker this process does not hold is one a previous process spawned. It
     // is not going to move under us, so it counts as settled rather than as
     // something to wait for — which is what `wait` does for the same case.
     let inertSettled = 0;
-    for (const id of [...new Set(ids)]) {
+    for (const id of unique) {
       const w = this.workers.get(id);
       if (w) {
         live.push(w);
@@ -526,7 +532,7 @@ export class WorkerManager {
       });
     }
 
-    const records = ids.map((id) => this.get(id)).filter((r): r is WorkerRecord => r !== undefined);
+    const records = unique.map((id) => this.get(id)).filter((r): r is WorkerRecord => r !== undefined);
     return { records, settled: records.filter((r) => isSettled(r.state)).map((r) => r.workerID) };
   }
 
@@ -608,20 +614,23 @@ export class WorkerManager {
     // one that only exists in the index (a previous process's, rebuilt at
     // startup) gets a machine seeded from its stored state. Both reject an
     // illegal move identically, which is the property that matters.
-    if (live) live.machine.apply("merge", { reason: "gated_merge", detail });
-    else new WorkerMachine({ workerID, initial: record.state }).apply("merge", { reason: "gated_merge", detail });
+    const trail = {
+      mergeID: detail.mergeID,
+      branch: detail.integrationBranch,
+      ...(detail.sha === undefined ? {} : { sha: detail.sha }),
+    };
+    // A live worker's machine writes the `state:merged` row itself, through the
+    // hook installed in `spawn()`; one rebuilt from the index has no hook, so
+    // this is the only path that writes it twice if both do.
+    if (live) live.machine.apply("merge", { reason: "gated_merge", detail: trail });
+    else new WorkerMachine({ workerID, initial: record.state }).apply("merge", { reason: "gated_merge", detail: trail });
 
     const updated: WorkerRecord = { ...record, state: "merged", updatedAt: this.opts.now() };
     if (live) live.record.current = updated;
     this.opts.store.putWorker(updated);
-    this.opts.store.appendEvent(workerID, "state:merged", {
-      from: record.state,
-      trigger: "merge",
-      reason: "gated_merge",
-      mergeID: detail.mergeID,
-      branch: detail.integrationBranch,
-      ...(detail.sha === undefined ? {} : { sha: detail.sha }),
-    });
+    if (!live) {
+      this.opts.store.appendEvent(workerID, "state:merged", { from: record.state, trigger: "merge", reason: "gated_merge", ...trail });
+    }
     if (live) this.notify(live);
     return updated;
   }

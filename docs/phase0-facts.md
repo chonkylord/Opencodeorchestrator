@@ -85,6 +85,7 @@ they are listed in full at the bottom rather than quietly omitted.
 | **`edit`+`bash` alone is not enough for a long headless run** | **verified (phase 2)** | An `implement` worker with only the `HEADLESS_PERMISSIONS` ruleset was observed raising a permission ask mid-run on a real task. The defaults above are why: `doom_loop: ask` is an *interactive* anti-loop guard, and an unattended worker cannot answer it — left at `ask` it does not stop a runaway, it stops the run. The manager allows `doom_loop` for `implement` workers (its own idle, wall-clock and token budgets already bound loops) and deliberately leaves `external_directory` at `ask`, because that one is meant to reach Claude. |
 | **`AGENTS.md` in the session directory is auto-loaded** | **verified (phase 2)** · *resolves unresolved #3* | Settled with a marker string. A file containing `AGENTS_MARKER_JHQ6ILKP` was written to a worktree; a worker in that worktree, instructed **not to read, open, list or search any file** and to answer only from the context it was already given, returned the marker verbatim in 11.7s — against 21s for the same probe when it was told to read the file, which is the round trip a tool call costs. So a file-based brief channel does work. Phase 2 uses the per-prompt `system` field anyway, for reasons that are about the diff and about mutability rather than about pickup — see ADR-0002. *Caveat: instruction-following is not proof; a model that ignored the prohibition would produce the same answer. The timing is the corroborating evidence, not the assertion.* |
 | Escalation channel | **verified (schema)** | Native: `GET /api/session/{id}/question` + `…/reply` + `…/reject`, and the same shape for `permission`. The §5 "blocked" state maps onto these directly — no need to invent a protocol. |
+| **`external_directory` really does fire in a live concurrent run, and it is not deterministic** | **observed (phase 5)** | Measured **2026-08-29**, OpenCode **1.18.25**, free Muse Spark, three concurrent `implement` workers in three worktrees under `<repo>/.orchestrator/worktrees/`. On one of two otherwise-identical runs, **two of the three** workers escalated `the worker needs permission "external_directory" for <repo>/.orchestrator/*` — the directory their own worktrees live in — and blocked; on the second run, with the same four tasks on a fresh copy of the same fixture, **none** did and all four completed on the first pass. So the jail signal works as the row above intends and the escalation path handles it, but *which* tool call reaches outside is model behaviour and varies run to run. Two consequences: an unattended wave can block on a permission nobody is there to grant, and a run that blocks is not evidence of a bug in the run that did not. Not investigated further in Phase 5 — the root cause is which OpenCode tool resolves a path upward, and answering it means instrumenting the adapter's raw permission events. |
 
 ## 6. Things OpenCode already does that the plan proposed to build
 
@@ -124,6 +125,23 @@ version bump does not invalidate it, and a host upgrade does.
    failures, no interference. **Caveat: one run, four sessions, one free-tier
    model.** It does not speak to 8+, to paid providers under rate limits, or to
    long-running workers; re-measure before raising the §5 concurrency cap past 4.
+
+   **Re-measured in Phase 5, twice, on 2026-08-29 against OpenCode 1.18.25.**
+   (a) The Phase 1 probe again: four concurrent worktree sessions, all four
+   completed in **11.4 / 13.0 / 13.9 / 15.3 s**, and **no stream carried another
+   session's events** — the assertion is `sessionID !== this session` over every
+   frame received, and it found zero. That is the property all of concurrency
+   rests on, and it is now measured on two separate days against two OpenCode
+   builds rather than assumed.
+   (b) The first end-to-end measurement *through the orchestrator*: three
+   concurrent `implement` workers plus a queued dependent, driven by a live
+   Claude Code 2.1.251 session over MCP, on the free
+   `opencode/muse-spark-1.2-contributor-free`. All four completed; per-worker
+   wall clock 23.8 / 30.1 / 33.5 / 48.7 s at ~6.2k–17.0k tokens each;
+   **no rate limiting, no refused prompt, no cross-talk.** So the §11 Phase 5
+   default of 3 is comfortable on the free tier. **Still unmeasured:** more than
+   four, paid providers under rate limits, and workers running for minutes rather
+   than seconds. The cap stays at 3 and `ORCHESTRATOR_MAX_CONCURRENT` moves it.
 3. ~~**`AGENTS.md` pickup.**~~ **Resolved in Phase 2 — yes, it is picked up.** See the row in §5; the probe lives in `test/e2e/manager.e2e.test.ts` behind `OC_E2E=1 OC_E2E_AGENTS=1`. Phase 2 still carries the brief in the per-prompt `system` field, by choice rather than by necessity (ADR-0002).
 4. **`cost` on paid providers.** Still open. Phase 2's budget enforcement was the natural place to settle it and could not: this environment has no paid provider, so every run was free-tier and `cost` was `0` throughout, exactly as before. The manager therefore budgets on `totalTokens` and reports `cost` advisorily (`WorkerResult.usage`), and the §4.3 result line prints tokens whenever cost is `0`. Confirm `cost` populates on a paid provider before building dollar-denominated budgets.
 5. **Replying to a permission or question request in band.** The adapter surfaces `permission.asked` / `question.asked` as normalized events but exposes no way to answer them — Phase 1 did not build one and the endpoint shapes (`…/reply`, `…/reject`) are schema-verified only. Phase 2 works around it: a mid-run ask is converted into an escalation by aborting the turn and delivering Claude's answer as the next prompt to the same session, which keeps its context. Nothing hangs, but a partial turn is lost each time. Add `respond()` to the adapter when the shapes are verified on the wire.

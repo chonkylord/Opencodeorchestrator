@@ -191,6 +191,10 @@ export class Scheduler {
   enqueue(workerID: string, dependsOn: readonly string[]): Promise<Admission> {
     const deps = [...new Set(dependsOn)].filter((id) => id !== workerID);
     this.edges.set(workerID, deps);
+    // A spawn after `halt()` is a misuse, but it must not be a hang: `pump()`
+    // does nothing once halted, so a promise pushed onto the queue here would
+    // never settle and `dispose()` would wait for it forever.
+    if (this.halted) return Promise.resolve<Admission>({ kind: "refused", reason: "manager_halted" });
     return new Promise<Admission>((resolve) => {
       this.queue.push({ workerID, dependsOn: deps, settle: resolve });
       this.pump();

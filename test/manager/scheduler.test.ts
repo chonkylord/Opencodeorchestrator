@@ -346,6 +346,23 @@ describe("cancelling and disposing with a full queue", () => {
     await waitFor(() => stateOf(manager, c) === "completed", 10_000, "the worker behind it to run");
   }, 30_000);
 
+  test("a worker cancelled between admission and its session never opens one", async () => {
+    // The window the queue widened: between `spawn()` returning and the session
+    // existing there is nothing for an abort to act on. It used to be recorded
+    // and then ignored, and the worker ran to completion anyway. Cancelling in
+    // the same tick as the spawn lands squarely in it.
+    const { manager, store } = await harness({ workMs: 200 }, { maxConcurrent: 3 });
+    const id = (await manager.spawn(spec({ task: "cancelled before it could start" }))).workerID;
+    const cancelled = await manager.cancel(id, "changed_my_mind");
+
+    expect(cancelled.state).toBe("cancelled");
+    expect(cancelled.reason).toBe("changed_my_mind");
+    expect(cancelled.sessionID).toBeUndefined();
+    expect(cancelled.result!.reportSource).toBe("not_started");
+    // And no prompt was ever sent, which is the fact the state is claiming.
+    expect(store.listEvents(id).some((e) => e.kind === "state:running")).toBe(false);
+  }, 20_000);
+
   test("halt() settles parked admissions rather than leaving promises nobody resolves", async () => {
     const { manager } = await harness({ workMs: 400 }, { maxConcurrent: 1 });
     const ids: string[] = [];
