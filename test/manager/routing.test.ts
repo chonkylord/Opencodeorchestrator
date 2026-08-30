@@ -198,6 +198,10 @@ describe("routing and priorities through the manager", () => {
       backend,
       store,
       repoRoot: repo.path,
+    // Phase 8 made `shared` the product default; these suites exercise the
+    // isolated path (worktrees, branches, snapshots) and say so rather than
+    // depending on a default.
+    defaultWorkspace: "isolated",
       tickMs: 10,
       verifyTests: false,
       ...managerOpts,

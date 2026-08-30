@@ -214,6 +214,33 @@ export async function snapshotCommit(worktree: string, message: string): Promise
  * from `ls-files --others`, so a worker that never got committed is still
  * measured honestly.
  */
+/**
+ * Files that differ from HEAD right now — modified, staged or untracked.
+ *
+ * The baseline a **shared** worker needs (§11 Phase 8). In its own worktree a
+ * worker starts from a clean tree, so everything that differs from its base is
+ * its doing. In the user's checkout that is false before it even begins: the
+ * user may have half a feature in progress, and attributing that to the first
+ * worker to finish would be a lie in the one channel this system keeps honest.
+ *
+ * So the manager records this at the moment a shared worker starts, and
+ * subtracts it at the end.
+ */
+export async function dirtyFiles(repoRoot: string): Promise<string[]> {
+  const out = await git(repoRoot, ["status", "--porcelain=1", "--untracked-files=all", "--", ".", ...EXCLUDE_PATHSPECS]);
+  const files = splitLines(out.stdout)
+    // `XY path` — and `R  old -> new` for a rename, whose *new* name is the one
+    // that exists on disk and the one every other path in this file speaks of.
+    .map((line) => {
+      const path = line.slice(3).trim();
+      const arrow = path.indexOf(" -> ");
+      return arrow >= 0 ? path.slice(arrow + 4) : path;
+    })
+    .map((p) => (p.startsWith('"') && p.endsWith('"') ? p.slice(1, -1) : p))
+    .filter((p) => p !== "" && !isExcluded(p));
+  return [...new Set(files)].sort();
+}
+
 export async function changedFiles(worktree: string, baseSha: string): Promise<string[]> {
   const tracked = await git(worktree, ["diff", "--name-only", baseSha, "--", ".", ...EXCLUDE_PATHSPECS]);
   const untracked = await git(worktree, ["ls-files", "--others", "--exclude-standard", "--", ".", ...EXCLUDE_PATHSPECS]);

@@ -35,6 +35,14 @@ export interface BriefContext {
   readonly baseSha: string;
   /** Absolute path of the worktree the worker is jailed to. */
   readonly worktree: string;
+  /**
+   * True when this directory is shared with other workers (§11 Phase 8).
+   *
+   * It changes what the worker must be told: not "this tree is yours" but "other
+   * people are editing here at the same time, so stay inside your own paths and
+   * do not tidy anything you did not write".
+   */
+  readonly shared?: boolean;
 }
 
 const MODE_RULES: Readonly<Record<WorkerMode, readonly string[]>> = {
@@ -88,6 +96,20 @@ export function buildBrief(ctx: BriefContext): Brief {
 
   lines.push("## Constraints");
   lines.push(`- Work only inside ${worktree}. Never read or write outside it.`);
+  if (ctx.shared) {
+    // The single most important thing a shared worker can be told, and the one
+    // an isolated worker never needed to hear: the tree is not yours.
+    lines.push(
+      "- **You are working in a shared checkout. Other workers are editing it at the same time.**",
+      "  Files you did not write may appear or change under you while you work; that is expected",
+      "  and is not a problem to fix. Stay strictly inside the paths listed above.",
+      "- Do not revert, reformat, tidy or 'clean up' anything outside your own paths, even if it",
+      "  looks wrong or half-finished — it is somebody else's work in progress, and undoing it",
+      "  destroys their turn as surely as deleting it would.",
+      "- Do not run `git` commands that change state: no commit, no checkout, no stash, no reset.",
+      "  The changes are left uncommitted on purpose, for a human to read.",
+    );
+  }
   for (const rule of MODE_RULES[mode]) lines.push(`- ${rule}`);
   lines.push("- Do not modify integration points (package manifests, router indexes, lockfiles) unless listed above as yours.");
   lines.push("- Follow the conventions of the surrounding code rather than importing your own.");

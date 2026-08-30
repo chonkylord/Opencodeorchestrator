@@ -83,7 +83,27 @@ export interface WorkerSpec {
    * can never be stuck behind its own dependent whatever the priorities say.
    */
   readonly priority?: number;
+  /**
+   * Where this worker does its work (§11 Phase 8's shared-workspace mode).
+   *
+   * - `shared` — **the repository you pointed the orchestrator at**, directly.
+   *   Every worker sees every other worker's edits as they happen, which is how
+   *   Claude's own subagents behave and is the default. Nothing is committed for
+   *   you and nothing is merged: the work is simply in your tree when it is done,
+   *   for you to review and commit.
+   * - `isolated` — its own git worktree on its own branch, invisible to everyone
+   *   until a gated merge takes it. Slower to set up and stronger in every way
+   *   that matters for evidence; use it when workers would collide, or when you
+   *   want the test gate between their work and your tree.
+   *
+   * The trade is real and is stated in full in
+   * `docs/adr/0008-shared-workspace.md`.
+   */
+  readonly workspace?: WorkspaceMode;
 }
+
+/** Where a worker works. See {@link WorkerSpec.workspace}. */
+export type WorkspaceMode = "shared" | "isolated";
 
 /** One claimed file change, straight from the worker's report (§4.2). */
 export interface ReportedChange {
@@ -188,6 +208,34 @@ export interface WorkerResult {
     readonly of: string;
     readonly authorModel: string;
     readonly crossModel: boolean;
+  };
+  /**
+   * How confidently this worker's changes could be told apart from everyone
+   * else's — set only in `shared` mode (§11 Phase 8).
+   *
+   * In an isolated worktree the question does not arise: the diff in a worker's
+   * own directory is that worker's diff, and DD-4 rests on it. In a shared tree
+   * several workers edit at once and git records who changed a file exactly as
+   * well as a shared folder does, which is not at all.
+   *
+   * So attribution becomes best-effort, and this field is what makes that
+   * visible rather than silent: `owned` is what the worker's declared
+   * `ownedPaths` claim, `unattributed` is everything else that changed while it
+   * ran and could belong to anyone, and `concurrent` names the workers that were
+   * running alongside it. A shared-mode result with a long `unattributed` list
+   * and three concurrent workers is a weaker measurement than the same result
+   * from an isolated worker, and it should look like one.
+   */
+  readonly attribution?: {
+    readonly mode: WorkspaceMode;
+    /** Changed files this worker's `ownedPaths` cover. Empty when it declared none. */
+    readonly owned: readonly string[];
+    /** Changed files no running worker owns. Could be anyone's, including yours. */
+    readonly unattributed: readonly string[];
+    /** Files already modified before this worker started; not its doing. */
+    readonly preexisting: readonly string[];
+    /** Other workers sharing the tree while this one ran. */
+    readonly concurrent: readonly string[];
   };
 }
 

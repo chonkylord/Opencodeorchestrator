@@ -18,6 +18,7 @@ import {
   DEFAULT_MAX_REVISIONS,
   DEFAULT_RUN_BUDGET_TOKENS,
   type WorkerMode,
+  type WorkspaceMode,
   clampConcurrency,
   parseModelPool,
 } from "../manager/index.js";
@@ -87,6 +88,17 @@ export interface ServerConfig {
    * `ORCHESTRATOR_REVIEW_POOL`, comma-separated and in preference order.
    */
   readonly reviewPool: readonly string[];
+  /**
+   * Where workers work unless a spawn says otherwise (§11 Phase 8).
+   *
+   * `shared` (the default) puts every worker in **your repository**, together,
+   * the way Claude's own subagents work: they see each other's edits, nothing is
+   * committed for you, and there is no merge because the work is already in your
+   * tree. `isolated` gives each worker its own worktree and branch behind the
+   * gated merge — stronger evidence, at the cost of workers not seeing each
+   * other. `ORCHESTRATOR_WORKSPACE`.
+   */
+  readonly workspace: WorkspaceMode;
 }
 
 /** `.orchestrator/` is already git-excluded for the worktrees; the index joins it. */
@@ -124,6 +136,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
       ...(env["ORCHESTRATOR_MODEL_REVIEW"] ? { review: env["ORCHESTRATOR_MODEL_REVIEW"] } : {}),
     },
     reviewPool: parseModelPool(env["ORCHESTRATOR_REVIEW_POOL"]),
+    // Anything but an exact "isolated" means shared: the default is the mode the
+    // orchestrator is meant to be used in, and a typo should not silently opt a
+    // user into the slower one.
+    workspace: env["ORCHESTRATOR_WORKSPACE"] === "isolated" ? "isolated" : "shared",
   };
 }
 

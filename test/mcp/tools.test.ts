@@ -74,6 +74,9 @@ async function harness(
     runBudgetTokens: 0,
     models: {},
     reviewPool: [],
+    // These suites are about ISOLATION — worktrees, branches, the merge gate.
+    // Phase 8 made `shared` the product default, so they now say so explicitly.
+    workspace: "isolated",
     ...configOver,
   };
   const orchestrator = await createOrchestrator(config, {

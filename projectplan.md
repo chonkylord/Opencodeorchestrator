@@ -289,6 +289,13 @@ git worktree add .orchestrator/worktrees/w-003 -b worker/w-003 <base-sha>
 
 Worker `cwd` = worktree root, set via `POST /session?directory=<worktree>`.
 
+> **Phase 8: this is now the `isolated` mode, not the only mode.** The default is
+> `shared` — the worker's `cwd` is the repository itself, alongside every other
+> shared worker, with no worktree and no branch of its own. The `git worktree add`
+> above still happens for `workspace: "isolated"`. See
+> [ADR-0008](docs/adr/0008-shared-workspace.md), which also records the one rule
+> that does not move: `git reset --hard` never runs in the user's checkout.
+
 **Revised after Phase 0** — per-worktree file injection largely does not work under DD-2, and is not needed:
 
 - **Permissions** — passed inline on session create (`permission: [{permission, pattern, action}]`). No `opencode.json` file. Verified.
@@ -296,7 +303,7 @@ Worker `cwd` = worktree root, set via `POST /session?directory=<worktree>`.
 - **Task brief** — delivered as the prompt itself. `AGENTS.md` in the worktree remains an option and is **verified** — Phase 2 confirmed OpenCode auto-loads it (`docs/phase0-facts.md` §5, probe in `test/e2e/manager.e2e.test.ts` behind `OC_E2E_AGENTS=1`). The brief still travels in the per-prompt `system` field, by choice rather than by necessity. *(Corrected in Phase 4: this line said "unverified" long after Phase 2 verified it.)*
 - **Report contract** — carried in the brief's words, and read from the worker's final reply. *(Corrected in Phase 4: this line said to prefer `format: {type: "json_schema", …}`, which was written as "verified (schema)" and had never been sent. Phase 2 sent it: the free-tier model this project defaults to **rejects** schema-constrained output. The manager attempts it, drops it on rejection and stops asking on that backend — see [ADR-0002](docs/adr/0002-worker-contract-channel.md). The contract cannot depend on a feature the default model does not have.)*
 
-On completion the manager runs `git add -A && git commit` to snapshot everything, then computes diffs.
+On completion the manager runs `git add -A && git commit` to snapshot everything, then computes diffs. *(Phase 8: for `isolated` workers only. A `shared` worker's changes are left **uncommitted** in the user's tree — `git add -A` there would sweep up whatever else they had in progress, onto whatever branch they were on. The diffs are computed the same way either way.)*
 
 Research/review workers: no worktree, or a read-only mount of the target worktree.
 
@@ -356,7 +363,7 @@ it used to claim. Rows marked ✅ are built and tested
 
 | Tool | Params | Returns | Notes |
 |------|--------|---------|-------|
-| `worker_spawn` ✅ | `task`, `scope?`, `mode` (implement/research/review), `model?`, `ownedPaths?` (file paths/globs), `acceptance?`, `testCommand?`, `baseRef?`, `runID?`, `notes?`, `budget?`, `dependsOn?`, `reviewOf?`, `priority?` | `{workerID, branch, runID}` + whether it started or QUEUED | Returns in <2s; runs in background. **Corrected:** the param was `owns?` (renamed to match `WorkerSpec.ownedPaths`), and the return used to promise `worktree` — which DD-1 makes impossible, because the worktree is created in the background *after* spawn returns. It appears in `worker_status` once it exists. **Phase 5:** `dependsOn` is implemented, and the reply says whether the worker started or is queued — behind the cap, or behind a dependency — because "spawned" alone cannot tell those apart. A `dependsOn` that names an id nobody was handed is rejected at spawn, before a row is written. **Phase 6:** `reviewOf` points a `review` worker at another worker's diff — it gets its own worktree at that worker's base plus the diff quoted in its brief, and is rejected at spawn under the same rule as `dependsOn` if it names a worker nobody was handed or is passed without `mode: "review"`. There is no separate `worker_review` tool: a reviewer is a worker. **Phase 8:** a `review` worker is routed to a *different model* from the one that wrote the code where one is configured (`ORCHESTRATOR_REVIEW_POOL`), and `worker_result` says whether the review was independent; `priority` reorders the queue among workers that could all start now, and cannot promote a worker past its own dependency. |
+| `worker_spawn` ✅ | `task`, `scope?`, `mode` (implement/research/review), `model?`, `ownedPaths?` (file paths/globs), `acceptance?`, `testCommand?`, `baseRef?`, `runID?`, `notes?`, `budget?`, `dependsOn?`, `reviewOf?`, `priority?` | `{workerID, branch, runID}` + whether it started or QUEUED | Returns in <2s; runs in background. **Corrected:** the param was `owns?` (renamed to match `WorkerSpec.ownedPaths`), and the return used to promise `worktree` — which DD-1 makes impossible, because the worktree is created in the background *after* spawn returns. It appears in `worker_status` once it exists. **Phase 5:** `dependsOn` is implemented, and the reply says whether the worker started or is queued — behind the cap, or behind a dependency — because "spawned" alone cannot tell those apart. A `dependsOn` that names an id nobody was handed is rejected at spawn, before a row is written. **Phase 6:** `reviewOf` points a `review` worker at another worker's diff — it gets its own worktree at that worker's base plus the diff quoted in its brief, and is rejected at spawn under the same rule as `dependsOn` if it names a worker nobody was handed or is passed without `mode: "review"`. There is no separate `worker_review` tool: a reviewer is a worker. **Phase 8:** a `review` worker is routed to a *different model* from the one that wrote the code where one is configured (`ORCHESTRATOR_REVIEW_POOL`), and `worker_result` says whether the review was independent; `priority` reorders the queue among workers that could all start now, and cannot promote a worker past its own dependency. **`workspace`** chooses where it works: `shared` (the default) is the user's own repository alongside every other shared worker — no branch, no snapshot commit, no merge — and `isolated` is the pre-Phase-8 worktree behind the gated merge. |
 | `worker_status` ✅ | `ids?` | state, elapsed, last-activity age, revision count, ~cost, and the suggested next call | Cheap; safe to poll. With no `ids`, reports what is still active or blocked. |
 | `worker_wait` ✅ | `id` **or** `ids`, `mode?` (any/all), `timeoutMs?` (≤30,000) | same as status, one line per worker | Bounded block; reduces polling chatter. Resolves on any settled state, `blocked` included. A timeout is not an error. **Corrected twice:** the param was `ids`, and Phase 3 narrowed it to one id because batched waits were Phase 5; **Phase 5 restored `ids`** — with a `mode`, because "wait for any" and "wait for all" are different questions and a wave needs both. It is one tool rather than two: a `worker_wait_all` beside it would differ only by a suffix. The 30,000 cap was a guess when written, is now half a measured host ceiling, and **does not move for a batch**; see [`docs/phase3-notes.md`](docs/phase3-notes.md). |
 | `worker_result` ✅ | `id` | structured result (§4.3) | The default thing Claude reads. On a `blocked` worker it renders the *record* — there is no result until a worker settles, and blocking is not settling. |
@@ -627,7 +634,7 @@ Four defects found on the way, each by a test written to catch it rather than by
 
 One sharp edge found and **not** fixed, recorded rather than left for someone to trip over: a restarted manager mints worker ids from `w-001` again, so anything it spawns collides with the rows the dead one left. The tests give their second manager a distinct prefix. A durable id sequence belongs to Phase 8 or to the first bug report.
 
-### Phase 8 — Optimization (ongoing) · **three of six done**
+### Phase 8 — Optimization (ongoing) · **four of six done**
 
 Model-routing presets with automatic selection, worker priorities, smarter summarization, shared-workspace mode for trivially-parallel tasks, container sandboxing, cross-model review diversity.
 
@@ -648,10 +655,20 @@ Model-routing presets with automatic selection, worker priorities, smarter summa
 
 **And a Phase 7 open item closed.** The review worker that "wedged once and nobody root-caused why" is **model-specific, not review-mode-specific**: on one review task, three models finished in 24–33 s at ~12–14k tokens while `nemotron-3-ultra-free` generated **39,004 tokens over 6.5 minutes with no terminal event**. The general lesson is that a free model can generate indefinitely without terminating, and the **wall-clock** budget rather than the idle watchdog is what catches it.
 
-**Not done, and why — this phase is `(ongoing)` and these are the remaining three:**
+**Shared-workspace mode — built, and it changed the default.** Every worker now works in **your repository**, together, the way Claude's own subagents do: they see each other's edits as they happen, nothing is committed for you, and there is no merge because the work is simply in your tree when it finishes. `workspace: "isolated"` (or `ORCHESTRATOR_WORKSPACE=isolated`) restores the previous behaviour per worker or per server.
+
+This is the item [ADR-0007](docs/adr/0007-model-routing-and-review-diversity.md) declined on design grounds, and the objection was real rather than wrong: DD-4's reconciliation rests on *the diff in a worker's directory is that worker's diff*, and a shared tree removes it. What Phase 8 built is that objection answered rather than ignored — see [ADR-0008](docs/adr/0008-shared-workspace.md):
+
+- **`git reset --hard` still never runs in your checkout.** That, not general squeamishness, is what [ADR-0003](docs/adr/0003-integration-worktree.md) was protecting. Shared workers have no branch, so `workspace_merge` refuses them structurally and they cannot reach the pipeline that owns the command. `workspace_cleanup` has the mirror guard: anything at or above the repo root is not ours to remove.
+- **Nothing is committed.** DD-5's snapshot is right in a worktree the orchestrator owns; in your checkout `git add -A` would sweep up whatever else you had in progress, onto whatever branch you were on. The changes are left uncommitted for you to read — which is also what a native subagent leaves.
+- **Attribution is best-effort and says so.** A shared result carries `owned` (what its `ownedPaths` cover), `unattributed` (changed while it ran, owned by nobody, could be anyone's), `preexisting` (dirty before it started — *your* work, never credited to a worker) and `concurrent` (who else was in the tree). A shared worker that ran alone is measured exactly and is not discounted for the mode.
+- **The brief tells it the tree is shared** — that files will change underneath it, that it must not tidy or revert anything outside its own paths, and that it must run no state-changing `git` command.
+
+Verified live on **2026-08-30**: two concurrent workers in one checkout with a pre-existing `NOTES.md`. Each attributed its own file and reported the other's as unattributed rather than claiming it; both listed `NOTES.md` as pre-existing; both named the other as concurrent; `HEAD` did not move and the user's file was untouched.
+
+**Not done, and why — this phase is `(ongoing)` and these are the remaining two:**
 
 - **Container sandboxing** — *blocked here, not deferred by choice.* The Docker client is installed and there is no daemon (`/var/run/docker.sock` does not exist), so nothing written for it could be run even once. An isolation mechanism that has never executed is worse than none.
-- **Shared-workspace mode** — *declined on design grounds.* Every measurement here attributes a diff to a worker by taking `git diff` in that worker's own worktree against its own base (DD-4, §6.1). Two workers in one directory makes that ambiguous exactly when it matters, and the honest version needs per-path ownership enforced at *measurement* time rather than stated in a brief. That is its own design with its own ADR, not a flag.
 - **Smarter summarization** — *no measurement says it is needed.* §8's context targets were verified as met in Phase 3 and nothing since has moved them. Rewriting the render caps without evidence would change the one part of this system whose budget is already measured.
 
 **Total: ~3.5–4.5 weeks solo to a hardened v1.**
@@ -700,7 +717,7 @@ Everything above is structured so that wrong answers to any of these change **on
 
 ## 15. Deferred Ideas (explicitly out of v1)
 
-- Shared workspaces for trivially parallel tasks
+- ~~Shared workspaces for trivially parallel tasks~~ — **built in Phase 8, and now the default.** Workers share the user's own checkout, as Claude's native subagents do. The attribution cost this deferral was worried about is real and is reported rather than hidden ([ADR-0008](docs/adr/0008-shared-workspace.md)); `workspace: "isolated"` keeps the stronger evidence for the workers that need it.
 - Arbitrary task DAGs (keep `dependsOn` flat for now)
 - ~~Automatic model selection based on task classification~~ — **partly built in Phase 8.** Selection by *mode* and by review diversity is automatic and deterministic ([ADR-0007](docs/adr/0007-model-routing-and-review-diversity.md)). Classification of the **task text** is still deferred, and deliberately: the only way to do it properly is a model call, and a wrong classification routes work to the wrong model silently.
 - ~~Cross-model adversarial review as default rather than option~~ — **built in Phase 8.** A reviewer is routed away from the author's model wherever another is configured; where none is, the review still happens and says it is not independent.

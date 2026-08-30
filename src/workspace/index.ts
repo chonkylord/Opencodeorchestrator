@@ -22,6 +22,7 @@ export {
   createWorktree,
   ensureExcluded,
   defaultWorktreeRoot,
+  dirtyFiles,
   diffStat,
   listManifests,
   manifestPath,

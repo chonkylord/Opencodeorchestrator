@@ -164,6 +164,13 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         "implementation).\n" +
         "BATCH related work into one worker to amortize session warm-up, and prefer 2-5 workers in " +
         "parallel — merge pain grows superlinearly past that.\n\n" +
+        "WHERE THEY WORK: by default every worker edits YOUR repository directly, together, the way " +
+        "subagents do — they see each other's changes, and when they finish the work is already in your " +
+        "tree, uncommitted, for you to read and commit. Nothing is merged and nothing is committed for " +
+        "you. The cost is that the orchestrator cannot always tell whose change is whose: give each " +
+        "worker `ownedPaths` and it can, and worker_result names anything it could not attribute. Pass " +
+        "`workspace: \"isolated\"` for a worker that should get its own worktree and branch behind the " +
+        "merge gate instead.\n\n" +
         "CONCURRENCY: the orchestrator runs a fixed number of workers at once (see the reply this " +
         "returns) and QUEUES the rest, in spawn order. Spawning six is fine and costs nothing extra — " +
         "the queued ones sit in `spawned` having allocated nothing, and their time limits do not start " +
@@ -199,6 +206,17 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
           .enum(["implement", "research", "review"])
           .optional()
           .describe("implement (edit+bash, the default) | research | review (both strictly read-only)"),
+        workspace: z
+          .enum(["shared", "isolated"])
+          .optional()
+          .describe(
+            "Where this worker works. `shared` (the default) is YOUR repository, alongside every other " +
+              "shared worker — they see each other's edits as they happen, nothing is committed for you, " +
+              "and there is no merge because the work is simply there when it finishes. `isolated` gives it " +
+              "its own git worktree and branch, invisible to the others until workspace_merge takes it " +
+              "through the test gate. Use `isolated` when workers would edit the same files, or when you " +
+              "want the gate between their work and your tree.",
+          ),
         priority: z
           .number()
           .int()
@@ -295,6 +313,7 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         ...(args.dependsOn === undefined ? {} : { dependsOn: args.dependsOn }),
         ...(args.reviewOf === undefined ? {} : { reviewOf: args.reviewOf }),
         ...(args.priority === undefined ? {} : { priority: args.priority }),
+        ...(args.workspace === undefined ? {} : { workspace: args.workspace }),
       };
       try {
         const r = await manager.spawn(spec);

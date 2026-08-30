@@ -103,6 +103,7 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
     maxRetries: config.maxRetries,
     models: config.models,
     reviewPool: config.reviewPool,
+    defaultWorkspace: config.workspace,
     runBudgetTokens: config.runBudgetTokens,
     // §11 Phase 7's metrics. Rooted at the repository, beside the run reports,
     // and never on the wire — see `src/manager/metrics.ts`.
@@ -205,7 +206,8 @@ async function main(): Promise<void> {
   log(
     `ready on stdio · db ${config.dbPath} · model ${config.defaultModel} · ` +
       `max ${config.maxConcurrent} concurrent · max ${config.maxRevisions} revisions · ` +
-      `${config.maxRetries} retries · run cap ${config.runBudgetTokens === 0 ? "off" : config.runBudgetTokens.toLocaleString("en-US")}`,
+      `${config.maxRetries} retries · run cap ${config.runBudgetTokens === 0 ? "off" : config.runBudgetTokens.toLocaleString("en-US")} · ` +
+      `workspace ${config.workspace}`,
   );
 }
 

@@ -60,6 +60,7 @@ describe("configuration", () => {
         ORCHESTRATOR_RUN_BUDGET_TOKENS: "500000",
         ORCHESTRATOR_MODEL_REVIEW: "acme/reviewer",
         ORCHESTRATOR_REVIEW_POOL: "acme/one, acme/two , ,acme/one",
+        ORCHESTRATOR_WORKSPACE: "isolated",
       },
       "/ignored",
     );
@@ -77,6 +78,7 @@ describe("configuration", () => {
       // Trimmed, de-duplicated, and empties dropped: an env var with a stray
       // comma should cost nothing, like every other value in this file.
       reviewPool: ["acme/one", "acme/two"],
+      workspace: "isolated",
     });
     // `:memory:` is a SQLite keyword, not a path, and must survive resolution.
     expect(loadConfig({ ORCHESTRATOR_DB: ":memory:" }, "/x").dbPath).toBe(":memory:");
@@ -92,6 +94,16 @@ describe("configuration", () => {
     expect(loadConfig({ ORCHESTRATOR_MAX_CONCURRENT: "banana" }, "/x").maxConcurrent).toBe(3);
     expect(loadConfig({ ORCHESTRATOR_MAX_CONCURRENT: "" }, "/x").maxConcurrent).toBe(3);
     expect(loadConfig({ ORCHESTRATOR_MAX_CONCURRENT: "9999" }, "/x").maxConcurrent).toBe(32);
+  });
+
+  test("ORCHESTRATOR_WORKSPACE defaults to shared, and only an exact 'isolated' opts out", () => {
+    // The default is the mode the orchestrator is meant to be used in — every
+    // worker in your repository together, the way Claude's own subagents work.
+    // A typo must not silently opt someone into the slower, isolated one.
+    expect(loadConfig({}, "/x").workspace).toBe("shared");
+    expect(loadConfig({ ORCHESTRATOR_WORKSPACE: "isolated" }, "/x").workspace).toBe("isolated");
+    expect(loadConfig({ ORCHESTRATOR_WORKSPACE: "Isolated" }, "/x").workspace).toBe("shared");
+    expect(loadConfig({ ORCHESTRATOR_WORKSPACE: "banana" }, "/x").workspace).toBe("shared");
   });
 
   test("Phase 7's two new variables are clamped, and each has a meaningful zero", () => {
@@ -142,6 +154,9 @@ describe("start-up and recovery (§9)", () => {
     runBudgetTokens: 0,
     models: {},
     reviewPool: [],
+    // These suites are about ISOLATION — worktrees, branches, the merge gate.
+    // Phase 8 made `shared` the product default, so they now say so explicitly.
+    workspace: "isolated",
     };
 
     const first = await createOrchestrator(config, { tickMs: 10, abortGraceMs: 200 });
@@ -194,6 +209,7 @@ describe("start-up and recovery (§9)", () => {
     runBudgetTokens: 0,
     models: {},
     reviewPool: [],
+    workspace: "isolated",
       },
       { tickMs: 10, abortGraceMs: 200 },
     );

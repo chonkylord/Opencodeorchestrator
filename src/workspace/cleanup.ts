@@ -134,6 +134,20 @@ export async function cleanupWorkspace(opts: CleanupOptions): Promise<CleanupRep
 
   const pruned: PrunedWorker[] = [];
   for (const candidate of opts.candidates) {
+    // §11 Phase 8: a shared worker's "worktree" is the repository itself and its
+    // branch is the user's. Pruning it would delete their checkout. The guard is
+    // structural rather than a naming convention: anything at or above the repo
+    // root is not ours to remove, whatever the candidate says.
+    if (candidate.worktree && !isUnder(candidate.worktree, worktreeRoot)) {
+      pruned.push({
+        workerID: candidate.workerID,
+        branch: candidate.branch,
+        worktreeRemoved: false,
+        branchDeleted: false,
+        kept: "it worked in your repository directly (workspace: shared), so there is no worktree or branch of its own to prune",
+      });
+      continue;
+    }
     pruned.push(await pruneWorker(repoRoot, candidate, { containers, force, worktreeRoot }));
   }
 

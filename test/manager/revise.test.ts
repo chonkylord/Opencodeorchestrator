@@ -68,6 +68,10 @@ async function harness(
     backend,
     store,
     repoRoot: repo.path,
+    // Phase 8 made `shared` the product default; these suites exercise the
+    // isolated path (worktrees, branches, snapshots) and say so rather than
+    // depending on a default.
+    defaultWorkspace: "isolated",
     tickMs: 10,
     budgetPollMs: 20,
     abortGraceMs: 400,

@@ -56,6 +56,7 @@ import {
   buildBrief,
   buildReviewPrompt,
   buildRevisionPrompt,
+  matchesPath,
   parseReport,
   reconcile,
 } from "../briefs/index.js";
@@ -63,6 +64,7 @@ import type { Store } from "../store/index.js";
 import {
   changedFiles,
   createWorktree,
+  dirtyFiles,
   readCommitDiff,
   readDiff,
   defaultWorktreeRoot,
@@ -70,6 +72,7 @@ import {
   listManifests,
   readReportFile,
   resolveRepoRoot,
+  resolveSha,
   runTestCommand,
   snapshotCommit,
   writeManifest,
@@ -89,6 +92,7 @@ import type {
   WorkerReport,
   WorkerResult,
   WorkerSpec,
+  WorkspaceMode,
 } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -214,6 +218,15 @@ export interface WorkerManagerOptions {
    * is available, and says so in the result rather than passing silently.
    */
   readonly reviewPool?: readonly string[];
+  /**
+   * Where workers work unless they say otherwise (§11 Phase 8).
+   *
+   * Defaults to `shared` — the repository itself, every worker in it together,
+   * the way Claude's own subagents behave. `isolated` is the pre-Phase-8
+   * behaviour and is still what you want when workers would collide or when the
+   * merge gate should stand between their work and your tree.
+   */
+  readonly defaultWorkspace?: WorkspaceMode;
   readonly budget?: Partial<WorkerBudget>;
   /**
    * How many workers may be past `spawned` at once (§11 Phase 5).
@@ -488,6 +501,12 @@ class ManagedWorker {
   /** Transient-error retries this worker has spent. Capped; never reset. */
   retries = 0;
   /**
+   * Files already modified when this shared worker started (§11 Phase 8).
+   *
+   * Empty for an isolated worker, whose worktree starts clean by construction.
+   */
+  preexisting: readonly string[] = [];
+  /**
    * A cancellation that arrived before there was anything to abort.
    *
    * The queue widened a window that always existed: between `spawn()` returning
@@ -597,6 +616,7 @@ export class WorkerManager {
       defaultModel: options.defaultModel ?? DEFAULT_MODEL,
       models: options.models ?? {},
       reviewPool: options.reviewPool ?? [],
+      defaultWorkspace: options.defaultWorkspace ?? "shared",
       budget: { ...DEFAULT_BUDGET, ...options.budget },
       maxConcurrent: options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT,
       maxRevisions: Math.max(0, Math.floor(options.maxRevisions ?? DEFAULT_MAX_REVISIONS)),
@@ -1756,14 +1776,40 @@ export class WorkerManager {
     // checkout sits on another is reviewing two different repositories at once.
     const review = rec.mode === "review" && rec.spec.reviewOf ? await this.reviewTargetOf(rec.spec.reviewOf) : undefined;
     const baseRef = rec.spec.baseRef ?? review?.baseSha;
-    const wt = await createWorktree({
-      repoRoot,
-      workerID: rec.workerID,
-      root: worktreeRoot,
-      ...(baseRef === undefined ? {} : { baseRef }),
-    });
+
+    let wt: { path: string; branch: string; baseSha: string };
+    if (this.workspaceOf(rec.spec) === "shared") {
+      // §11 Phase 8: the worker works in the repository itself, alongside every
+      // other shared worker — which is what Claude's own subagents do, and what
+      // this was asked for. No worktree, no branch, and nothing to merge
+      // afterwards because the work is simply *there*.
+      //
+      // Two things this must get right, and they are the whole reason shared
+      // mode is not one line. The baseline is HEAD **plus whatever was already
+      // dirty**, because attributing the user's half-finished feature to the
+      // first worker that settles would be a lie in the one channel this system
+      // keeps honest. And nothing is ever committed here — see `settle()`.
+      w.preexisting = await dirtyFiles(repoRoot);
+      wt = { path: repoRoot, branch: "", baseSha: await resolveSha(repoRoot, baseRef ?? "HEAD") };
+      this.opts.store.appendEvent(rec.workerID, "shared_workspace", {
+        repoRoot,
+        baseSha: wt.baseSha,
+        alreadyDirty: w.preexisting.length,
+      });
+    } else {
+      wt = await createWorktree({
+        repoRoot,
+        workerID: rec.workerID,
+        root: worktreeRoot,
+        ...(baseRef === undefined ? {} : { baseRef }),
+      });
+    }
     this.update(w, { worktree: wt.path, branch: wt.branch, baseSha: wt.baseSha });
-    this.writeManifest(w);
+    // Skipped in shared mode: `writeManifest` writes one file per *worktree*, and
+    // in a shared tree every worker would overwrite the last one's — turning
+    // DD-7's rebuild-from-disk into a rebuild of whichever worker finished most
+    // recently. There is no per-worker directory to rebuild from either.
+    if (wt.branch !== "") this.writeManifest(w);
     if (w.cancelRequested) return { kind: "cancelled", reason: w.cancelRequested };
 
     const base = buildBrief({
@@ -1773,6 +1819,7 @@ export class WorkerManager {
       budget: this.budgetFor(rec.spec),
       baseSha: wt.baseSha,
       worktree: wt.path,
+      ...(wt.branch === "" ? { shared: true } : {}),
     });
     // A reviewer's standing contract is the same as anyone's; only the turn's
     // instruction differs, because the thing it is being pointed at is not in
@@ -2382,7 +2429,14 @@ export class WorkerManager {
     // snapshot the worktree" would be a discrepancy about a directory that was
     // never meant to exist.
     let snapshot: WorkerResult["snapshot"];
-    if (rec.worktree) {
+    // **Never in shared mode.** DD-5 has the manager commit so the worker does
+    // not have to, which is right in a worktree the orchestrator owns. The user's
+    // checkout is not that: `git add -A` there would sweep up whatever else they
+    // had in progress, onto whatever branch they happen to be on, and call it
+    // this worker's snapshot. The work is left as uncommitted changes for them to
+    // read and commit — which is also exactly what a native subagent leaves.
+    const isShared = this.workspaceOf(rec.spec) === "shared";
+    if (rec.worktree && !isShared) {
       try {
         const snap = await snapshotCommit(rec.worktree, snapshotMessage(rec));
         snapshot = { committed: snap.committed, ...(snap.sha === undefined ? {} : { sha: snap.sha }) };
@@ -2571,6 +2625,7 @@ export class WorkerManager {
       ...(error ? { error: { code: error.code, message: error.message } } : {}),
       ...(snapshot === undefined ? {} : { snapshot }),
       ...(reviewOf === undefined ? {} : { review: reviewOf }),
+      ...(this.workspaceOf(rec.spec) === "shared" ? { attribution: this.attribute(w, actual) } : {}),
       reportSource: parsed.source,
     };
   }
@@ -2675,6 +2730,62 @@ export class WorkerManager {
       discrepancies: (t.result?.discrepancies ?? []).slice(0, MAX_REVIEW_DISCREPANCIES).map((d) => `${d.kind}: ${d.detail}`),
     };
     return { target: { ...target, atSnapshot }, baseSha: reviewBase, source };
+  }
+
+  /** Where a worker works: its own choice, else the manager's default. */
+  private workspaceOf(spec: WorkerSpec): WorkspaceMode {
+    return spec.workspace ?? this.opts.defaultWorkspace;
+  }
+
+  /**
+   * Who did what, in a tree where several workers were writing at once.
+   *
+   * There is no clever trick here and this function does not pretend otherwise.
+   * Git records which worker changed a file exactly as well as a shared folder
+   * does — which is not at all — so the honest answer has three parts:
+   *
+   * - **`preexisting`** is subtracted outright. It was dirty before this worker
+   *   drew breath, so whatever it is, it is not this worker's.
+   * - **`owned`** is what the worker's declared `ownedPaths` cover. This is the
+   *   only positive evidence available, and it is a *claim the brief made*
+   *   rather than a measurement — a worker that ignored its own path list is
+   *   attributed work it did not do, which is why `ownedPaths` matters far more
+   *   in shared mode than in an isolated one.
+   * - **`unattributed`** is the rest: files that changed while this worker ran,
+   *   that nobody owns, and that could belong to any concurrent worker. Named,
+   *   not hidden, and not quietly credited to whoever settled first.
+   *
+   * `concurrent` lists who else was in the tree, because a result with an empty
+   * `concurrent` list is exact — a shared worker that happened to run alone is
+   * measured as precisely as an isolated one, and should not be discounted.
+   */
+  private attribute(w: ManagedWorker, changed: readonly string[]): NonNullable<WorkerResult["attribution"]> {
+    const rec = w.record.current;
+    const preexisting = new Set(w.preexisting);
+    const mine = changed.filter((f) => !preexisting.has(f));
+    const owned = rec.spec.ownedPaths ?? [];
+    const isMine = (f: string): boolean => owned.some((p) => matchesPath(f, p));
+
+    // Everyone else who shared the tree at any point while this worker ran.
+    const concurrent: string[] = [];
+    for (const [id, other] of this.workers) {
+      if (id === rec.workerID) continue;
+      const o = other.record.current;
+      if (this.workspaceOf(o.spec) !== "shared") continue;
+      if (o.startedAt === undefined) continue;
+      // Overlapping intervals, with an open end meaning "still going".
+      const otherEnded = o.endedAt ?? Number.POSITIVE_INFINITY;
+      const mineStarted = rec.startedAt ?? 0;
+      if (otherEnded >= mineStarted) concurrent.push(id);
+    }
+
+    return {
+      mode: "shared",
+      owned: owned.length > 0 ? mine.filter(isMine) : [],
+      unattributed: owned.length > 0 ? mine.filter((f) => !isMine(f)) : mine,
+      preexisting: changed.filter((f) => preexisting.has(f)),
+      concurrent: concurrent.sort(),
+    };
   }
 
   private budgetFor(spec: WorkerSpec): WorkerBudget {

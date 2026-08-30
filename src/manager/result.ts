@@ -44,6 +44,31 @@ export function renderResult(r: WorkerResult, opts: RenderOptions = {}): string 
   lines.push(`Task: ${r.task}`);
   lines.push("");
 
+  if (r.attribution) {
+    const a = r.attribution;
+    // Said plainly, because a shared-mode diff is a weaker measurement than an
+    // isolated one and the difference is invisible unless somebody says it.
+    if (a.concurrent.length === 0) {
+      lines.push("Workspace: your repository (shared). No other worker was in it while this one ran, so the changes below are its own.");
+    } else {
+      lines.push(
+        `Workspace: your repository (shared), alongside ${a.concurrent.length} other worker(s): ${a.concurrent.join(", ")}. ` +
+          "Git does not record which of them changed a file, so the split below is best-effort.",
+      );
+      if (a.owned.length > 0) lines.push(`  Its own paths: ${a.owned.join(", ")}`);
+      if (a.unattributed.length > 0) {
+        lines.push(
+          `  COULD BE ANYONE'S: ${a.unattributed.join(", ")} — changed while it ran, owned by nobody. ` +
+            "Give workers `ownedPaths` and this list gets shorter.",
+        );
+      }
+    }
+    if (a.preexisting.length > 0) {
+      lines.push(`  Already modified before it started (not its doing): ${a.preexisting.join(", ")}`);
+    }
+    lines.push("");
+  }
+
   if (r.review) {
     // Before the summary, because it decides how much the summary is worth. A
     // same-model review is the weakest check this system produces and saying so

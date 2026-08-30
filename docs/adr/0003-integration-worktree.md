@@ -1,6 +1,13 @@
 # ADR-0003: The merge happens in a dedicated integration worktree, and worktree lifecycle stays on local git
 
 **Status:** accepted (Phase 4)
+**Amended by [ADR-0008](0008-shared-workspace.md) (Phase 8).** The rule below —
+that the orchestrator never writes to the user's working tree — held for every
+phase up to 8 and still holds for `isolated` workers. Phase 8's `shared` mode, now
+the default, does write files there by request. What ADR-0003 was actually
+protecting is unchanged and unchangeable: **`git reset --hard` never runs in the
+user's checkout.** Shared workers have no branch, so they cannot enter the merge
+pipeline that owns that command.
 **Date:** 2026-08-28
 **Supersedes nothing. Closes:** `docs/phase0-facts.md` §6's standing warning about
 `/experimental/worktree`, and ADR-0002's "Phase 4 should revisit it for creation

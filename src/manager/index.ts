@@ -85,4 +85,5 @@ export type {
   WorkerReport,
   WorkerResult,
   WorkerSpec,
+  WorkspaceMode,
 } from "./types.js";

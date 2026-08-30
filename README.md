@@ -1,8 +1,8 @@
 # Claude → OpenCode Subagent Orchestrator
 
 An MCP server that lets Claude delegate implementation work to parallel OpenCode
-workers, each isolated in its own git worktree, and see back only structured
-results — never worker transcripts.
+workers — by default in your own repository, together, the way Claude's native
+subagents work — and see back only structured results, never worker transcripts.
 
 The full design is in [`projectplan.md`](projectplan.md).
 
@@ -29,18 +29,17 @@ pruning respects a TTL, and a permission request is answered **in band** — the
 worker waits at its tool call and carries straight on, where before every ask cost
 it a partial turn.
 
-Phase 8 added **cross-model review** — a reviewer is routed away from the model
-that wrote the code, so its critique is an independent read rather than the author
-marking its own homework — along with model-routing presets and worker priorities.
+Phase 8 added **shared workspaces** — every worker in your own checkout, seeing
+each other's edits, which is now the default — plus **cross-model review**, where
+a reviewer is routed away from the model that wrote the code so its critique is an
+independent read rather than the author marking its own homework, along with
+model-routing presets and worker priorities.
 
-**What this is not.** Phase 8 is `(ongoing)` and three of its six items are not
+**What this is not.** Phase 8 is `(ongoing)` and two of its six items are not
 here: **container sandboxing** is blocked in this environment rather than deferred
 (the Docker client is installed and there is no daemon, so nothing written for it
-could be run even once); **shared-workspace mode** is declined on design grounds,
-because two workers in one directory makes DD-4's diff attribution ambiguous
-exactly when it matters and the honest version needs its own design; and **smarter
-summarization** has no measurement saying it is needed, §8's context targets
-having been verified as met in Phase 3.
+could be run even once), and **smarter summarization** has no measurement saying
+it is needed, §8's context targets having been verified as met in Phase 3.
 
 Three things are still open, listed under "Unresolved" in
 [`docs/phase0-facts.md`](docs/phase0-facts.md): `cost` unverified on a paid
@@ -58,6 +57,7 @@ again, so it can collide with rows a dead one left.
 - [`docs/adr/0005-the-review-loop.md`](docs/adr/0005-the-review-loop.md) — why a revision re-enters the queue, which failure states may be revised, and what a reviewer is pointed at
 - [`docs/adr/0006-hardening.md`](docs/adr/0006-hardening.md) — what a crash costs, what a budget buys, who decides a retry, and the endpoint the fact sheet had wrong
 - [`docs/adr/0007-model-routing-and-review-diversity.md`](docs/adr/0007-model-routing-and-review-diversity.md) — why a reviewer is a different model, why it reads the code as the author left it, and what priorities may not do
+- [`docs/adr/0008-shared-workspace.md`](docs/adr/0008-shared-workspace.md) — why workers share your checkout by default, what that costs in evidence, and the one operation that is still forbidden there
 - [`docs/phase0-facts.md`](docs/phase0-facts.md) — verified API facts, and what is still unresolved
 - [`src/opencode/`](src/opencode/) — the adapter. **The only code that knows OpenCode exists** (DD-2)
 - [`src/manager/`](src/manager/) — the lifecycle: state machine, run loop, watchdogs, budgets, recovery, and the admission gate
@@ -81,6 +81,32 @@ Tests: 4 passed / 0 failed / 0 skipped
 Discrepancies: none
 Snapshot: a7c6376179 on the worker's branch
 ```
+
+### Where workers work
+
+By default, **in your repository, together** — like native subagents. They see
+each other's files, nothing is committed for you, and when they finish the work is
+simply there, uncommitted, for you to read:
+
+```
+w-001: completed | changed: src/geometry.js
+  Workspace: your repository (shared), alongside 1 other worker: w-002.
+  Git does not record which of them changed a file, so the split below is best-effort.
+    Its own paths: src/geometry.js
+    COULD BE ANYONE'S: src/strings.js — changed while it ran, owned by nobody.
+    Already modified before it started (not its doing): NOTES.md
+```
+
+That last line is the point: your own half-finished work is never credited to a
+worker. Give each worker `ownedPaths` and the middle line shrinks to nothing.
+
+The orchestrator will write files into your tree. It will **never** commit, reset,
+checkout or delete there — `git reset --hard` in your checkout is the one thing
+[ADR-0003](docs/adr/0003-integration-worktree.md) forbade and Phase 8 did not move.
+
+Pass `workspace: "isolated"` for a worker that should get its own worktree and
+branch behind the test gate instead — stronger evidence, at the cost of it not
+seeing its siblings' work.
 
 The merge never runs in your checkout. It runs in an integration worktree the
 orchestrator creates under `.orchestrator/` and removes afterwards, so
@@ -244,6 +270,7 @@ is one more thing to find.
 | `ORCHESTRATOR_RUN_BUDGET_TOKENS` | `2000000` | §8's global cap, in tokens across every worker sharing a `runID`. Per-worker budgets stop one worker running away; this stops a *wave* doing it — six workers each dutifully inside their own ceiling still spend six ceilings. Refuses a spawn rather than killing what is running, and is checked again before a queued worker opens a session. `0` disables it; there is no upper clamp, because a big number is somebody who has measured their own spend. |
 | `ORCHESTRATOR_MODEL_IMPLEMENT`<br>`ORCHESTRATOR_MODEL_RESEARCH`<br>`ORCHESTRATOR_MODEL_REVIEW` | *(unset)* | DD-9's per-mode model presets. Unset means every worker takes `ORCHESTRATOR_MODEL`. |
 | `ORCHESTRATOR_REVIEW_POOL` | *(unset)* | Comma-separated models a `review` worker may be routed to, in preference order — the first that is **not** the model which wrote the code under review. This is what makes a critique an independent read rather than the author marking its own homework. Unset means reviews fall back to the preset or the default, which may well be the author's own model; `worker_result` says which kind of review you got either way. |
+| `ORCHESTRATOR_WORKSPACE` | `shared` | Where workers work. `shared` puts every worker in **your repository**, together, the way Claude's native subagents behave — no branch, nothing committed for you, no merge because the work is already in your tree. `isolated` gives each its own worktree and branch behind the gated merge: stronger evidence, at the cost of workers not seeing each other. Only an exact `isolated` opts out; a typo leaves you on the default. Per-worker override: `worker_spawn({workspace})`. |
 
 ```bash
 claude mcp add orchestrator \

@@ -329,6 +329,19 @@ export class MergeCoordinator {
     if (record.state === "merged") {
       throw new MergeStartError(`${workerID} is already merged (into a previous integration branch); nothing to do`);
     }
+    // §11 Phase 8: a shared worker has no branch, because its work went straight
+    // into the repository. There is nothing to merge and — far more importantly —
+    // nothing here may try: the pipeline's rollback is `git reset --hard`, and
+    // pointed at the user's own checkout that destroys work nobody asked it to
+    // touch. ADR-0003 drew that line and shared mode does not move it.
+    if (record.branch === "") {
+      throw new MergeStartError(
+        `${workerID} worked in your repository directly (workspace: shared), so its changes are already in your tree — ` +
+          "there is no branch to merge and nothing for the test gate to stand between. Review them with " +
+          `worker_diff({id: "${workerID}"}) and commit what you want. Spawn with workspace: "isolated" if you want ` +
+          "the gate.",
+      );
+    }
     if (record.state !== "completed") {
       throw new MergeStartError(
         `${workerID} is ${record.state}, and only a \`completed\` worker can be merged. ` +
