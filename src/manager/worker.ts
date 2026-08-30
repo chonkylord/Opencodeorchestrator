@@ -77,6 +77,7 @@ import {
 import { type Admission, DEFAULT_MAX_CONCURRENT, DependencyError, type QueueHint, Scheduler } from "./scheduler.js";
 import { type Metric, type MetricsSink, NULL_METRICS } from "./metrics.js";
 import { type RevisionRound, revisionRounds } from "./revisions.js";
+import { type Route, route } from "./routing.js";
 import { WorkerMachine, type WorkerState, isSettled } from "./state.js";
 import type {
   Discrepancy,
@@ -203,6 +204,16 @@ export interface WorkerManagerOptions {
   readonly defaultModel?: string;
   /** DD-9 presets, per mode. */
   readonly models?: Partial<Record<WorkerMode, string>>;
+  /**
+   * Models a `review` worker may be routed to, in preference order (§11 Phase 8).
+   *
+   * The point is that a reviewer should not be the same model as the author it
+   * is reviewing — a critique from a model that shares the author's blind spots
+   * is the weakest kind of check this system can produce. Empty is fine and
+   * means "use the presets"; a same-model review still happens when nothing else
+   * is available, and says so in the result rather than passing silently.
+   */
+  readonly reviewPool?: readonly string[];
   readonly budget?: Partial<WorkerBudget>;
   /**
    * How many workers may be past `spawned` at once (§11 Phase 5).
@@ -560,6 +571,8 @@ export class WorkerManager {
     budget: WorkerBudget;
   };
   private readonly workers = new Map<string, ManagedWorker>();
+  /** How each worker's model was chosen (§11 Phase 8). Reporting only. */
+  private readonly routes = new Map<string, Route>();
   /** §11 Phase 5's cap, queue and `dependsOn`. See {@link Scheduler}. */
   private readonly scheduler: Scheduler;
   /**
@@ -583,6 +596,7 @@ export class WorkerManager {
       ...(options.worktreeRoot === undefined ? {} : { worktreeRoot: options.worktreeRoot }),
       defaultModel: options.defaultModel ?? DEFAULT_MODEL,
       models: options.models ?? {},
+      reviewPool: options.reviewPool ?? [],
       budget: { ...DEFAULT_BUDGET, ...options.budget },
       maxConcurrent: options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT,
       maxRevisions: Math.max(0, Math.floor(options.maxRevisions ?? DEFAULT_MAX_REVISIONS)),
@@ -710,7 +724,24 @@ export class WorkerManager {
     }
     const runID = spec.runID ?? "run-default";
     const mode: WorkerMode = spec.mode ?? "implement";
-    const model = spec.model ?? this.opts.models[mode] ?? this.opts.defaultModel;
+    // §11 Phase 8. A `review` worker is routed *away* from the model that wrote
+    // the code it is reading, which is what turns ADR-0005's caveat — "Muse Spark
+    // reviewing Muse Spark, sharing the author's blind spots by construction" —
+    // from a permanent property into a configuration choice.
+    const reviewTarget = mode === "review" && spec.reviewOf ? this.get(spec.reviewOf) : undefined;
+    const chosen = route(
+      {
+        defaultModel: this.opts.defaultModel,
+        perMode: this.opts.models,
+        reviewPool: this.opts.reviewPool,
+      },
+      {
+        mode,
+        ...(spec.model === undefined ? {} : { explicit: spec.model }),
+        ...(reviewTarget === undefined ? {} : { avoid: reviewTarget.model }),
+      },
+    );
+    const model = chosen.model;
     const repoRoot = await this.resolveRepo();
 
     this.opts.store.createRun({ id: runID, repoRoot });
@@ -736,6 +767,9 @@ export class WorkerManager {
     };
 
     const box = { current: record };
+    // Kept in memory only: it is derivable from the trail and from the two
+    // models, and DD-7 says the index holds nothing whose loss breaks a run.
+    this.routes.set(workerID, chosen);
     const w = new ManagedWorker(box, this.opts.now, (change) => {
       // The machine's own hook is the *only* writer of `state:*`. A second,
       // richer append beside a transition writes the same event twice, which
@@ -754,10 +788,15 @@ export class WorkerManager {
       task: spec.task,
       mode,
       model,
+      // Why this model, so "which model reviewed this?" is answerable from the
+      // trail rather than from re-deriving the configuration that was live then.
+      routedBy: chosen.reason,
+      ...(chosen.diverse === undefined ? {} : { crossModel: chosen.diverse }),
+      ...(chosen.avoided === undefined ? {} : { authorModel: chosen.avoided }),
       ...(spec.dependsOn && spec.dependsOn.length > 0 ? { dependsOn: [...spec.dependsOn] } : {}),
     });
 
-    const admission = this.scheduler.enqueue(workerID, spec.dependsOn ?? []);
+    const admission = this.scheduler.enqueue(workerID, spec.dependsOn ?? [], spec.priority ?? 0);
     // Written to the record straight away, so a status line taken one
     // millisecond after `worker_spawn` returns already says why nothing is
     // happening. The position and the outstanding dependencies are in-process
@@ -1005,7 +1044,10 @@ export class WorkerManager {
       feedbackChars: feedback.length,
     });
 
-    const admission = this.scheduler.enqueue(workerID, []);
+    // The same priority as the spawn: a revision is more of this worker's work,
+    // and a wave that put its critical path first should not lose that ordering
+    // the moment one of them needs a second round.
+    const admission = this.scheduler.enqueue(workerID, [], rec.spec.priority ?? 0);
     const hint = this.scheduler.hint(workerID);
     this.update(w, {
       state: w.machine.state,
@@ -1248,7 +1290,7 @@ export class WorkerManager {
     w.machine.apply("recover", { reason: "recovering" });
     this.opts.store.appendEvent(workerID, "recovered", { action, sessionID: stored.sessionID ?? null });
     this.metric({ kind: "recovery", at: this.opts.now(), runID: stored.runID, workerID, action, resumed: true });
-    const admission = this.scheduler.enqueue(workerID, []);
+    const admission = this.scheduler.enqueue(workerID, [], stored.spec.priority ?? 0);
     const hint = this.scheduler.hint(workerID);
     this.update(w, { state: w.machine.state, reason: hint?.reason ?? "recovering", endedAt: undefined });
     w.done = this.driveRecovery(w, admission).catch(() => {
@@ -2485,6 +2527,9 @@ export class WorkerManager {
         parseIssues: parsed.issues,
         actualFiles: actual,
         ...(rec.spec.ownedPaths === undefined ? {} : { ownedPaths: rec.spec.ownedPaths }),
+        // DD-10: `research` and `review` cannot write, so their `changes` list is
+        // not a claim about what they wrote. See `ReconcileInput.readOnly`.
+        ...(rec.mode === "implement" ? {} : { readOnly: true }),
         worktree: rec.worktree,
         ...(verification === undefined ? {} : { tests: verification }),
       }),
@@ -2497,6 +2542,14 @@ export class WorkerManager {
 
     const error = disposition.kind === "failed" ? (disposition.error ?? w.lastError) : undefined;
     const startedAt = rec.startedAt ?? rec.createdAt;
+    // §11 Phase 8: whether this review was cross-model. Derived from the route
+    // taken at spawn rather than re-computed, so the result records what
+    // actually happened and not what the configuration says now.
+    const chosen = this.routes.get(rec.workerID);
+    const reviewOf =
+      rec.mode === "review" && rec.spec.reviewOf && chosen?.avoided !== undefined
+        ? { of: rec.spec.reviewOf, authorModel: chosen.avoided, crossModel: chosen.diverse === true }
+        : undefined;
 
     return {
       workerID: rec.workerID,
@@ -2517,6 +2570,7 @@ export class WorkerManager {
       ...(disposition.kind === "complete" ? {} : { reason: disposition.reason }),
       ...(error ? { error: { code: error.code, message: error.message } } : {}),
       ...(snapshot === undefined ? {} : { snapshot }),
+      ...(reviewOf === undefined ? {} : { review: reviewOf }),
       reportSource: parsed.source,
     };
   }
@@ -2580,6 +2634,24 @@ export class WorkerManager {
   private async reviewTargetOf(targetID: string): Promise<{ target: ReviewTarget; baseSha: string; source: string }> {
     const t = this.get(targetID);
     if (!t) throw new Error(`reviewOf names a worker that does not exist: ${targetID}`);
+    // **Phase 8 correction.** Phase 6 branched the reviewer from the target's
+    // *base* commit, on the reasoning that this is how a human reads a pull
+    // request. It is not, and the first live cross-model review found out how
+    // badly: the reviewer read `src/stats.js` in its own worktree, did not find
+    // the function the diff said had been added, and reported — confidently, and
+    // as a finding — that the author's change "was not applied". It was; the
+    // reviewer was reading the version from before it.
+    //
+    // So the reviewer now branches from the target's **snapshot commit**: the
+    // files it can read are the code as that worker left it, and the diff shows
+    // what changed to get there. That is what a human actually reviews.
+    //
+    // The measurement property that made this checkout worth having is
+    // untouched — the reviewer's own diff is taken against its own base, so a
+    // read-only worker still measures as having changed nothing, and one that
+    // writes is still visible rather than camouflaged.
+    const reviewBase = t.result?.snapshot?.committed && t.result.snapshot.sha ? t.result.snapshot.sha : t.baseSha;
+    const atSnapshot = reviewBase !== t.baseSha;
 
     let page: Awaited<ReturnType<typeof readDiff>> | undefined;
     let source = "none";
@@ -2591,7 +2663,7 @@ export class WorkerManager {
       source = "snapshot";
     }
 
-    const target: ReviewTarget = {
+    const target: Omit<ReviewTarget, "atSnapshot"> = {
       workerID: t.workerID,
       task: t.task,
       summary: t.result?.summary ?? "",
@@ -2602,7 +2674,7 @@ export class WorkerManager {
       // not spend its one round re-deriving findings that are already measured.
       discrepancies: (t.result?.discrepancies ?? []).slice(0, MAX_REVIEW_DISCREPANCIES).map((d) => `${d.kind}: ${d.detail}`),
     };
-    return { target, baseSha: t.baseSha, source };
+    return { target: { ...target, atSnapshot }, baseSha: reviewBase, source };
   }
 
   private budgetFor(spec: WorkerSpec): WorkerBudget {

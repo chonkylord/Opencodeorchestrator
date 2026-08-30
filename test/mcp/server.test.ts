@@ -58,6 +58,8 @@ describe("configuration", () => {
         ORCHESTRATOR_MAX_REVISIONS: "5",
         ORCHESTRATOR_MAX_RETRIES: "1",
         ORCHESTRATOR_RUN_BUDGET_TOKENS: "500000",
+        ORCHESTRATOR_MODEL_REVIEW: "acme/reviewer",
+        ORCHESTRATOR_REVIEW_POOL: "acme/one, acme/two , ,acme/one",
       },
       "/ignored",
     );
@@ -71,6 +73,10 @@ describe("configuration", () => {
       maxRevisions: 5,
       maxRetries: 1,
       runBudgetTokens: 500_000,
+      models: { review: "acme/reviewer" },
+      // Trimmed, de-duplicated, and empties dropped: an env var with a stray
+      // comma should cost nothing, like every other value in this file.
+      reviewPool: ["acme/one", "acme/two"],
     });
     // `:memory:` is a SQLite keyword, not a path, and must survive resolution.
     expect(loadConfig({ ORCHESTRATOR_DB: ":memory:" }, "/x").dbPath).toBe(":memory:");
@@ -134,6 +140,8 @@ describe("start-up and recovery (§9)", () => {
     maxRevisions: 3,
     maxRetries: 2,
     runBudgetTokens: 0,
+    models: {},
+    reviewPool: [],
     };
 
     const first = await createOrchestrator(config, { tickMs: 10, abortGraceMs: 200 });
@@ -184,6 +192,8 @@ describe("start-up and recovery (§9)", () => {
     maxRevisions: 3,
     maxRetries: 2,
     runBudgetTokens: 0,
+    models: {},
+    reviewPool: [],
       },
       { tickMs: 10, abortGraceMs: 200 },
     );

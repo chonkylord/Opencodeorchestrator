@@ -199,6 +199,21 @@ export function buildRevisionPrompt(feedback: string, round: number, maxRounds: 
       "the obstacle in `questions` rather than reporting success you have not achieved.",
     );
   }
+  lines.push(
+    "",
+    "## How to report",
+    "",
+    "Leave `changes` **empty**. It means *files you edited*, and you edit nothing — the",
+    "orchestrator checks it against your own git diff, so listing the files you reviewed there",
+    "reports you as having changed them and produces a false finding about your own work.",
+    "The files you are commenting on go in `risks` and `followUps`, named in the text.",
+    "",
+    'Your `status` is about **your review**, not about the work you reviewed. Use "completed"',
+    "whenever you managed to review the diff — including, especially, when your verdict is that",
+    'the work is wrong. Use "failed" only if you could not review it at all (the diff was',
+    'unreadable, or there was nothing to look at), and "blocked" only if you need something to',
+    "continue. A review that found ten defects is a completed review.",
+  );
   lines.push("", "Reply with the report JSON when you are done.");
   return lines.join("\n");
 }
@@ -216,6 +231,15 @@ export interface ReviewTarget {
   /** Unified diff lines, already capped by the caller. */
   readonly diff: readonly string[];
   readonly diffTruncated: boolean;
+  /**
+   * True when the reviewer's own checkout is the code **after** the change.
+   *
+   * False when the target committed nothing, in which case the checkout is the
+   * base and there is no change to see in it. The reviewer is told which of the
+   * two it has, because guessing wrong makes it report the change as missing —
+   * which is exactly what happened before this field existed.
+   */
+  readonly atSnapshot: boolean;
   /** What the orchestrator's own reconciliation already found, if anything. */
   readonly discrepancies: readonly string[];
 }
@@ -256,17 +280,38 @@ export function buildReviewPrompt(target: ReviewTarget): string {
     lines.push("Those are settled. Do not spend your round re-finding them.");
   }
   lines.push("");
-  lines.push("Its diff, in full or in part:");
+  // Stated before the diff and unconditionally, because a reviewer that is wrong
+  // about which version it is reading produces confident false findings. The
+  // first live cross-model review did exactly that: it read the pre-change file,
+  // could not find the function the diff added, and reported the change as never
+  // applied.
+  lines.push("## What is in your worktree");
+  lines.push("");
+  if (target.atSnapshot) {
+    lines.push(
+      "Your worktree holds the code **as this worker left it — the change is already applied**.",
+      "Open the files and read them; what you see is the result being reviewed, not the code",
+      "before it. The diff below shows what changed to get there.",
+      "",
+      "So do NOT conclude that a change is missing because you expected to find it somewhere",
+      "else: check the file the diff names, at the path the diff names. If a claim and the",
+      "file genuinely disagree, that is a real finding and worth reporting precisely.",
+    );
+  } else {
+    lines.push(
+      "This worker committed nothing, so your worktree is the code **as it was before** — there",
+      "is no change in it to read. Judge it from the diff and the report alone, and say plainly",
+      "if there is not enough there to judge.",
+    );
+  }
+  lines.push("");
+  lines.push("Its diff:");
   lines.push("");
   lines.push("```diff");
   lines.push(...target.diff);
   lines.push("```");
   if (target.diffTruncated) {
-    lines.push(
-      "",
-      "That diff was cut short. Your worktree holds the code as it was **before** these",
-      "changes, so read it for context on anything the diff only shows in part.",
-    );
+    lines.push("", "That diff was cut short; read the files themselves for anything it only shows in part.");
   }
   lines.push("");
   lines.push(

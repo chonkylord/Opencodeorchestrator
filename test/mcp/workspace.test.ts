@@ -52,6 +52,8 @@ async function harness(mockOpts: Parameters<typeof OCMock.start>[0] = {}): Promi
     maxRevisions: 3,
     maxRetries: 2,
     runBudgetTokens: 0,
+    models: {},
+    reviewPool: [],
   };
   const orchestrator = await createOrchestrator(config, {
     tickMs: 10,

@@ -44,6 +44,19 @@ export function renderResult(r: WorkerResult, opts: RenderOptions = {}): string 
   lines.push(`Task: ${r.task}`);
   lines.push("");
 
+  if (r.review) {
+    // Before the summary, because it decides how much the summary is worth. A
+    // same-model review is the weakest check this system produces and saying so
+    // is cheaper than Claude discovering it later — or not discovering it.
+    lines.push(
+      r.review.crossModel
+        ? `Review of ${r.review.of} (written by ${r.review.authorModel}) — a DIFFERENT model, so this is an independent read rather than the author re-reading itself.`
+        : `Review of ${r.review.of} (written by ${r.review.authorModel}) — the SAME model, so it shares the author's blind spots by construction. ` +
+            "Treat it as a second opinion from the same mind, not as independent evidence; the diff-versus-report reconciliation below is the stronger check.",
+    );
+    lines.push("");
+  }
+
   if (r.summary) lines.push(`Summary: ${clampWords(r.summary, SUMMARY_WORDS)}`);
   else if (r.reportSource === "not_started") {
     // "The worker produced no usable report" would be true and misleading: it

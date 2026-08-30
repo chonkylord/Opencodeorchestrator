@@ -72,6 +72,17 @@ export interface WorkerSpec {
    * `docs/adr/0005-the-review-loop.md`.
    */
   readonly reviewOf?: string;
+  /**
+   * Admission priority among workers that could all start right now
+   * (§11 Phase 8). Higher runs first; ties keep spawn order. Default 0.
+   *
+   * It reorders the *queue*, nothing else: it does not preempt a running worker,
+   * does not raise a budget, and cannot let a worker skip a dependency. ADR-0004
+   * deferred this here by name, and the property it was careful about still
+   * holds — the queue is scanned for entries that are runnable, so a dependency
+   * can never be stuck behind its own dependent whatever the priorities say.
+   */
+  readonly priority?: number;
 }
 
 /** One claimed file change, straight from the worker's report (§4.2). */
@@ -163,6 +174,21 @@ export interface WorkerResult {
    * happened rather than because a worker achieved nothing.
    */
   readonly reportSource: "reply" | "report_file" | "none" | "not_started";
+  /**
+   * Set only on a `review` worker, and only when it was pointed at another
+   * worker (§11 Phase 8).
+   *
+   * `crossModel` is the load-bearing field. A critique from the *same* model that
+   * wrote the code shares the author's blind spots by construction, which
+   * ADR-0005 had to state as an unavoidable caveat on every review this system
+   * produced. It is avoidable now, so the result says which kind of review this
+   * was rather than leaving Claude to assume the stronger one.
+   */
+  readonly review?: {
+    readonly of: string;
+    readonly authorModel: string;
+    readonly crossModel: boolean;
+  };
 }
 
 /** The manager's row for one worker. The SQLite `workers` table mirrors it. */

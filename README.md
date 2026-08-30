@@ -8,7 +8,7 @@ The full design is in [`projectplan.md`](projectplan.md).
 
 ## Status
 
-**v1 is complete, and Phase 7's hardening with it — phases 0 through 7.** The architecture's OpenCode assumptions
+**v1 is complete, with Phase 7's hardening and part of Phase 8's optimization — phases 0 through 7, and three of Phase 8's six items.** The architecture's OpenCode assumptions
 are verified against a live server, the backend decision is recorded, the adapter
 that isolates those assumptions is built, a worker goes from a one-line task to a
 committed worktree and a structured result without a human in the loop, Claude can
@@ -29,18 +29,27 @@ pruning respects a TTL, and a permission request is answered **in band** — the
 worker waits at its tool call and carries straight on, where before every ask cost
 it a partial turn.
 
-**What this is not.** Phase 8 (optimization: model-routing presets with automatic
-selection, worker priorities, cross-model review diversity, shared-workspace mode,
-container sandboxing) is real work and none of it is here. Three things are still
-open, listed under "Unresolved" in
+Phase 8 added **cross-model review** — a reviewer is routed away from the model
+that wrote the code, so its critique is an independent read rather than the author
+marking its own homework — along with model-routing presets and worker priorities.
+
+**What this is not.** Phase 8 is `(ongoing)` and three of its six items are not
+here: **container sandboxing** is blocked in this environment rather than deferred
+(the Docker client is installed and there is no daemon, so nothing written for it
+could be run even once); **shared-workspace mode** is declined on design grounds,
+because two workers in one directory makes DD-4's diff attribution ambiguous
+exactly when it matters and the honest version needs its own design; and **smarter
+summarization** has no measurement saying it is needed, §8's context targets
+having been verified as met in Phase 3.
+
+Three things are still open, listed under "Unresolved" in
 [`docs/phase0-facts.md`](docs/phase0-facts.md): `cost` unverified on a paid
 provider (every run here has been free-tier, where it is always `0`), `RunBackend`
 never built or exercised, and in-band replies to *questions* — permissions are
 answered in band now, but a question's reply is a selection from labels the worker
-offered rather than free text, so that half still costs a turn. Two smaller sharp
-edges are recorded rather than fixed: a restarted manager mints worker ids from
-`w-001` again, so it can collide with rows a dead one left; and a read-only review
-worker wedged once in the v1 demo and nobody has root-caused why.
+offered rather than free text, so that half still costs a turn. One sharp edge is
+recorded rather than fixed: a restarted manager mints worker ids from `w-001`
+again, so it can collide with rows a dead one left.
 
 - [`docs/adr/0001-serve-vs-run-backend.md`](docs/adr/0001-serve-vs-run-backend.md) — ServeBackend accepted, with costs
 - [`docs/adr/0002-worker-contract-channel.md`](docs/adr/0002-worker-contract-channel.md) — how the brief goes out and the report comes back
@@ -48,6 +57,7 @@ worker wedged once in the v1 demo and nobody has root-caused why.
 - [`docs/adr/0004-queue-and-dependencies.md`](docs/adr/0004-queue-and-dependencies.md) — the queue across a restart, and what a failed dependency does to its dependents
 - [`docs/adr/0005-the-review-loop.md`](docs/adr/0005-the-review-loop.md) — why a revision re-enters the queue, which failure states may be revised, and what a reviewer is pointed at
 - [`docs/adr/0006-hardening.md`](docs/adr/0006-hardening.md) — what a crash costs, what a budget buys, who decides a retry, and the endpoint the fact sheet had wrong
+- [`docs/adr/0007-model-routing-and-review-diversity.md`](docs/adr/0007-model-routing-and-review-diversity.md) — why a reviewer is a different model, why it reads the code as the author left it, and what priorities may not do
 - [`docs/phase0-facts.md`](docs/phase0-facts.md) — verified API facts, and what is still unresolved
 - [`src/opencode/`](src/opencode/) — the adapter. **The only code that knows OpenCode exists** (DD-2)
 - [`src/manager/`](src/manager/) — the lifecycle: state machine, run loop, watchdogs, budgets, recovery, and the admission gate
@@ -135,7 +145,25 @@ committed and mergeable. `reportSource: none` is the honest part — the worker'
 own report died with the process. Every measurement survived, and §4.3 has always
 held that the measurements are the stronger half.
 
-**Phase 8 (optimization) is next** — see [`projectplan.md`](projectplan.md) §11.
+A reviewer is not the model that wrote the code. On the same diff, the author's own
+model approved it; a different model approved it **and** noticed something the
+first had not:
+
+```
+opencode/muse-spark-1.2-contributor-free   completed  0 files changed, 0 discrepancies  (same model)
+  » Implementation Math.min(Math.max(value, lo), hi) correctly bounds value to [lo, hi].
+
+opencode/ling-3.0-flash-fin-free           completed  0 files changed, 0 discrepancies  (cross-model)
+  » The math is correct for all cases. However, no automated tests were added.
+  » risk: No tests for clamp in test/checks.mjs — the test file still imports only
+  »       { mean, median, sum }, despite the repo being designed so `npm test` means something.
+```
+
+Where no second model is configured the review still happens, and `worker_result`
+says in so many words that it is a second opinion from the same mind rather than
+independent evidence.
+
+**The rest of Phase 8 is next** — see [`projectplan.md`](projectplan.md) §11.
 
 ## Requirements
 
@@ -214,6 +242,8 @@ is one more thing to find.
 | `ORCHESTRATOR_MAX_REVISIONS` | `3` | How many rounds of feedback one worker may take through `worker_revise`. At the cap the tool refuses with a report of what was tried, what changed between rounds and what is still failing — the refusal is the deliverable, not an error. `0` turns revisions off entirely, which is a legitimate setting rather than a typo, so it is clamped to 1–20 only at the top. An unparseable value falls back to the default. |
 | `ORCHESTRATOR_MAX_RETRIES` | `2` | How many times a turn is re-sent after a provider error **the provider itself marks retryable** (exponential backoff from 1s, capped at 30s). A content filter or a bad request reproduces exactly and is failed on the first try rather than three times. `0` turns retries off; clamped to 0–10. |
 | `ORCHESTRATOR_RUN_BUDGET_TOKENS` | `2000000` | §8's global cap, in tokens across every worker sharing a `runID`. Per-worker budgets stop one worker running away; this stops a *wave* doing it — six workers each dutifully inside their own ceiling still spend six ceilings. Refuses a spawn rather than killing what is running, and is checked again before a queued worker opens a session. `0` disables it; there is no upper clamp, because a big number is somebody who has measured their own spend. |
+| `ORCHESTRATOR_MODEL_IMPLEMENT`<br>`ORCHESTRATOR_MODEL_RESEARCH`<br>`ORCHESTRATOR_MODEL_REVIEW` | *(unset)* | DD-9's per-mode model presets. Unset means every worker takes `ORCHESTRATOR_MODEL`. |
+| `ORCHESTRATOR_REVIEW_POOL` | *(unset)* | Comma-separated models a `review` worker may be routed to, in preference order — the first that is **not** the model which wrote the code under review. This is what makes a critique an independent read rather than the author marking its own homework. Unset means reviews fall back to the preset or the default, which may well be the author's own model; `worker_result` says which kind of review you got either way. |
 
 ```bash
 claude mcp add orchestrator \

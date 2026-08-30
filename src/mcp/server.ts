@@ -101,6 +101,8 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
     maxConcurrent: config.maxConcurrent,
     maxRevisions: config.maxRevisions,
     maxRetries: config.maxRetries,
+    models: config.models,
+    reviewPool: config.reviewPool,
     runBudgetTokens: config.runBudgetTokens,
     // §11 Phase 7's metrics. Rooted at the repository, beside the run reports,
     // and never on the wire — see `src/manager/metrics.ts`.

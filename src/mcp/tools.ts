@@ -177,12 +177,13 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         "MODES: `implement` may edit files and run commands; `research` and `review` are read-only and " +
         "cannot write anything, which is what makes them safe to point at unfamiliar code.\n\n" +
         "REVIEW WORKERS: pass `reviewOf` with the id of a worker that has settled, and this one reads its " +
-        "diff and critiques it. Worth knowing what that is and is not: every worker here runs on the same " +
-        "model, so a reviewer shares the author's blind spots, and its critique is one more model's OPINION. " +
-        "The orchestrator's own evidence is stronger and you already have it — the diff-versus-report " +
-        "reconciliation in worker_result, and the test command it re-ran itself. Use a reviewer for the " +
-        "judgement those cannot make (is this the right approach, does it handle the cases the task implied), " +
-        "not to confirm what they already measured.",
+        "diff and critiques it. It is routed to a DIFFERENT model from the one that wrote the code where " +
+        "another is available, so the critique is an independent read rather than the author marking its own " +
+        "homework; worker_result says which kind you got. Even so, a critique is one model's OPINION — the " +
+        "orchestrator's own evidence is stronger and you already have it, in the diff-versus-report " +
+        "reconciliation and the test command it re-ran itself. Use a reviewer for the judgement those cannot " +
+        "make (is this the right approach, does it handle the cases the task implied), not to confirm what " +
+        "they already measured.",
       inputSchema: {
         task: z
           .string()
@@ -198,6 +199,18 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
           .enum(["implement", "research", "review"])
           .optional()
           .describe("implement (edit+bash, the default) | research | review (both strictly read-only)"),
+        priority: z
+          .number()
+          .int()
+          .min(-100)
+          .max(100)
+          .optional()
+          .describe(
+            "Admission priority among QUEUED workers. Higher goes first; equal priorities keep spawn " +
+              "order; default 0. Use it when a wave has a critical path — the worker everything else " +
+              "depends on, or the one whose result you need to decide what to do next. It only reorders " +
+              "the queue: it never preempts a running worker and never lets one skip a dependency.",
+          ),
         reviewOf: z
           .string()
           .max(100)
@@ -281,6 +294,7 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         ...(args.budget === undefined ? {} : { budget: args.budget }),
         ...(args.dependsOn === undefined ? {} : { dependsOn: args.dependsOn }),
         ...(args.reviewOf === undefined ? {} : { reviewOf: args.reviewOf }),
+        ...(args.priority === undefined ? {} : { priority: args.priority }),
       };
       try {
         const r = await manager.spawn(spec);

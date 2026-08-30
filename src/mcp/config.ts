@@ -13,7 +13,14 @@
 
 import { resolve } from "node:path";
 
-import { DEFAULT_MAX_RETRIES, DEFAULT_MAX_REVISIONS, DEFAULT_RUN_BUDGET_TOKENS, clampConcurrency } from "../manager/index.js";
+import {
+  DEFAULT_MAX_RETRIES,
+  DEFAULT_MAX_REVISIONS,
+  DEFAULT_RUN_BUDGET_TOKENS,
+  type WorkerMode,
+  clampConcurrency,
+  parseModelPool,
+} from "../manager/index.js";
 
 export interface ServerConfig {
   /** The repository the workers branch from. */
@@ -66,6 +73,20 @@ export interface ServerConfig {
    * `0` disables it.
    */
   readonly runBudgetTokens: number;
+  /**
+   * DD-9's per-mode model presets (§11 Phase 8).
+   *
+   * Configuration has always had a slot for these; Phase 8 is where something
+   * reads them. `ORCHESTRATOR_MODEL_IMPLEMENT` / `_RESEARCH` / `_REVIEW`.
+   */
+  readonly models: Partial<Record<WorkerMode, string>>;
+  /**
+   * Models a `review` worker may be routed to, so it is not the model that wrote
+   * the code (§11 Phase 8, §15's "cross-model adversarial review").
+   *
+   * `ORCHESTRATOR_REVIEW_POOL`, comma-separated and in preference order.
+   */
+  readonly reviewPool: readonly string[];
 }
 
 /** `.orchestrator/` is already git-excluded for the worktrees; the index joins it. */
@@ -97,6 +118,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     maxRevisions: clampRevisions(numberOr(env["ORCHESTRATOR_MAX_REVISIONS"])),
     maxRetries: clampRetries(numberOr(env["ORCHESTRATOR_MAX_RETRIES"])),
     runBudgetTokens: clampRunBudget(numberOr(env["ORCHESTRATOR_RUN_BUDGET_TOKENS"])),
+    models: {
+      ...(env["ORCHESTRATOR_MODEL_IMPLEMENT"] ? { implement: env["ORCHESTRATOR_MODEL_IMPLEMENT"] } : {}),
+      ...(env["ORCHESTRATOR_MODEL_RESEARCH"] ? { research: env["ORCHESTRATOR_MODEL_RESEARCH"] } : {}),
+      ...(env["ORCHESTRATOR_MODEL_REVIEW"] ? { review: env["ORCHESTRATOR_MODEL_REVIEW"] } : {}),
+    },
+    reviewPool: parseModelPool(env["ORCHESTRATOR_REVIEW_POOL"]),
   };
 }
 

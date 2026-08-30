@@ -99,6 +99,10 @@ export type DependencyOutcome = "satisfied" | "failed" | "waiting";
 interface QueueEntry {
   readonly workerID: string;
   readonly dependsOn: readonly string[];
+  /** §11 Phase 8. Higher runs first; ties keep spawn order. */
+  readonly priority: number;
+  /** Spawn order, so a priority tie is still FIFO and still deterministic. */
+  readonly seq: number;
   readonly settle: (admission: Admission) => void;
 }
 
@@ -121,6 +125,8 @@ export class Scheduler {
    * dependency as merely *waiting* and the cascade would stall for a pump.
    */
   private readonly refused = new Set<string>();
+  /** Monotonic, so equal priorities break ties by spawn order rather than by luck. */
+  private seq = 0;
   private halted = false;
 
   constructor(opts: SchedulerOptions) {
@@ -188,7 +194,7 @@ export class Scheduler {
    * completed, or with `refused` when the worker is cancelled while queued or a
    * dependency ends in a state it can never come back from.
    */
-  enqueue(workerID: string, dependsOn: readonly string[]): Promise<Admission> {
+  enqueue(workerID: string, dependsOn: readonly string[], priority = 0): Promise<Admission> {
     const deps = [...new Set(dependsOn)].filter((id) => id !== workerID);
     this.edges.set(workerID, deps);
     // A worker being enqueued again is in flight again, so a refusal recorded
@@ -208,7 +214,7 @@ export class Scheduler {
     // never settle and `dispose()` would wait for it forever.
     if (this.halted) return Promise.resolve<Admission>({ kind: "refused", reason: "manager_halted" });
     return new Promise<Admission>((resolve) => {
-      this.queue.push({ workerID, dependsOn: deps, settle: resolve });
+      this.queue.push({ workerID, dependsOn: deps, priority, seq: this.seq++, settle: resolve });
       this.pump();
     });
   }
@@ -225,10 +231,15 @@ export class Scheduler {
     const index = this.queue.findIndex((e) => e.workerID === workerID);
     if (index < 0) return undefined;
     const entry = this.queue[index]!;
+    // Position in *admission* order, not in array order. With priorities the two
+    // differ, and "3rd of 5" is a promise about when this worker runs — a number
+    // taken from the array would quietly mean something else the moment anything
+    // jumped the queue.
+    const ahead = this.queue.filter((e) => e.priority > entry.priority || (e.priority === entry.priority && e.seq < entry.seq)).length;
     const waitingFor = entry.dependsOn.filter((id) => this.outcomeOf(id) !== "satisfied");
     return {
       reason: waitingFor.length > 0 ? "waiting_on_dependencies" : "queued",
-      position: index + 1,
+      position: ahead + 1,
       queueLength: this.queue.length,
       waitingFor,
       running: this.occupied.size,
@@ -340,7 +351,23 @@ export class Scheduler {
     }
 
     while (this.occupied.size < this.maxConcurrent) {
-      const index = this.queue.findIndex((e) => e.dependsOn.every((id) => this.outcomeOf(id) === "satisfied"));
+      // The *best* runnable entry, not the first — §11 Phase 8's priorities,
+      // which ADR-0004 deferred here by name. "Runnable" is unchanged and is
+      // still what matters most: the scan covers the whole queue rather than
+      // stopping at the head, which is what guarantees a dependency is never
+      // stuck behind its own dependent. Priority only reorders among entries
+      // that could all start right now, so it cannot introduce a deadlock that
+      // FIFO did not already have.
+      let index = -1;
+      let best: QueueEntry | undefined;
+      for (let i = 0; i < this.queue.length; i++) {
+        const e = this.queue[i]!;
+        if (!e.dependsOn.every((id) => this.outcomeOf(id) === "satisfied")) continue;
+        if (!best || e.priority > best.priority) {
+          best = e;
+          index = i;
+        }
+      }
       if (index < 0) return;
       const [entry] = this.queue.splice(index, 1);
       this.occupied.add(entry!.workerID);
@@ -348,6 +375,7 @@ export class Scheduler {
         running: this.occupied.size,
         maxConcurrent: this.maxConcurrent,
         queued: this.queue.length,
+        ...(entry!.priority === 0 ? {} : { priority: entry!.priority }),
       });
       entry!.settle({ kind: "start" });
     }

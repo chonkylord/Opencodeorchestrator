@@ -42,6 +42,22 @@ export interface ReconcileInput {
   /** Absolute worktree path, so absolute claims can be made relative. */
   readonly worktree?: string;
   readonly tests?: TestVerification;
+  /**
+   * True for a worker that cannot write at all — `research` and `review` (DD-10).
+   *
+   * It turns off exactly one rule: `claimed_not_changed`. A read-only worker's
+   * `changes` list is not a claim about what it wrote, because it wrote nothing
+   * and could not have; in practice it is the model naming the files it *read*,
+   * however plainly the brief says otherwise. Measured on 2026-08-30 across four
+   * free models: telling reviewers to leave `changes` empty fixed one of them and
+   * not the others, which is ADR-0002's lesson again — the contract cannot depend
+   * on instruction-following the models do not reliably have.
+   *
+   * The rule in the other direction is **kept, and matters more**: a read-only
+   * worker whose diff is not empty has done something it could not do, and that
+   * is a finding about the sandbox rather than about the report.
+   */
+  readonly readOnly?: boolean;
 }
 
 /**
@@ -75,14 +91,19 @@ export function reconcile(input: ReconcileInput): Discrepancy[] {
     if (p) claimed.set(p, c.action);
   }
 
-  // The claim the report cannot make good on. This is the lying-report case.
-  for (const [file, action] of [...claimed].sort()) {
-    if (!actual.has(file)) {
-      out.push({
-        kind: "claimed_not_changed",
-        file,
-        detail: `report claims ${action} but the diff does not show it`,
-      });
+  // The claim the report cannot make good on. This is the lying-report case —
+  // and only for a worker that could have written something. For a read-only
+  // one the same list means "files I looked at", and flagging it manufactures a
+  // discrepancy that dilutes the very signal DD-4 exists to provide.
+  if (!input.readOnly) {
+    for (const [file, action] of [...claimed].sort()) {
+      if (!actual.has(file)) {
+        out.push({
+          kind: "claimed_not_changed",
+          file,
+          detail: `report claims ${action} but the diff does not show it`,
+        });
+      }
     }
   }
 

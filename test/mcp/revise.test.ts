@@ -101,6 +101,8 @@ async function harness(
     maxRevisions: 3,
     maxRetries: 2,
     runBudgetTokens: 0,
+    models: {},
+    reviewPool: [],
     ...configOver,
   };
   const orchestrator = await createOrchestrator(config, {
@@ -472,9 +474,20 @@ describe("a review worker critiques another worker's diff", () => {
     expect(record.mode).toBe("review");
     expect(record.result!.changes.files).toBe(0);
     expect(record.result!.discrepancies).toEqual([]);
-    // Its own worktree, at the author's base — not a mount of the author's.
-    expect(record.worktree).not.toBe(h.orchestrator.manager.get(authorID)!.worktree);
-    expect(record.baseSha).toBe(h.orchestrator.manager.get(authorID)!.baseSha);
+    // Its own worktree — not a mount of the author's, so its own measured diff
+    // stays empty and a reviewer that writes something is visible.
+    const author2 = h.orchestrator.manager.get(authorID)!;
+    expect(record.worktree).not.toBe(author2.worktree);
+    // **At the author's SNAPSHOT, not its base** — corrected in Phase 8. Phase 6
+    // branched from the base, so the files the reviewer could read were the
+    // versions from *before* the change; the first live cross-model review read
+    // one, could not find the function the diff added, and reported the change as
+    // never applied. The reviewer now reads the code as the author left it.
+    expect(record.baseSha).toBe(author2.result!.snapshot!.sha!);
+    expect(record.baseSha).not.toBe(author2.baseSha);
+
+    // And it is told which version it is holding, in so many words.
+    expect(reviewPrompt!).toContain("the change is already applied");
   }, 60_000);
 
   test("reviewOf is rejected at spawn when it names a worker nobody was handed", async () => {

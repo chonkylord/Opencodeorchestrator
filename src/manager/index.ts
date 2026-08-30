@@ -58,6 +58,8 @@ export {
 
 export { METRICS_DIR, type Metric, type MetricKind, type MetricsSink, NULL_METRICS, fileMetrics } from "./metrics.js";
 
+export { type Route, type RouteRequest, type RoutingConfig, parseModelPool, route } from "./routing.js";
+
 export { type RevisionRound, revisionRounds } from "./revisions.js";
 
 export { RUN_REPORT_DIR, type RunReport, buildRunReport, writeRunReport } from "./runreport.js";

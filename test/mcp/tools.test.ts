@@ -72,6 +72,8 @@ async function harness(
     maxRevisions: 3,
     maxRetries: 2,
     runBudgetTokens: 0,
+    models: {},
+    reviewPool: [],
     ...configOver,
   };
   const orchestrator = await createOrchestrator(config, {
