@@ -67,6 +67,7 @@ import {
   renderReviseStarted,
   renderRevisionCap,
   renderRunReport,
+  sharedPathWarning,
   renderWaitMany,
   statusLine,
 } from "./render.js";
@@ -318,17 +319,26 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
       try {
         const r = await manager.spawn(spec);
         const hint = manager.queueHint(r.workerID);
-        const head = `Spawned ${r.workerID} (${r.mode}, ${r.model}) on branch ${r.branch}, run ${r.runID}.`;
+        const shared = manager.isShared(spec);
+        const head =
+          `Spawned ${r.workerID} (${r.mode}, ${r.model}), run ${r.runID}` +
+          (shared ? " — in your repository, alongside the other shared workers." : ` on branch ${r.branch}.`);
+        // §6.2 asked at spawn instead of at merge, because a shared worker never
+        // reaches a merge and two of them claiming one file do not produce a
+        // conflict for a gate to catch — they overwrite each other, live.
+        const warning = sharedPathWarning(manager, r.workerID, spec, shared);
         if (!hint) {
           return ok(
-            `${head}\n` +
-              "It is preparing its worktree and session now; the worktree path appears in worker_status " +
-              `once it exists. ${hintSlots(manager)}\n` +
+            `${head}\n${warning}` +
+              (shared
+                ? "It is starting now. Its changes will appear in your working tree, uncommitted, as it makes them. "
+                : "It is preparing its worktree and session now; the worktree path appears in worker_status once it exists. ") +
+              `${hintSlots(manager)}\n` +
               `Next: worker_wait({id: "${r.workerID}"}) to block until it settles, then worker_result.`,
           );
         }
         return ok(
-          `${head}\n` +
+          `${head}\n${warning}` +
             (hint.waitingFor.length > 0
               ? `QUEUED, waiting for ${hint.waitingFor.join(", ")} to complete. Nothing has been allocated and ` +
                 "its time limits have not started — they begin when it actually runs.\n" +

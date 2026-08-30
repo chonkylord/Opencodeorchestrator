@@ -50,6 +50,7 @@ export {
   type OverlapPair,
   type OverlapReport,
   type SharedFile,
+  declaredOverlap,
   detectOverlap,
   isIntegrationFile,
   suggestMergeOrder,

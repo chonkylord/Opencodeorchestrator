@@ -112,6 +112,46 @@ the user's work.
 
 ---
 
+## Decision 5: §6.2's overlap question is asked at spawn, because there is no merge to ask it at
+
+`detectOverlap` runs inside the merge pipeline, from *measured* diffs, and warns
+before workers are merged one at a time. A shared worker never reaches it: no
+branch, no merge, no gate.
+
+That would have left the question unasked in the mode where it matters **more**.
+Two isolated workers editing one file produce a merge conflict the gate catches
+and rolls back. Two shared workers editing one file produce a last-write-wins
+race in the user's tree, with nothing watching and nothing to roll back to.
+
+So the question is asked at spawn instead, from what has been *declared* rather
+than measured, and answered in the reply that hands back the worker id — while
+the plan can still change. Two warnings:
+
+- **A collision:** another shared worker, still live, has claimed paths this one
+  declares. The reply names the worker, the patterns, and the three ways out:
+  narrow a path list, sequence them with `dependsOn`, or move one to `isolated`.
+- **No claim at all:** `ownedPaths` is the only boundary a shared worker has and
+  the only evidence its changes can be attributed by. Without it the worker is
+  unbounded and everything it touches is reported unattributable.
+
+Comparing two arbitrary globs for intersection is not decidable without walking
+the filesystem, and `declaredOverlap` does not pretend otherwise: a pattern with
+no wildcard is tested directly, and two wildcard patterns are compared on their
+literal prefixes. It is biased toward reporting a possible collision rather than
+missing one — a false warning costs a sentence, a missed one costs a file.
+
+Settled workers are not counted: a worker that has finished writing is not
+contesting anything, and a warning that fires on every wave is a warning nobody
+reads.
+
+**And one bug this found in Decision 3's own attribution.** `matchesPath` takes
+`(pattern, file)`; the first version of `attribute()` called it with the
+arguments reversed. An exact path still matched — both sides equal — and every
+*glob* silently matched nothing, so a worker owning `src/**` was credited with
+none of its own work and all of it landed in `unattributed`. Wrong in the
+direction that looks like caution, which is why it survived a live run against
+exact filenames. The regression test uses a glob.
+
 ## Consequences
 
 - **§8's jail signal is weaker.** An isolated worker reaching outside its worktree

@@ -210,6 +210,74 @@ describe("attribution, and what it admits it cannot know", () => {
   });
 });
 
+describe("ownedPaths, which is the only boundary a shared worker has", () => {
+  test("a GLOB in ownedPaths attributes work — the reversed-argument bug", async () => {
+    // `matchesPath(pattern, file)`, in that order. Called the other way round an
+    // exact path still matched (both sides equal) while every glob matched
+    // nothing, so a worker owning `src/**` was credited with none of its own work
+    // and all of it landed in `unattributed`. Wrong in the direction that looks
+    // like caution, which is exactly why it survived a live run against exact
+    // filenames. Asserted with a glob so it cannot come back.
+    const h = await harness();
+    const r = await h.manager.spawn(spec({ ownedPaths: ["src/**"] }));
+    const sessionID = await sessionOf(h.manager, r.workerID);
+    h.mock.setWrite(sessionID, [{ path: "src/deep/nested.js", content: "export const n = 1;\n" }]);
+    const done = await h.manager.wait(r.workerID, 8_000);
+
+    const a = done.result!.attribution!;
+    expect(a.owned).toContain("src/deep/nested.js");
+    expect(a.unattributed).not.toContain("src/deep/nested.js");
+  });
+
+  test("two shared workers claiming the same paths are warned about at spawn", async () => {
+    // §6.2's overlap check runs from measured diffs inside the merge pipeline,
+    // and a shared worker never reaches it. Two isolated workers on one file get
+    // a merge conflict the gate catches; two shared workers get a last-write-wins
+    // race in the user's tree with nobody watching.
+    const h = await harness({ workMs: 400 });
+    const first = await h.manager.spawn(spec({ task: "api", ownedPaths: ["src/api/**"] }));
+    const second = await h.manager.spawn(spec({ task: "also api", ownedPaths: ["src/api/routes.js"] }));
+
+    const collisions = h.manager.collisionsFor(second.workerID);
+    expect(collisions).toHaveLength(1);
+    expect(collisions[0]!.workerID).toBe(first.workerID);
+    expect(collisions[0]!.paths).toContain("src/api/routes.js");
+    const kinds = h.store.listEvents(second.workerID, { limit: 50 }).map((e) => e.kind);
+    expect(kinds).toContain("shared_path_collision");
+
+    await Promise.all([h.manager.wait(first.workerID, 10_000), h.manager.wait(second.workerID, 10_000)]);
+  });
+
+  test("workers on genuinely separate paths are not warned about", async () => {
+    // A warning that fires on every wave is a warning nobody reads.
+    const h = await harness({ workMs: 300 });
+    const a = await h.manager.spawn(spec({ task: "src", ownedPaths: ["src/**"] }));
+    const b = await h.manager.spawn(spec({ task: "test", ownedPaths: ["test/**"] }));
+    expect(h.manager.collisionsFor(b.workerID)).toEqual([]);
+    await Promise.all([h.manager.wait(a.workerID, 10_000), h.manager.wait(b.workerID, 10_000)]);
+  });
+
+  test("a settled worker's claim no longer collides with a new one", async () => {
+    // It is done writing, so the file is not contested any more — only workers
+    // that could still be editing count.
+    const h = await harness();
+    const first = await h.manager.spawn(spec({ ownedPaths: ["src/shared.js"] }));
+    await h.manager.wait(first.workerID, 8_000);
+    const second = await h.manager.spawn(spec({ ownedPaths: ["src/shared.js"] }));
+    expect(h.manager.collisionsFor(second.workerID)).toEqual([]);
+  });
+
+  test("an isolated worker never collides — it has its own copy of everything", async () => {
+    const h = await harness({ workMs: 300 });
+    const shared = await h.manager.spawn(spec({ ownedPaths: ["src/**"] }));
+    const iso = await h.manager.spawn(spec({ ownedPaths: ["src/**"], workspace: "isolated" }));
+    expect(h.manager.collisionsFor(iso.workerID)).toEqual([]);
+    // …and the shared one is not warned about the isolated one either.
+    expect(h.manager.collisionsFor(shared.workerID)).toEqual([]);
+    await Promise.all([h.manager.wait(shared.workerID, 10_000), h.manager.wait(iso.workerID, 10_000)]);
+  });
+});
+
 describe("the safety properties shared mode must not trade away", () => {
   test("workspace_merge refuses a shared worker instead of resetting your checkout", async () => {
     // The pipeline's rollback is `git reset --hard`. Pointed at the user's own

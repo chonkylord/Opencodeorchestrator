@@ -21,7 +21,7 @@
  */
 
 import type { StoredEvent } from "../store/index.js";
-import type { MergeRecord, QueueHint, RecoverOutcome, RevisionCapReport, RevisionRound, StartedMerge, WorkerRecord } from "../manager/index.js";
+import type { MergeRecord, QueueHint, RecoverOutcome, SharedCollision, RevisionCapReport, RevisionRound, StartedMerge, WorkerRecord } from "../manager/index.js";
 import { isSettled as isSettledState } from "../manager/index.js";
 import type { CleanupReport, DiffPage, MergeStep, OverlapReport } from "../workspace/index.js";
 
@@ -791,4 +791,47 @@ export function renderBudgetGrant(r: WorkerRecord, budget: { tokens: number; wal
     lines.push("", "It is still running, and the new ceiling applies from the next watchdog tick — no restart needed.");
   }
   return lines.join("\n");
+}
+
+/**
+ * What to tell a caller about a shared worker's claim on the tree.
+ *
+ * Two warnings, and both exist because shared mode removed the thing that used
+ * to catch these later. §6.2's overlap check runs from measured diffs inside the
+ * merge pipeline; a shared worker has no branch and never reaches it.
+ *
+ * - **A collision** — another shared worker has already claimed paths this one
+ *   declared. Two isolated workers doing that produce a merge conflict the gate
+ *   catches; two shared workers produce a last-write-wins race in the user's
+ *   tree, with nobody watching.
+ * - **No claim at all** — `ownedPaths` is the *only* boundary a shared worker
+ *   has, and the only evidence its changes can be attributed by. Without it the
+ *   worker is unbounded and everything it touches lands in `unattributed`.
+ *
+ * Returns the empty string when there is nothing to say, so a caller can splice
+ * it in unconditionally.
+ */
+export function sharedPathWarning(
+  manager: { collisionsFor(id: string): readonly SharedCollision[] },
+  workerID: string,
+  spec: { ownedPaths?: readonly string[] },
+  shared: boolean,
+): string {
+  if (!shared) return "";
+  const owned = spec.ownedPaths ?? [];
+  if (owned.length === 0) {
+    return (
+      "WARNING: no `ownedPaths`, and it is working in your repository alongside the other shared workers. " +
+      "That list is the only boundary it has and the only way its changes can be told from anyone else's — " +
+      "without it, everything it touches is reported as unattributable. Give it one.\n"
+    );
+  }
+  const collisions = manager.collisionsFor(workerID);
+  if (collisions.length === 0) return "";
+  const who = collisions.map((c) => `${c.workerID} (${c.paths.join(", ")})`).join("; ");
+  return (
+    `WARNING: it claims paths already claimed by ${who}. They are in the SAME working tree, so they will not ` +
+    "conflict — they will overwrite each other, and the last write wins with nothing to catch it. Narrow one " +
+    'of the path lists, sequence them with `dependsOn`, or give one `workspace: "isolated"`.\n'
+  );
 }

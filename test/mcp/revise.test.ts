@@ -660,6 +660,37 @@ describe("§11 Phase 7's tools over the wire", () => {
   }, 40_000);
 });
 
+describe("shared-workspace warnings over the wire", () => {
+  test("a shared worker with no ownedPaths is warned at spawn", async () => {
+    const h = await harness({ report: claims("Done.") }, { workspace: "shared" });
+    const r = await call(h.client, "worker_spawn", { task: "do a thing", runID: "run-1" });
+    expect(r.isError).toBe(false);
+    expect(r.text).toContain("in your repository");
+    expect(r.text).toContain("no `ownedPaths`");
+    expect(r.text).toContain("only boundary");
+  }, 30_000);
+
+  test("a shared worker claiming another's paths is warned, and told the three ways out", async () => {
+    const h = await harness({ report: claims("Done."), workMs: 500 }, { workspace: "shared" });
+    await call(h.client, "worker_spawn", { task: "api", runID: "run-1", ownedPaths: ["src/api/**"] });
+    const second = await call(h.client, "worker_spawn", { task: "also api", runID: "run-1", ownedPaths: ["src/api/routes.js"] });
+
+    expect(second.text).toContain("claims paths already claimed by");
+    // The distinction that matters: not a conflict, a silent overwrite.
+    expect(second.text).toContain("overwrite each other");
+    expect(second.text).toContain("dependsOn");
+    expect(second.text).toContain("isolated");
+  }, 30_000);
+
+  test("no warning when the paths are genuinely separate", async () => {
+    // A warning on every wave is a warning nobody reads.
+    const h = await harness({ report: claims("Done."), workMs: 300 }, { workspace: "shared" });
+    await call(h.client, "worker_spawn", { task: "src", runID: "run-1", ownedPaths: ["src/**"] });
+    const second = await call(h.client, "worker_spawn", { task: "tests", runID: "run-1", ownedPaths: ["test/**"] });
+    expect(second.text).not.toContain("WARNING");
+  }, 30_000);
+});
+
 /** The session a worker opened, once it has opened one. */
 async function waitForSession(h: Harness, id: string, ms = 15_000): Promise<string> {
   const deadline = Date.now() + ms;

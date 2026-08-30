@@ -33,6 +33,7 @@ export {
   backoffMs,
   DEFAULT_MODEL,
   type RecoverAction,
+  type SharedCollision,
   type RecoverOutcome,
   type ReviseOutcome,
   RunBudgetError,

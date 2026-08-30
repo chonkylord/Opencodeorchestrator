@@ -30,6 +30,7 @@
  * sets (from `changedFiles`) and this decides what they mean.
  */
 
+import { matchesPath } from "../briefs/reconcile.js";
 import { basename } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -262,4 +263,68 @@ export function suggestMergeOrder(report: OverlapReport): string[] {
     }
   }
   return [...report.workers].sort((a, b) => (weight.get(a) ?? 0) - (weight.get(b) ?? 0) || a.localeCompare(b));
+}
+
+// ---------------------------------------------------------------------------
+// Declared-path overlap (§11 Phase 8's shared workspace)
+// ---------------------------------------------------------------------------
+
+/**
+ * Do two workers' `ownedPaths` lay claim to any of the same files?
+ *
+ * {@link detectOverlap} above answers §6.2's question — *did* these workers
+ * touch the same files — from measured diffs, before a merge. Shared-workspace
+ * mode has no merge, and needs the question asked one step earlier and one step
+ * weaker: *could* they, given what they have declared? Two shared workers with
+ * overlapping claims do not produce a merge conflict for a gate to catch; they
+ * overwrite each other in the user's tree while both are running.
+ *
+ * Comparing two arbitrary globs for intersection is not decidable without
+ * enumerating the filesystem, and this does not pretend otherwise:
+ *
+ * - A pattern with no wildcard is a concrete path, so it is tested directly
+ *   against the other side with {@link matchesPath} — which catches the cases
+ *   that actually happen, `src/api.ts` against `src/**` and against itself.
+ * - Two wildcard patterns are compared on their literal prefixes, and are
+ *   reported as overlapping when one prefix contains the other. `src/**` and
+ *   `src/api/*` overlap; `src/**` and `test/**` do not.
+ *
+ * It is deliberately biased toward **reporting** a possible collision rather
+ * than missing one: the output is a warning to a caller who can still change the
+ * plan, and a false warning costs a sentence where a missed one costs a file.
+ */
+export function declaredOverlap(a: readonly string[], b: readonly string[]): string[] {
+  const hits = new Set<string>();
+  for (const pa of a) {
+    for (const pb of b) {
+      if (overlaps(pa, pb)) {
+        hits.add(pa);
+        hits.add(pb);
+      }
+    }
+  }
+  return [...hits].sort();
+}
+
+function overlaps(a: string, b: string): boolean {
+  if (a === b) return true;
+  const aGlob = a.includes("*");
+  const bGlob = b.includes("*");
+  if (!aGlob && !bGlob) {
+    // Two concrete paths: equal, or one is a directory containing the other.
+    return matchesPath(a, b) || matchesPath(b, a);
+  }
+  if (!aGlob) return matchesPath(b, a);
+  if (!bGlob) return matchesPath(a, b);
+  const pa = literalPrefix(a);
+  const pb = literalPrefix(b);
+  return pa.startsWith(pb) || pb.startsWith(pa);
+}
+
+/** Everything before the first wildcard, trimmed to a path boundary. */
+function literalPrefix(pattern: string): string {
+  const star = pattern.indexOf("*");
+  const head = star < 0 ? pattern : pattern.slice(0, star);
+  const slash = head.lastIndexOf("/");
+  return slash < 0 ? "" : head.slice(0, slash + 1);
 }

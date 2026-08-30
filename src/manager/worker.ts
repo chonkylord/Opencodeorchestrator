@@ -71,6 +71,7 @@ import {
   diffStat,
   listManifests,
   readReportFile,
+  declaredOverlap,
   resolveRepoRoot,
   resolveSha,
   runTestCommand,
@@ -364,6 +365,13 @@ export class RunBudgetError extends Error {
   }
 }
 
+/** Another shared worker laying claim to paths this one declared. */
+export interface SharedCollision {
+  readonly workerID: string;
+  /** The declared patterns that could match the same files. */
+  readonly paths: readonly string[];
+}
+
 /** §9's three decisions about a worker a dead process left behind. */
 export type RecoverAction = "resume" | "fail" | "discard";
 
@@ -592,6 +600,8 @@ export class WorkerManager {
   private readonly workers = new Map<string, ManagedWorker>();
   /** How each worker's model was chosen (§11 Phase 8). Reporting only. */
   private readonly routes = new Map<string, Route>();
+  /** Shared-workspace path collisions found at spawn. Reporting only. */
+  private readonly collisions = new Map<string, readonly SharedCollision[]>();
   /** §11 Phase 5's cap, queue and `dependsOn`. See {@link Scheduler}. */
   private readonly scheduler: Scheduler;
   /**
@@ -647,6 +657,21 @@ export class WorkerManager {
   /** The cap this manager is enforcing. Configuration, exposed for reporting. */
   get maxConcurrent(): number {
     return this.scheduler.maxConcurrent;
+  }
+
+  /**
+   * Workers already claiming paths this one declared, found at spawn.
+   *
+   * Empty for an isolated worker, for one that declared no `ownedPaths`, and —
+   * the ordinary case — for one whose claim nobody else shares.
+   */
+  collisionsFor(workerID: string): readonly SharedCollision[] {
+    return this.collisions.get(workerID) ?? [];
+  }
+
+  /** Whether this worker will work in the user's own checkout. */
+  isShared(spec: WorkerSpec): boolean {
+    return this.workspaceOf(spec) === "shared";
   }
 
   /** §5's revision cap. Configuration, exposed so the tools can quote it. */
@@ -815,6 +840,17 @@ export class WorkerManager {
       ...(chosen.avoided === undefined ? {} : { authorModel: chosen.avoided }),
       ...(spec.dependsOn && spec.dependsOn.length > 0 ? { dependsOn: [...spec.dependsOn] } : {}),
     });
+
+    // Computed before the worker is admitted, so the warning reaches the caller
+    // in the same reply that hands back the id — while the plan can still change.
+    const collisions = this.sharedCollisions(workerID, spec);
+    if (collisions.length > 0) {
+      this.opts.store.appendEvent(workerID, "shared_path_collision", {
+        with: collisions.map((c) => c.workerID),
+        paths: [...new Set(collisions.flatMap((c) => c.paths))],
+      });
+    }
+    this.collisions.set(workerID, collisions);
 
     const admission = this.scheduler.enqueue(workerID, spec.dependsOn ?? [], spec.priority ?? 0);
     // Written to the record straight away, so a status line taken one
@@ -2732,6 +2768,37 @@ export class WorkerManager {
     return { target: { ...target, atSnapshot }, baseSha: reviewBase, source };
   }
 
+  /**
+   * Who else is already claiming the files this shared worker is about to edit
+   * (§11 Phase 8, §6.2 asked one step earlier).
+   *
+   * §6.2's overlap check runs in the merge pipeline, from *measured* diffs, and
+   * a shared worker never gets there — it has no branch and nothing to merge. So
+   * the question has to be asked at spawn instead, from what has been *declared*,
+   * and it matters more here than it ever did before a merge: two isolated
+   * workers touching one file produce a conflict the gate catches, while two
+   * shared workers produce a last-write-wins race in the user's tree with nobody
+   * watching.
+   *
+   * Only shared workers are compared with shared workers. An isolated worker has
+   * its own copy of every file and can overlap freely.
+   */
+  private sharedCollisions(workerID: string, spec: WorkerSpec): SharedCollision[] {
+    if (this.workspaceOf(spec) !== "shared") return [];
+    const mine = spec.ownedPaths ?? [];
+    if (mine.length === 0) return [];
+    const out: SharedCollision[] = [];
+    for (const [id, other] of this.workers) {
+      if (id === workerID) continue;
+      const o = other.record.current;
+      if (isSettled(o.state) && o.state !== "blocked") continue;
+      if (this.workspaceOf(o.spec) !== "shared") continue;
+      const paths = declaredOverlap(mine, o.spec.ownedPaths ?? []);
+      if (paths.length > 0) out.push({ workerID: id, paths });
+    }
+    return out.sort((a, b) => a.workerID.localeCompare(b.workerID));
+  }
+
   /** Where a worker works: its own choice, else the manager's default. */
   private workspaceOf(spec: WorkerSpec): WorkspaceMode {
     return spec.workspace ?? this.opts.defaultWorkspace;
@@ -2764,7 +2831,12 @@ export class WorkerManager {
     const preexisting = new Set(w.preexisting);
     const mine = changed.filter((f) => !preexisting.has(f));
     const owned = rec.spec.ownedPaths ?? [];
-    const isMine = (f: string): boolean => owned.some((p) => matchesPath(f, p));
+    // `matchesPath(pattern, file)` — in that order. Reversed, an exact path still
+    // matched (both sides equal) and every *glob* silently matched nothing, so a
+    // worker owning `src/**` was credited with none of its own work and all of it
+    // landed in `unattributed`. Wrong in the one direction that looks like
+    // caution, which is why it survived a live run.
+    const isMine = (f: string): boolean => owned.some((pattern) => matchesPath(pattern, f));
 
     // Everyone else who shared the tree at any point while this worker ran.
     const concurrent: string[] = [];
