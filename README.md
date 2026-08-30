@@ -8,7 +8,7 @@ The full design is in [`projectplan.md`](projectplan.md).
 
 ## Status
 
-**v1 is complete — phases 0 through 6.** The architecture's OpenCode assumptions
+**v1 is complete, and Phase 7's hardening with it — phases 0 through 7.** The architecture's OpenCode assumptions
 are verified against a live server, the backend decision is recorded, the adapter
 that isolates those assumptions is built, a worker goes from a one-line task to a
 committed worktree and a structured result without a human in the loop, Claude can
@@ -20,21 +20,34 @@ and Claude can now tell a worker it got something wrong: `worker_revise` sends
 feedback to a worker's existing session, capped, with a read-only reviewer that
 can be pointed at another worker's diff.
 
-**What v1 is not.** Phase 7 (hardening: budget *enforcement* beyond a per-worker
-abort, retries with backoff, orphan pruning, richer crash-recovery flows, a
-metrics log) and Phase 8 (optimization: model-routing presets, worker priorities,
-cross-model review diversity, shared-workspace mode, container sandboxing) are
-both real work and neither is here. Four smaller things are still open and are
-listed under "Unresolved" in [`docs/phase0-facts.md`](docs/phase0-facts.md): no
-in-band reply to a permission or question request (a mid-run ask costs a partial
-turn), `cost` unverified on a paid provider, `RunBackend` never exercised, and
-`.orchestrator/` visible in `git status` until some worker prepares a worktree.
+Phase 7 added what a system that runs unattended needs: a `kill -9` mid-run is
+recovered rather than mourned (the worker is salvaged from its worktree into a
+real result on a mergeable branch), a worker that exhausts its budget can be given
+more and carried on instead of being lost, a run has a global token cap as well as
+its per-worker ones, transient provider errors are retried with backoff, orphan
+pruning respects a TTL, and a permission request is answered **in band** — the
+worker waits at its tool call and carries straight on, where before every ask cost
+it a partial turn.
+
+**What this is not.** Phase 8 (optimization: model-routing presets with automatic
+selection, worker priorities, cross-model review diversity, shared-workspace mode,
+container sandboxing) is real work and none of it is here. Three things are still
+open, listed under "Unresolved" in
+[`docs/phase0-facts.md`](docs/phase0-facts.md): `cost` unverified on a paid
+provider (every run here has been free-tier, where it is always `0`), `RunBackend`
+never built or exercised, and in-band replies to *questions* — permissions are
+answered in band now, but a question's reply is a selection from labels the worker
+offered rather than free text, so that half still costs a turn. Two smaller sharp
+edges are recorded rather than fixed: a restarted manager mints worker ids from
+`w-001` again, so it can collide with rows a dead one left; and a read-only review
+worker wedged once in the v1 demo and nobody has root-caused why.
 
 - [`docs/adr/0001-serve-vs-run-backend.md`](docs/adr/0001-serve-vs-run-backend.md) — ServeBackend accepted, with costs
 - [`docs/adr/0002-worker-contract-channel.md`](docs/adr/0002-worker-contract-channel.md) — how the brief goes out and the report comes back
 - [`docs/adr/0003-integration-worktree.md`](docs/adr/0003-integration-worktree.md) — where the merge runs, and why not OpenCode's own worktrees
 - [`docs/adr/0004-queue-and-dependencies.md`](docs/adr/0004-queue-and-dependencies.md) — the queue across a restart, and what a failed dependency does to its dependents
 - [`docs/adr/0005-the-review-loop.md`](docs/adr/0005-the-review-loop.md) — why a revision re-enters the queue, which failure states may be revised, and what a reviewer is pointed at
+- [`docs/adr/0006-hardening.md`](docs/adr/0006-hardening.md) — what a crash costs, what a budget buys, who decides a retry, and the endpoint the fact sheet had wrong
 - [`docs/phase0-facts.md`](docs/phase0-facts.md) — verified API facts, and what is still unresolved
 - [`src/opencode/`](src/opencode/) — the adapter. **The only code that knows OpenCode exists** (DD-2)
 - [`src/manager/`](src/manager/) — the lifecycle: state machine, run loop, watchdogs, budgets, recovery, and the admission gate
@@ -102,7 +115,27 @@ Revision refused: w-002 has already taken 3 of 3 rounds.
   and the worker disagree about what the problem is.
 ```
 
-**Phase 7 (hardening) is next** — see [`projectplan.md`](projectplan.md) §11.
+A manager that dies mid-run is the case everything else here is built to survive.
+The worktrees are the durable state (DD-7), so a restart does not ask the worker
+what it did — it reads the repository:
+
+```
+[orchestrator] recovered 1 interrupted worker(s) from a previous process
+AFTER RECOVER: interrupted | manager_restart
+RECOVER: resuming
+FINAL: completed
+FILES: 2  src/stats.js, test/checks.mjs
+TESTS: npm test — re-run by the orchestrator, green
+SNAPSHOT: 4e1e271884
+REPORT SOURCE: none
+```
+
+That is a real `kill -9`, 20 seconds into a real task: 205 insertions recovered,
+committed and mergeable. `reportSource: none` is the honest part — the worker's
+own report died with the process. Every measurement survived, and §4.3 has always
+held that the measurements are the stronger half.
+
+**Phase 8 (optimization) is next** — see [`projectplan.md`](projectplan.md) §11.
 
 ## Requirements
 
@@ -179,6 +212,8 @@ is one more thing to find.
 | `ORCHESTRATOR_VERIFY_TESTS` | `1` | Re-run the brief's test command after a worker finishes. Set `0` to turn the independent verification off; DD-4 is worth less without it. |
 | `ORCHESTRATOR_MAX_CONCURRENT` | `3` | How many workers may run at once — counting `preparing`, `running` and `blocked`. Spawns past it are **queued**, not rejected. Phase 1 measured four concurrent sessions on one server completing with no cross-talk; that is one run on one free-tier model, so the default leaves headroom inside it. Raise it after measuring your own provider under load, not before. Clamped to 1–32; an unparseable value falls back to the default rather than refusing to start. |
 | `ORCHESTRATOR_MAX_REVISIONS` | `3` | How many rounds of feedback one worker may take through `worker_revise`. At the cap the tool refuses with a report of what was tried, what changed between rounds and what is still failing — the refusal is the deliverable, not an error. `0` turns revisions off entirely, which is a legitimate setting rather than a typo, so it is clamped to 1–20 only at the top. An unparseable value falls back to the default. |
+| `ORCHESTRATOR_MAX_RETRIES` | `2` | How many times a turn is re-sent after a provider error **the provider itself marks retryable** (exponential backoff from 1s, capped at 30s). A content filter or a bad request reproduces exactly and is failed on the first try rather than three times. `0` turns retries off; clamped to 0–10. |
+| `ORCHESTRATOR_RUN_BUDGET_TOKENS` | `2000000` | §8's global cap, in tokens across every worker sharing a `runID`. Per-worker budgets stop one worker running away; this stops a *wave* doing it — six workers each dutifully inside their own ceiling still spend six ceilings. Refuses a spawn rather than killing what is running, and is checked again before a queued worker opens a session. `0` disables it; there is no upper clamp, because a big number is somebody who has measured their own spend. |
 
 ```bash
 claude mcp add orchestrator \
@@ -201,6 +236,8 @@ uncommitted, because your `.gitignore` is yours.
 | `worker_output` | The lifecycle audit trail, paginated. Debugging only. |
 | `worker_message` | Answer a blocked worker; the session is reused. |
 | `worker_revise` | Send a settled worker back with feedback; same session, capped, with a terminal report at the cap. |
+| `worker_recover` | Resolve a worker a crash left behind: resume (or salvage from its worktree), fail, or discard. |
+| `worker_budget` | Give a worker more tokens or wall clock, so an exhausted one can be carried on rather than lost. |
 | `worker_stop` | Graceful abort, with the worktree snapshotted. |
 | `worker_list` | Inventory, filterable by state and run. |
 | `worker_diff` | The unified diff a worker produced, paginated under a 400-line cap. |
