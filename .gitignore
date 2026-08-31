@@ -2,3 +2,8 @@ node_modules/
 .orchestrator/
 *.log
 bun.lock
+# Local Claude Code settings — a per-machine trust decision (which commands may
+# run without a prompt), not a property of the project. Kept out of shared
+# history deliberately: a permission grant one person made for their own machine
+# is not one everybody cloning this repo should inherit silently.
+.claude/
