@@ -318,7 +318,10 @@ describe("worker_revise over the wire", () => {
   }, 30_000);
 
   test("revising a blocked worker is refused and points at worker_message", async () => {
-    const h = await harness({ scenario: "blocked" });
+    // `jailed` over the wire, because that is the only mode that still produces a
+    // blocked worker after §11 Phase 10 — the harness above pins `full`, under
+    // which this worker is granted its permission and completes.
+    const h = await harness({ scenario: "blocked" }, { permissionMode: "jailed" });
     const spawned = await call(h.client, "worker_spawn", { task: "ask me something", runID: "run-1" });
     const id = idFrom(spawned.text);
     await waitSettled(h.client, id);

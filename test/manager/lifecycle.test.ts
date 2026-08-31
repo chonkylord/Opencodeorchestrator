@@ -216,12 +216,16 @@ describe("the blocked path (§5)", () => {
     expect(store.listEvents(w.workerID, { limit: 100 }).map((e) => e.kind)).toContain("answered");
   });
 
-  test("a mid-run permission wall becomes an escalation instead of a hang", async () => {
-    // The adapter cannot answer one of these in band, so the turn is stopped and
-    // the question is put to Claude. §8 wants exactly this shape: a worker
-    // reaching for something it may not have raises a question rather than
-    // silently doing it or silently waiting forever.
-    const { manager } = await harness({ scenario: "blocked" });
+  test("a mid-run permission wall becomes an escalation instead of a hang, in `jailed`", async () => {
+    // §8's shape: a worker reaching for something it may not have raises a
+    // question rather than silently doing it or silently waiting forever.
+    //
+    // §11 Phase 10 made that a *mode* rather than the behaviour. Under the `full`
+    // default the manager answers the request itself and this worker completes
+    // without a question ever reaching Claude — see `test/manager/phase10.test.ts`.
+    // The escalation path is still exactly what `jailed` is for, so it is still
+    // tested; it is just no longer what happens by default.
+    const { manager } = await harness({ scenario: "blocked" }, { permissionMode: "jailed" });
     const w = await manager.spawn(spec());
     const asked = await manager.wait(w.workerID, 5_000);
 
@@ -418,20 +422,29 @@ describe("worker modes (DD-10)", () => {
     expect((prompt.body as Record<string, unknown>)["tools"]).toMatchObject({ bash: false, edit: false });
   });
 
-  test("an implement worker gets headless permissions and no tool restrictions", async () => {
+  test("an implement worker gets full permissions and no tool restrictions", async () => {
     const { mock, manager } = await harness({ writeFiles: true, report: TRUTHFUL });
     const w = await manager.spawn(spec());
     await manager.wait(w.workerID, 5_000);
 
     const create = mock.requests.find((r) => r.method === "POST" && r.path === "/session")!;
+    // §11 Phase 10 / ADR-0011. Until then this was `HEADLESS_PERMISSIONS` plus
+    // `doom_loop`, with `external_directory` deliberately left at `ask` as §8's
+    // jail signal. That signal is now granted by default; the set it was part of
+    // is what `ORCHESTRATOR_PERMISSIONS=jailed` restores, asserted in
+    // `test/manager/phase10.test.ts`.
     expect((create.body as Record<string, unknown>)["permission"]).toEqual([
       { permission: "edit", pattern: "**", action: "allow" },
       { permission: "bash", pattern: "**", action: "allow" },
+      { permission: "webfetch", pattern: "**", action: "allow" },
+      { permission: "external_directory", pattern: "**", action: "allow" },
       // `doom_loop` is an interactive guard, and an unattended worker cannot
       // answer it: left at `ask` it deadlocks the run the manager's own
-      // watchdogs already bound. `external_directory` is deliberately absent —
-      // that ask is §8's jail signal and is meant to reach Claude.
+      // watchdogs already bound.
       { permission: "doom_loop", pattern: "**", action: "allow" },
+      // The load-bearing one: a permission this adapter has never heard of gets
+      // `allow` instead of `ask`, and `ask` in a headless run is a deadlock.
+      { permission: "*", pattern: "**", action: "allow" },
     ]);
     const prompt = mock.requests.find((r) => r.path.endsWith("/prompt_async"))!;
     const body = prompt.body as Record<string, unknown>;

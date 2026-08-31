@@ -302,7 +302,10 @@ describe("dependsOn", () => {
   test("a blocked dependency is neither satisfied nor failed — its dependent waits", async () => {
     // `blocked` is settled, but it is settled *asking a question*. Failing its
     // dependents the moment it asks would turn every escalation into a cascade.
-    const { manager } = await harness({ scenario: "blocked", workMs: 20 }, { maxConcurrent: 4 });
+    // `jailed` is how a worker still reaches `blocked` at all after §11 Phase 10;
+    // the scheduler property under test is about the state, not about the mode
+    // that produced it.
+    const { manager } = await harness({ scenario: "blocked", workMs: 20 }, { maxConcurrent: 4, permissionMode: "jailed" });
 
     const a = (await manager.spawn(spec({ task: "asks something" }))).workerID;
     const b = (await manager.spawn(spec({ task: "waits", dependsOn: [a] }))).workerID;

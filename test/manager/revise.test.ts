@@ -432,7 +432,11 @@ describe("which states may be revised", () => {
   });
 
   test("a `blocked` worker is pointed at worker_message rather than revised", async () => {
-    const h = await harness({ scenario: "blocked" });
+    // `jailed`, because the state under test has to exist: §11 Phase 10 grants
+    // the request in band under the `full` default and the worker completes
+    // without ever blocking. What is asserted here — that `revise` refuses a
+    // blocked worker — is unchanged by which mode produced the block.
+    const h = await harness({ scenario: "blocked" }, { permissionMode: "jailed" });
     const r = await h.manager.spawn(spec());
     await waitFor(() => h.manager.get(r.workerID)!.state === "blocked", 4_000, "blocked");
     expect(() => h.manager.revise(r.workerID, "here is the answer")).toThrow(/worker_message/);

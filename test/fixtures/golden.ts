@@ -12,7 +12,7 @@
  * exit code.
  */
 
-import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -31,8 +31,26 @@ export interface GoldenRepo {
 /** The command the fixture's own `package.json` exposes. */
 export const GOLDEN_TEST_COMMAND = "npm test";
 
+/**
+ * A temp directory under its *canonical* path.
+ *
+ * `tmpdir()` on macOS is `/var/folders/...`, and `/var` is a symlink to
+ * `/private/var`; on Linux it is already canonical and this is a no-op. It
+ * matters because the code under test does not invent repository paths, it asks
+ * git for them — `rev-parse --show-toplevel` and `worktree list --porcelain`
+ * both answer with the resolved path. A fixture that hands out the unresolved
+ * one makes every comparison against git's output fail on macOS and pass on
+ * Linux, which is a property of the fixture rather than of the orchestrator.
+ *
+ * Resolved once here rather than at each comparison, because the alternative is
+ * remembering to do it at every assertion for as long as the suite exists.
+ */
+function mkdtempReal(prefix: string): string {
+  return realpathSync(mkdtempSync(join(tmpdir(), `${prefix}-`)));
+}
+
 export function makeGoldenRepo(prefix = "golden"): GoldenRepo {
-  const path = mkdtempSync(join(tmpdir(), `${prefix}-`));
+  const path = mkdtempReal(prefix);
   cpSync(FIXTURE, path, { recursive: true });
   return { path, baseSha: initRepo(path), cleanup: () => rmSync(path, { recursive: true, force: true }) };
 }
@@ -44,7 +62,7 @@ export function makeGoldenRepo(prefix = "golden"): GoldenRepo {
  * repository with no HEAD fails in a way that has nothing to teach anyone.
  */
 export function makeEmptyRepo(prefix = "repo"): GoldenRepo {
-  const path = mkdtempSync(join(tmpdir(), `${prefix}-`));
+  const path = mkdtempReal(prefix);
   writeFileSync(join(path, "README.md"), "# scratch\n");
   return { path, baseSha: initRepo(path), cleanup: () => rmSync(path, { recursive: true, force: true }) };
 }

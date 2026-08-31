@@ -505,6 +505,13 @@ describe("retries with backoff", () => {
 });
 
 describe("answering a permission in band", () => {
+  // Every test here needs a worker that *stops* — the whole subject is what
+  // happens once one has. §11 Phase 10 made `full` the default, and in `full`
+  // the manager grants the request itself and the worker never blocks, so these
+  // pin `jailed` rather than riding on a default that no longer holds. The
+  // `full` side of the same fork is `test/manager/phase10.test.ts`.
+  const jailed = { permissionMode: "jailed" } as const;
+
   test("the turn is never aborted, and the worker carries on from where it stopped", async () => {
     // `docs/phase0-facts.md` "Unresolved" 5, closed. Before Phase 7 the manager
     // had to convert a permission ask into an escalation — abort the turn,
@@ -513,7 +520,7 @@ describe("answering a permission in band", () => {
     // measured what that cost: three asks in one four-worker run, and the worker
     // that escalated twice ended on 47,531 tokens against 7,715 for the one that
     // never did.
-    const h = await harness({ scenario: "blocked" });
+    const h = await harness({ scenario: "blocked" }, jailed);
     const r = await h.manager.spawn(spec());
     await waitFor(() => h.manager.get(r.workerID)!.state === "blocked", 4_000, "blocked");
     const blocked = h.manager.get(r.workerID)!;
@@ -538,7 +545,7 @@ describe("answering a permission in band", () => {
   test("`deny` refuses the request rather than granting it quietly", async () => {
     // Guessing allow/deny from free text in the permissive direction would
     // defeat exactly the jail signal §8 keeps `external_directory` at `ask` for.
-    const h = await harness({ scenario: "blocked" });
+    const h = await harness({ scenario: "blocked" }, jailed);
     const r = await h.manager.spawn(spec());
     await waitFor(() => h.manager.get(r.workerID)!.state === "blocked", 4_000, "blocked");
 
@@ -552,7 +559,7 @@ describe("answering a permission in band", () => {
     // or the request was answered twice. The pre-Phase-7 path still works and is
     // one prompt away, so the fallback is a partial turn rather than a dead
     // worker — the old cost, paid only when the new route is unavailable.
-    const h = await harness({ scenario: "blocked" });
+    const h = await harness({ scenario: "blocked" }, jailed);
     const r = await h.manager.spawn(spec());
     await waitFor(() => h.manager.get(r.workerID)!.state === "blocked", 4_000, "blocked");
 
