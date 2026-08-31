@@ -33,6 +33,8 @@ export {
   DEFAULT_RUN_BUDGET_TOKENS,
   backoffMs,
   DEFAULT_MODEL,
+  DEFAULT_PERMISSION_MODE,
+  type PermissionMode,
   type RecoverAction,
   type SharedCollision,
   type RecoverOutcome,
