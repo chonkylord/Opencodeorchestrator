@@ -57,6 +57,10 @@ async function harness(mockOpts: Parameters<typeof OCMock.start>[0] = {}): Promi
     // These suites are about ISOLATION — worktrees, branches, the merge gate.
     // Phase 8 made `shared` the product default, so they now say so explicitly.
     workspace: "isolated",
+    waitMaxMs: 30_000,
+    // Off in tests: a fixed port would collide across parallel test files, and
+    // nothing here is asserting on the dashboard.
+    dashboardPort: -1,
   };
   const orchestrator = await createOrchestrator(config, {
     tickMs: 10,

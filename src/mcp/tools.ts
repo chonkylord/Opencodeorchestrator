@@ -67,6 +67,7 @@ import {
   renderReviseStarted,
   renderRevisionCap,
   renderRunReport,
+  modelCapabilityNote,
   sharedPathWarning,
   renderWaitMany,
   statusLine,
@@ -89,6 +90,109 @@ import {
 export const WAIT_TIMEOUT_MAX_MS = 30_000;
 export const WAIT_TIMEOUT_DEFAULT_MS = 20_000;
 
+/**
+ * The most `ORCHESTRATOR_WAIT_MAX_MS` may raise the cap to.
+ *
+ * Not a measurement — nothing has measured a host that waits ten minutes — but a
+ * bound on how wrong a mis-set environment variable is allowed to be.
+ */
+export const WAIT_TIMEOUT_CEILING_MS = 600_000;
+
+/**
+ * How often a blocking `worker_wait` tells the host it is still alive.
+ *
+ * **The one lever this side of the wire has on the polling problem.** A worker
+ * that runs six minutes costs eight `worker_wait` calls at a 30-second cap, and
+ * seven of them return "still running" — measured in the field, and the largest
+ * single waste in the tool surface. The instinct is to hook the host's own
+ * background-task notification path; an MCP server has no such path, because a
+ * server cannot start a turn on the host. What it *can* do is the mechanism the
+ * protocol actually provides: emit `notifications/progress` against the
+ * request's own progress token while the call is in flight. A host that resets
+ * its tool-call timeout on progress (the MCP spec permits this, and permits
+ * capping it too) will hold a much longer wait open, which is what turns eight
+ * calls into one.
+ *
+ * Ten seconds is comfortably inside any plausible idle timeout and costs one
+ * tiny frame per tick. The heartbeat is sent unconditionally and the *cap* is
+ * not raised with it: whether a given host honours it is a question for
+ * `orchestrator_timeout_probe`, and until somebody has run that probe against
+ * their own host, {@link WAIT_TIMEOUT_MAX_MS} stays at half the one ceiling that
+ * has actually been measured.
+ */
+export const WAIT_HEARTBEAT_MS = 10_000;
+
+/** Clamp for `ORCHESTRATOR_WAIT_MAX_MS`. A typo starts the server, it does not stop it. */
+export function clampWaitMax(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return WAIT_TIMEOUT_MAX_MS;
+  return Math.max(1_000, Math.min(WAIT_TIMEOUT_CEILING_MS, Math.floor(value)));
+}
+
+/**
+ * How long `worker_message` waits to see whether the answer was refused.
+ *
+ * DD-1 says start-and-return; honesty says do not report a delivery that has
+ * not happened. Both hold at this size: the failures that are *not* knowable
+ * from `answerability()` — a backend that rejects the prompt, a session the
+ * provider has dropped — reject in tens of milliseconds, while a *successful*
+ * answer takes seconds (it waits out the session's settle guard) and so is
+ * never mistaken for one. The tool still returns an order of magnitude inside
+ * the two-second budget.
+ */
+export const ANSWER_CONFIRM_MS = 1_200;
+
+/** The race marker for {@link ANSWER_CONFIRM_MS}. Distinct from any rejection value. */
+const PENDING = Symbol("answer-pending");
+
+/**
+ * What a request handler needs from the SDK to send progress. Structural, so the
+ * tests can drive the tool directly without building a whole transport.
+ */
+interface ProgressCapable {
+  readonly _meta?: { readonly progressToken?: string | number } | undefined;
+  readonly sendNotification: (n: {
+    method: "notifications/progress";
+    params: { progressToken: string | number; progress: number; total?: number; message?: string };
+  }) => Promise<void>;
+}
+
+/**
+ * Tell the host, every {@link WAIT_HEARTBEAT_MS}, that a blocking wait is alive.
+ *
+ * Returns the stopper; call it in a `finally`, because a timer left running past
+ * the response is a notification against a request that no longer exists.
+ *
+ * Silent when the client sent no progress token — progress is opt-in per the
+ * spec, and a notification with no token to correlate it is noise the host has
+ * to discard. Failures are swallowed for the same reason a diagnostic is never
+ * fatal: a host that will not take a progress frame is a host that gets a
+ * shorter wait, not a broken tool call.
+ */
+function startHeartbeat(extra: ProgressCapable | undefined, budgetMs: number, targets: () => number): () => void {
+  const token = extra?._meta?.progressToken;
+  if (extra === undefined || token === undefined || budgetMs <= WAIT_HEARTBEAT_MS) return () => {};
+  const startedAt = Date.now();
+  const timer = setInterval(() => {
+    const elapsed = Date.now() - startedAt;
+    void extra
+      .sendNotification({
+        method: "notifications/progress",
+        params: {
+          progressToken: token,
+          progress: Math.min(elapsed, budgetMs),
+          total: budgetMs,
+          message: `waiting on ${targets()} worker(s) · ${Math.round(elapsed / 1000)}s`,
+        },
+      })
+      .catch(() => {
+        /* a host that will not take progress simply does not get it */
+      });
+  }, WAIT_HEARTBEAT_MS);
+  // Never hold the process open for a heartbeat.
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
 export interface ToolDeps {
   readonly manager: WorkerManager;
   readonly store: Store;
@@ -99,6 +203,15 @@ export interface ToolDeps {
   readonly now?: () => number;
   /** Diagnostics. Never stdout — that is the JSON-RPC channel. */
   readonly log?: (line: string) => void;
+  /**
+   * `worker_wait`'s cap for this server. Defaults to {@link WAIT_TIMEOUT_MAX_MS}.
+   *
+   * Raise it only against a measured host — see {@link WAIT_HEARTBEAT_MS} and
+   * `orchestrator_timeout_probe`. A cap past what the host will wait for does
+   * not make waits longer; it makes them fail, and a failed wait leaves a worker
+   * running with nobody watching it.
+   */
+  readonly waitMaxMs?: number;
 }
 
 type ToolResult = {
@@ -138,6 +251,7 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
   const { manager, store } = deps;
   const now = deps.now ?? Date.now;
   const log = deps.log ?? ((line: string) => console.error(line));
+  const waitMax = clampWaitMax(deps.waitMaxMs);
 
   /** The lookup every tool starts with, with the error message they all want. */
   function find(id: string): WorkerRecord | undefined {
@@ -326,7 +440,7 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         // §6.2 asked at spawn instead of at merge, because a shared worker never
         // reaches a merge and two of them claiming one file do not produce a
         // conflict for a gate to catch — they overwrite each other, live.
-        const warning = sharedPathWarning(manager, r.workerID, spec, shared);
+        const warning = sharedPathWarning(manager, r.workerID, spec, shared) + modelCapabilityNote(manager, r.model);
         if (!hint) {
           return ok(
             `${head}\n${warning}` +
@@ -423,7 +537,7 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
     {
       title: "Block until a worker settles",
       description:
-        `Wait for workers to stop needing attention, up to ${WAIT_TIMEOUT_MAX_MS / 1000} seconds. Returns the ` +
+        `Wait for workers to stop needing attention, up to ${Math.round(waitMax / 1000)} seconds. Returns the ` +
         "moment they do — completed, failed, timed_out, over_budget, cancelled, or BLOCKED (a worker " +
         "waiting on an answer has stopped, as far as you are concerned) — or when the timeout expires, " +
         "whichever comes first.\n\n" +
@@ -434,8 +548,9 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         "before workspace_merge.\n\n" +
         "A timeout is not an error and the workers are not affected: 'still running' is a legitimate " +
         "answer, and calling again resumes waiting. Use this instead of a polling loop. It is the one " +
-        "tool here that does not return immediately, which is why it is bounded; a wave that needs " +
-        "fifteen minutes needs several of these calls.\n\n" +
+        "tool here that does not return immediately, which is why it is bounded; work longer than the cap " +
+        "needs more than one of these calls, so prefer `ids` + `mode: \"any\"` and spend each call on the " +
+        "whole wave rather than one worker at a time.\n\n" +
         "Waiting on a QUEUED worker waits for whatever is ahead of it, which may be a long time and is " +
         "not that worker running. worker_status says whether a worker has started; if it has not, wait " +
         "on the workers that are running instead.",
@@ -455,24 +570,27 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
           .number()
           .int()
           .min(100)
-          .max(WAIT_TIMEOUT_MAX_MS)
+          .max(waitMax)
           .optional()
-          .describe(`How long to block. Default ${WAIT_TIMEOUT_DEFAULT_MS}ms, hard cap ${WAIT_TIMEOUT_MAX_MS}ms.`),
+          .describe(`How long to block. Default ${WAIT_TIMEOUT_DEFAULT_MS}ms, hard cap ${waitMax}ms.`),
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async ({ id, ids, mode, timeoutMs }): Promise<ToolResult> => {
+    async ({ id, ids, mode, timeoutMs }, extra): Promise<ToolResult> => {
       const targets = [...new Set([...(ids ?? []), ...(id === undefined ? [] : [id])])];
       if (targets.length === 0) {
         return fail("worker_wait needs `id` (one worker) or `ids` (several). Use worker_list to find them.");
       }
       const missing = targets.filter((t) => !find(t));
       if (missing.length > 0) return unknown(missing[0]!);
-      // The cap is half a *measured* host ceiling (60s on Claude Code 2.1.251),
-      // not a guess, and it does not move for a batch: the other half pays for
-      // this tool's own work and the transport, whichever way it is called.
-      const budget = Math.min(timeoutMs ?? WAIT_TIMEOUT_DEFAULT_MS, WAIT_TIMEOUT_MAX_MS);
+      // The default cap is half a *measured* host ceiling (60s on Claude Code
+      // 2.1.251) rather than a guess, and it does not move for a batch: the other
+      // half pays for this tool's own work and the transport, whichever way it is
+      // called. `ORCHESTRATOR_WAIT_MAX_MS` raises it for a host somebody has
+      // measured themselves — see WAIT_HEARTBEAT_MS.
+      const budget = Math.min(timeoutMs ?? WAIT_TIMEOUT_DEFAULT_MS, waitMax);
       const started = now();
+      const stopHeartbeat = startHeartbeat(extra, budget, () => targets.length);
       try {
         if (targets.length === 1) {
           const r = await manager.wait(targets[0]!, budget);
@@ -490,6 +608,8 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         return ok(renderWaitMany(records, settled, chosen, now() - started, now(), (w) => manager.queueHint(w)));
       } catch (e) {
         return fail(`Could not wait on ${targets.join(", ")}: ${message(e)}`);
+      } finally {
+        stopHeartbeat();
       }
     },
   );
@@ -518,7 +638,7 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
       const t = now();
       // The order matters. `blocked` is settled but has no result, because the
       // result is built at settle and blocking is not settling.
-      if (r.state === "blocked") return ok(renderBlocked(r, t));
+      if (r.state === "blocked") return ok(renderBlocked(r, t, manager.isOrphaned(id)));
       if (!isSettled(r.state)) return ok(renderPending(r, t, manager.queueHint(id)));
       if (!r.result) return ok(renderNoResult(r, t));
       return ok(renderResult(r.result));
@@ -582,9 +702,12 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         "releases the tool call it is waiting at and it carries straight on, keeping everything it was in " +
         "the middle of. Pass `decision: \"deny\"` to refuse it instead. A worker that stopped to ASK YOU " +
         "something has ended its turn, and your answer arrives as its next prompt.\n" +
-        "Returns immediately, before the worker has actually resumed: poll worker_status until it is " +
-        "`running` again. Answer the question as concretely as you can — the worker cannot ask a " +
-        "follow-up without blocking a second time, and each round trip costs it a turn.",
+        "Returns before the worker has finished resuming — poll worker_status until it is `running` — but " +
+        "it does NOT return success unless the answer was accepted. An error here means nothing was " +
+        "delivered and says what to do instead; a worker whose session died with a previous orchestrator " +
+        "process can never be answered and needs worker_recover.\n" +
+        "Answer the question as concretely as you can — the worker cannot ask a follow-up without blocking " +
+        "a second time, and each round trip costs it a turn.",
       inputSchema: {
         id: z.string().max(100).describe("The blocked worker's id."),
         message: z
@@ -598,7 +721,9 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
           .describe(
             "Only meaningful when the worker is waiting on a PERMISSION (its status says " +
               "`permission_required`): whether to grant it. Defaults to allow. Deny when the worker is " +
-              "reaching somewhere it should not — that is what the permission wall is for.",
+              "reaching somewhere it should not — that is what the permission wall is for. A worker that " +
+              "asked to write scratch files OUTSIDE its tree does not need this granted: tell it about the " +
+              "scratch directory its brief already gave it and deny the reach.",
           ),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -606,23 +731,58 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
     async ({ id, message: text, decision }): Promise<ToolResult> => {
       const r = find(id);
       if (!r) return unknown(id);
-      if (r.state !== "blocked") {
+
+      // Asked *before* anything is started, because everything below returns
+      // before the answer has actually landed and a caller cannot tell the
+      // difference. See `WorkerManager.answerability`.
+      const answerable = manager.answerability(id);
+      if (!answerable.ok) {
+        if (answerable.code === "orphaned") {
+          return fail(
+            `Worker ${id} cannot be answered: ${answerable.message}.\n` +
+              `NOTHING WAS DELIVERED. Its work is not lost — the worktree is intact — but no answer can ever reach ` +
+              `this session, so answering again will fail the same way.\n` +
+              `Next: worker_recover({id: "${id}", action: "resume"}) to salvage what it produced, or ` +
+              `action: "discard" to let it go.`,
+          );
+        }
         return fail(
-          `Worker ${id} is ${r.state}, not blocked — nothing is waiting for an answer. ` +
+          `Worker ${id} is ${r.state}, not blocked — nothing is waiting for an answer. NOTHING WAS DELIVERED. ` +
             (isSettled(r.state)
               ? "It has already stopped; read worker_result and spawn a new worker if there is more to do."
               : "It is still working; wait for it to finish or to ask you something."),
         );
       }
+
       // DD-1. `answer()` resolves only once the follow-up prompt is away, which
       // means waiting out the settle guard the session needs before it will
       // accept another prompt — seconds, not milliseconds. Start it and return.
-      void manager.answer(id, text, decision).catch((e: unknown) => {
-        log(`[orchestrator] worker_message(${id}) failed after returning: ${message(e)}`);
-        store.appendEvent(id, "answer_failed", { message: message(e) });
-      });
+      //
+      // But not *instantly*: the check above rules out every failure that is
+      // knowable up front, and this short race catches the ones that are not —
+      // a backend that rejects the prompt, a session the provider has dropped.
+      // Both surface in well under a second, and paying for that once is worth
+      // rather more than a success string that turns out to be false.
+      const settled = manager.answer(id, text, decision).then(
+        () => undefined,
+        (e: unknown) => {
+          log(`[orchestrator] worker_message(${id}) failed: ${message(e)}`);
+          store.appendEvent(id, "answer_failed", { message: message(e) });
+          return e;
+        },
+      );
+      const early = await Promise.race([
+        settled,
+        new Promise<typeof PENDING>((r2) => setTimeout(() => r2(PENDING), ANSWER_CONFIRM_MS)),
+      ]);
+      if (early !== PENDING && early !== undefined) {
+        return fail(
+          `Worker ${id} refused the answer: ${message(early)}.\nNOTHING WAS DELIVERED. ` +
+            `Read worker_status({ids: ["${id}"]}) for where it actually is.`,
+        );
+      }
       return ok(
-        `Answer delivered to ${id}. It is resuming its existing session, which takes a moment.\n` +
+        `Answer accepted by ${id}. It is resuming its existing session, which takes a moment.\n` +
           `Next: worker_status({ids: ["${id}"]}) — it should return to \`running\`, then settle as usual.`,
       );
     },
@@ -686,11 +846,16 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
   server.registerTool(
     "worker_recover",
     {
-      title: "Decide what to do with a worker a crash left behind",
+      title: "Decide what to do with a worker whose session is gone",
       description:
-        "Act on an `interrupted` worker — one a previous orchestrator process was running when it died. " +
-        "Interrupted is a DECISION POINT, not a verdict: nothing was thrown away, the worktree is intact, " +
-        "and its branch still holds whatever it had committed. This is how you resolve it.\n\n" +
+        "Act on a worker this orchestrator process can no longer reach — one a previous process was " +
+        "mid-flight with when it died. That is a DECISION POINT, not a verdict: nothing was thrown away, " +
+        "the worktree is intact, and its branch still holds whatever it had committed. This is how you " +
+        "resolve it.\n\n" +
+        "WHICH WORKERS: any whose session died with the process that owned it, whatever state the row is " +
+        "in — `interrupted` (the usual case, written by the restart sweep) but equally one left `blocked`, " +
+        "`running`, `preparing` or `spawned`. A worker stuck `blocked` on a dead session is the case that " +
+        "matters most: worker_message can never reach it, so this is its ONLY way out.\n\n" +
         "ACTIONS:\n" +
         "- `resume` (usually right) — carry on with the worker. If its session somehow survived the crash " +
         "(only when an OpenCode server outlived the manager) it is re-attached and monitored. Otherwise the " +
@@ -705,7 +870,7 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         "There is no 'retry' action: re-running the same instruction is a new worker, so use worker_spawn. " +
         "Returns immediately; `resume` may queue behind running workers, so poll worker_status.",
       inputSchema: {
-        id: z.string().max(100).describe("The interrupted worker's id."),
+        id: z.string().max(100).describe("The unreachable worker's id."),
         action: z
           .enum(["resume", "fail", "discard"])
           .describe("resume (re-attach or salvage from the worktree) | fail | discard"),

@@ -133,6 +133,55 @@ export function manifestPath(worktree: string): string {
   return join(worktree, ORCHESTRATOR_DIR, MANIFEST_FILE);
 }
 
+// ---------------------------------------------------------------------------
+// Scratch space (§11 Phase 9)
+// ---------------------------------------------------------------------------
+
+/** Where per-worker scratch lives, under {@link ORCHESTRATOR_DIR}. */
+export const SCRATCH_DIR = "scratch";
+
+/**
+ * A worker's own scratch directory, inside its jail.
+ *
+ * The problem this solves is small and cost a whole worker: a worker told to
+ * write a throwaway verification script has nowhere to put it. `/tmp` is outside
+ * its tree and trips the `external_directory` permission wall — deliberately, and
+ * `IMPLEMENT_PERMISSIONS` explains why that wall is not widened — while the
+ * worktree itself is the thing being reconciled, so a scratch file dropped there
+ * shows up in the diff as unclaimed work and reads as a discrepancy. Both
+ * available answers were wrong, so the worker blocked on a permission request
+ * doing exactly what it was asked to do.
+ *
+ * This is the third answer: inside the jail, so no permission is needed; under
+ * `.orchestrator/`, which is already git-excluded and already filtered out of
+ * every changed-file list by {@link EXCLUDED}, so nothing written here can reach
+ * a diff, a snapshot or a reconciliation.
+ *
+ * Per worker rather than per tree, because in `shared` mode the tree is the
+ * user's whole checkout and several workers are in it at once.
+ */
+export function scratchPath(worktree: string, workerID: string): string {
+  return join(worktree, ORCHESTRATOR_DIR, SCRATCH_DIR, workerID);
+}
+
+/**
+ * Create {@link scratchPath} and return it.
+ *
+ * Best-effort by contract: a worker that cannot be given scratch space is a
+ * worker that works the way it did before this existed, not one that fails to
+ * start. The caller passes `undefined` to the brief in that case, and the brief
+ * simply says nothing about scratch.
+ */
+export function ensureScratch(worktree: string, workerID: string): string | undefined {
+  const path = scratchPath(worktree, workerID);
+  try {
+    mkdirSync(path, { recursive: true });
+    return path;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Write the worker's identity next to its work.
  *

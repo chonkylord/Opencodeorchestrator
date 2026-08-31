@@ -25,6 +25,7 @@ export {
 export { type RenderOptions, renderResult } from "./result.js";
 
 export {
+  type Answerability,
   DEFAULT_BUDGET,
   DEFAULT_MAX_RETRIES,
   DEFAULT_MAX_REVISIONS,
@@ -74,6 +75,8 @@ export {
 } from "./merges.js";
 
 export type {
+  ActivityInput,
+  WorkerObserver,
   DiffStat,
   MergeRecord,
   Discrepancy,

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Orchestrator</title>
+    <link rel="stylesheet" href="/app.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230a0a0a'/%3E%3Ccircle cx='8' cy='4' r='1.7' fill='%23fff'/%3E%3Ccircle cx='3.6' cy='12' r='1.4' fill='%23fff'/%3E%3Ccircle cx='8' cy='12' r='1.4' fill='%23fff'/%3E%3Ccircle cx='12.4' cy='12' r='1.4' fill='%23fff'/%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <header class="bar">
+      <div class="bar-id">
+        <span class="mark" aria-hidden="true"></span>
+        <span class="bar-name">orchestrator</span>
+        <span class="bar-repo" id="repo" title="repository root">—</span>
+      </div>
+
+      <div class="bar-stats" id="stats">
+        <div class="stat"><span class="stat-k">running</span><span class="stat-v" id="s-running">0</span></div>
+        <div class="stat"><span class="stat-k">queued</span><span class="stat-v" id="s-queued">0</span></div>
+        <div class="stat"><span class="stat-k">blocked</span><span class="stat-v" id="s-blocked">0</span></div>
+        <div class="stat"><span class="stat-k">done</span><span class="stat-v" id="s-settled">0</span></div>
+        <div class="stat"><span class="stat-k">failed</span><span class="stat-v" id="s-failed">0</span></div>
+        <div class="stat stat-wide">
+          <span class="stat-k">tokens</span><span class="stat-v" id="s-tokens">0</span>
+        </div>
+      </div>
+
+      <div class="bar-actions">
+        <button id="theme" class="ghost" type="button" title="Light / dark" aria-label="Toggle light or dark"></button>
+        <span class="link" id="link"><span class="dot" id="dot"></span><span id="link-text">connecting</span></span>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="pane pane-graph" aria-label="Orchestration graph">
+        <div class="pane-head">
+          <h2>Delegation</h2>
+          <div class="pane-head-meta" id="graph-meta">—</div>
+        </div>
+        <div class="graph-scroll">
+          <svg id="graph" class="graph" role="img" aria-label="Orchestrator and its workers"></svg>
+        </div>
+        <div class="legend" id="legend"></div>
+      </section>
+
+      <section class="pane pane-workers" aria-label="Workers">
+        <div class="pane-head">
+          <h2>Workers</h2>
+          <div class="pane-head-meta"><span id="worker-count">0</span></div>
+        </div>
+        <div class="rows" id="workers"></div>
+      </section>
+
+      <section class="pane pane-detail" aria-label="Worker detail">
+        <div class="pane-head detail-head">
+          <div class="detail-title">
+            <h2 id="d-id">no worker selected</h2>
+            <span class="chip" id="d-state" hidden></span>
+          </div>
+          <nav class="tabs" id="tabs">
+            <button class="tab is-on" data-tab="activity" type="button">Activity</button>
+            <button class="tab" data-tab="events" type="button">Trail</button>
+            <button class="tab" data-tab="result" type="button">Result</button>
+            <button class="tab" data-tab="brief" type="button">Brief</button>
+            <button class="tab" data-tab="diff" type="button">Diff</button>
+          </nav>
+        </div>
+
+        <div class="detail-meta" id="d-meta"></div>
+
+        <div class="panel" id="p-activity">
+          <div class="stream" id="stream">
+            <p class="empty">Select a worker to watch what it is doing.</p>
+          </div>
+          <label class="follow"><input type="checkbox" id="follow" checked /> follow</label>
+        </div>
+        <div class="panel" id="p-events" hidden><div class="trail" id="trail"></div></div>
+        <div class="panel" id="p-result" hidden><div class="result" id="result"></div></div>
+        <div class="panel" id="p-brief" hidden><pre class="pre" id="brief"></pre></div>
+        <div class="panel" id="p-diff" hidden><pre class="pre diff" id="diff"></pre></div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

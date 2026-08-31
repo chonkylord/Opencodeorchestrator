@@ -29,6 +29,27 @@ export interface RunRow {
   readonly meta: Record<string, unknown>;
 }
 
+/**
+ * What one `provider/model` has been observed to support (§11 Phase 9).
+ *
+ * Observations, not documentation: every field here was measured by a real turn
+ * against a real provider, which is why the shape carries the error that proved
+ * it rather than only the verdict.
+ */
+export interface ModelCapability {
+  /** False once the provider has rejected a schema-constrained request. */
+  readonly structuredOutput: boolean;
+  /** When the observation was made. */
+  readonly at: number;
+  /** The provider's own error code, when there was one. */
+  readonly code?: string;
+  /** The provider's message, truncated. Untrusted text (DD-8). */
+  readonly message?: string;
+}
+
+/** `meta` keys holding a {@link ModelCapability}. */
+const MODEL_CAP_PREFIX = "model_cap:";
+
 export interface StoredEvent {
   readonly id: number;
   readonly workerID: string;
@@ -84,10 +105,28 @@ interface MergeRow {
   error: string | null;
 }
 
+/**
+ * Where the index tells somebody it changed (§11 Phase 9).
+ *
+ * Every write in this system passes through {@link Store.putWorker} or
+ * {@link Store.appendEvent} — that is what makes it the right seam for the
+ * dashboard, and the reason Phase 9 added no notification plumbing to the
+ * manager at all. Two callbacks here see everything a dozen call sites do.
+ *
+ * Both are best-effort and are called *after* the row is committed: a subscriber
+ * that throws must not take the write with it.
+ */
+export interface StoreHooks {
+  readonly onWorker?: (record: WorkerRecord) => void;
+  readonly onEvent?: (event: StoredEvent) => void;
+}
+
 export class Store {
   private readonly db: Database;
+  private readonly hooks: StoreHooks;
 
-  constructor(path = ":memory:") {
+  constructor(path = ":memory:", hooks: StoreHooks = {}) {
+    this.hooks = hooks;
     this.db = new Database(path, { create: true });
     // WAL keeps a reader (a run report, a status poll) from blocking the run
     // loop's writes. `:memory:` ignores it, which is fine.
@@ -230,6 +269,7 @@ export class Store {
         JSON.stringify(record.questions),
         record.result ? JSON.stringify(record.result) : null,
       );
+    this.notify(() => this.hooks.onWorker?.(record));
   }
 
   getWorker(id: string): WorkerRecord | undefined {
@@ -255,6 +295,58 @@ export class Store {
       .map(toRecord);
   }
 
+  // --- model capabilities (§11 Phase 9) -----------------------------------
+
+  /**
+   * What a provider has been *observed* to refuse, keyed by `provider/model`.
+   *
+   * Discovering that a model cannot emit a schema-constrained reply costs a
+   * failed turn — the request is rejected, the constraint is dropped and the
+   * turn is re-sent. Before this the discovery was thrown away twice over: it
+   * was held in a single manager-wide boolean, so **one** model's refusal
+   * silenced structured output for **every** model the router might pick next,
+   * and it lived only in memory, so every new process paid for it again.
+   *
+   * Keeping it here fixes both. It belongs in `meta` rather than a table of its
+   * own because DD-7 still holds: this is an observation that can be re-made by
+   * running a worker, so losing it costs one turn, not a run.
+   */
+  putModelCapability(model: string, cap: ModelCapability): void {
+    this.db
+      .query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
+      .run(`${MODEL_CAP_PREFIX}${model}`, JSON.stringify(cap));
+  }
+
+  getModelCapability(model: string): ModelCapability | undefined {
+    const row = this.db
+      .query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?")
+      .get(`${MODEL_CAP_PREFIX}${model}`);
+    if (!row) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(row.value);
+      if (typeof parsed !== "object" || parsed === null) return undefined;
+      return parsed as ModelCapability;
+    } catch {
+      // A row we cannot read is a discovery we have to re-make, which costs one
+      // turn. Refusing to start over it would cost the run.
+      return undefined;
+    }
+  }
+
+  /** Every recorded capability, for seeding a fresh manager and for the dashboard. */
+  listModelCapabilities(): Record<string, ModelCapability> {
+    const rows = this.db
+      .query<{ key: string; value: string }, [string]>("SELECT key, value FROM meta WHERE key LIKE ?")
+      .all(`${MODEL_CAP_PREFIX}%`);
+    const out: Record<string, ModelCapability> = {};
+    for (const r of rows) {
+      const model = r.key.slice(MODEL_CAP_PREFIX.length);
+      const cap = this.getModelCapability(model);
+      if (cap) out[model] = cap;
+    }
+    return out;
+  }
+
   // --- events -------------------------------------------------------------
 
   /**
@@ -266,9 +358,26 @@ export class Store {
    * the context firewall exists to keep out.
    */
   appendEvent(workerID: string, kind: string, detail: Record<string, unknown> = {}): void {
-    this.db
+    const at = Date.now();
+    const info = this.db
       .query("INSERT INTO events (worker_id, at, kind, detail) VALUES (?, ?, ?, ?)")
-      .run(workerID, Date.now(), kind, JSON.stringify(detail));
+      .run(workerID, at, kind, JSON.stringify(detail));
+    this.notify(() => this.hooks.onEvent?.({ id: Number(info.lastInsertRowid), workerID, at, kind, detail }));
+  }
+
+  /**
+   * Run a hook without letting it reach the caller.
+   *
+   * A subscriber is a spectator. The write has already committed by the time
+   * this runs, so the only thing a throw here could achieve is to fail an
+   * orchestration because a dashboard tab is in a bad state.
+   */
+  private notify(fn: () => void): void {
+    try {
+      fn();
+    } catch {
+      /* a spectator does not get to fail the run */
+    }
   }
 
   listEvents(workerID: string, opts: { limit?: number; afterID?: number } = {}): StoredEvent[] {

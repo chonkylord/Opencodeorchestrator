@@ -70,6 +70,7 @@ import {
   defaultWorktreeRoot,
   diffStat,
   listManifests,
+  ensureScratch,
   readReportFile,
   declaredOverlap,
   resolveRepoRoot,
@@ -79,6 +80,8 @@ import {
   writeManifest,
 } from "../workspace/index.js";
 import { type Admission, DEFAULT_MAX_CONCURRENT, DependencyError, type QueueHint, Scheduler } from "./scheduler.js";
+import type { ModelCapability } from "../store/index.js";
+import type { ActivityInput, WorkerObserver } from "./types.js";
 import { type Metric, type MetricsSink, NULL_METRICS } from "./metrics.js";
 import { type RevisionRound, revisionRounds } from "./revisions.js";
 import { type Route, route } from "./routing.js";
@@ -303,6 +306,14 @@ export interface WorkerManagerOptions {
   readonly verifyTests?: boolean;
   /** Constrain the reply to the report schema. Off only to debug a provider. */
   readonly structuredOutput?: boolean;
+  /**
+   * Where the live worker transcript goes (§11 Phase 9).
+   *
+   * The local dashboard, and nothing else. Absent — the default, and what every
+   * test that does not care uses — means the manager never builds an
+   * {@link ActivityInput} at all.
+   */
+  readonly observer?: WorkerObserver;
   readonly now?: () => number;
   readonly newWorkerID?: () => string;
 }
@@ -373,7 +384,35 @@ export interface SharedCollision {
 }
 
 /** §9's three decisions about a worker a dead process left behind. */
+/**
+ * States a worker can be *orphaned* in — mid-flight, with a session this
+ * process does not hold. See {@link WorkerManager.isOrphaned}.
+ *
+ * `interrupted` is absent on purpose: it is already `worker_recover`'s own
+ * state, and a row in it needs no second name for the same condition.
+ */
+const ORPHANABLE: ReadonlySet<WorkerState> = new Set<WorkerState>(["spawned", "preparing", "running", "blocked"]);
+
 export type RecoverAction = "resume" | "fail" | "discard";
+
+/**
+ * Whether an answer can reach a worker, and if not, which of the three reasons.
+ *
+ * See {@link WorkerManager.answerability}. The codes are what the tool layer
+ * branches on to name a recovery, so they are a contract rather than a message.
+ */
+export type Answerability =
+  | { readonly ok: true }
+  | {
+      readonly ok: false;
+      /**
+       * - `unknown` — no such worker, in this process or the index.
+       * - `orphaned` — the row exists and the session does not. `worker_recover`.
+       * - `not_blocked` — live, but nothing is waiting for an answer.
+       */
+      readonly code: "unknown" | "orphaned" | "not_blocked";
+      readonly message: string;
+    };
 
 /** What {@link WorkerManager.recoverWorker} answers with. */
 export type RecoverOutcome =
@@ -592,8 +631,9 @@ const MAX_REVIEW_DISCREPANCIES = 10;
 // ---------------------------------------------------------------------------
 
 export class WorkerManager {
-  private readonly opts: Required<Omit<WorkerManagerOptions, "worktreeRoot" | "models" | "budget">> & {
+  private readonly opts: Required<Omit<WorkerManagerOptions, "worktreeRoot" | "models" | "budget" | "observer">> & {
     worktreeRoot?: string;
+    observer?: WorkerObserver;
     models: Partial<Record<WorkerMode, string>>;
     budget: WorkerBudget;
   };
@@ -605,13 +645,20 @@ export class WorkerManager {
   /** §11 Phase 5's cap, queue and `dependsOn`. See {@link Scheduler}. */
   private readonly scheduler: Scheduler;
   /**
-   * Does this backend's provider actually support schema-constrained replies?
+   * Models observed to reject schema-constrained replies, by `provider/model`.
    *
    * Starts optimistic and latches off the first time a provider rejects the
    * request, so exactly one worker pays for the discovery rather than all of
    * them. See ADR-0002 and `docs/phase0-facts.md` §3.
+   *
+   * **Per model, and durable.** It was neither, and both cost real work. A
+   * single manager-wide boolean meant the free-tier default's refusal — measured
+   * at +1s into a run — silenced structured output for every *other* model the
+   * router might pick, including the ones Phase 8 confirmed can do it; and
+   * holding it only in memory meant every new process re-bought the same failed
+   * turn. Seeded from the index at construction, written back on discovery.
    */
-  private structuredOutputOK: boolean;
+  private readonly structuredOutputDenied = new Set<string>();
   private repoRootResolved: string | undefined;
   private worktreeRootResolved: string | undefined;
   private halted = false;
@@ -623,6 +670,7 @@ export class WorkerManager {
       store: options.store,
       repoRoot: options.repoRoot,
       ...(options.worktreeRoot === undefined ? {} : { worktreeRoot: options.worktreeRoot }),
+      ...(options.observer === undefined ? {} : { observer: options.observer }),
       defaultModel: options.defaultModel ?? DEFAULT_MODEL,
       models: options.models ?? {},
       reviewPool: options.reviewPool ?? [],
@@ -644,13 +692,96 @@ export class WorkerManager {
       now: options.now ?? Date.now,
       newWorkerID: options.newWorkerID ?? (() => `w-${(++this.seq).toString().padStart(3, "0")}`),
     };
-    this.structuredOutputOK = this.opts.structuredOutput;
+    for (const [model, cap] of Object.entries(this.opts.store.listModelCapabilities())) {
+      if (!cap.structuredOutput) this.structuredOutputDenied.add(model);
+    }
     this.scheduler = new Scheduler({
       maxConcurrent: this.opts.maxConcurrent,
       // Live, never cached: a dependency's satisfaction is decided when the
       // queue is pumped, and the index lags the record by a write.
       stateOf: (id) => this.workers.get(id)?.record.current.state ?? this.opts.store.getWorker(id)?.state,
       onEvent: (id, kind, detail) => this.opts.store.appendEvent(id, kind, detail),
+    });
+  }
+
+  /**
+   * Will a turn on this model be sent with the report schema attached?
+   *
+   * False either because structured output is off for the whole manager, or
+   * because this particular model has been observed rejecting it. The second is
+   * the interesting one, and it is worth Claude knowing at spawn rather than
+   * discovering from a result with no report in it: a worker on such a model
+   * still reports, but over §5's report file rather than its own reply, and a
+   * model that manages neither leaves `reportSource: "none"` and a result built
+   * from measurements alone.
+   */
+  supportsStructuredOutput(model: string): boolean {
+    return this.opts.structuredOutput && !this.structuredOutputDenied.has(model);
+  }
+
+  /** What has been observed about a model, if anything. For the dashboard and the tools. */
+  modelCapability(model: string): ModelCapability | undefined {
+    return this.opts.store.getModelCapability(model);
+  }
+
+  /**
+   * Translate one backend frame for the dashboard, or drop it (§11 Phase 9).
+   *
+   * DD-2 lives here: the observer is handed the orchestrator's own vocabulary,
+   * never OpenCode's, so the adapter can be rewritten without the dashboard
+   * noticing. Frames that are pure liveness — heartbeats, stream opens, the
+   * `status` ticks — are dropped rather than translated: they are how the
+   * manager knows the server is alive, and they are not the worker doing
+   * anything.
+   *
+   * Wrapped, because an observer is a diagnostic and a diagnostic that can throw
+   * into the run loop is a diagnostic that can kill a worker.
+   */
+  private observe(w: ManagedWorker, e: OCEvent): void {
+    const observer = this.opts.observer;
+    if (!observer) return;
+    const at = this.opts.now();
+    // `isBlocking` rather than a comparison against the event's own kind string.
+    // DD-2's boundary test forbids naming a raw OpenCode event outside the
+    // adapter, and the normalised kinds share their names with the wire ones —
+    // so the predicate the escalation path already uses is both the correct
+    // abstraction and the one that keeps this file on the right side of it.
+    const entry: ActivityInput | undefined = isBlocking(e)
+      ? { kind: "ask", at, text: "questions" in e ? e.questions.join(" · ") : "permission" in e ? permissionQuestion(e) : "the worker is blocked" }
+      : e.kind === "text"
+        ? { kind: "text", at, text: e.delta }
+        : e.kind === "tool"
+          ? { kind: "tool", at, tool: e.tool, ...(e.title === undefined ? {} : { text: e.title }) }
+          : e.kind === "file.edited"
+            ? { kind: "file", at, file: e.file }
+            : e.kind === "error"
+              ? { kind: "error", at, text: `${e.error.code}: ${e.error.message}` }
+              : undefined;
+    if (!entry) return;
+    try {
+      observer.activity(w.record.current.workerID, entry);
+    } catch {
+      /* an observer is a diagnostic; it does not get to fail a worker */
+    }
+  }
+
+  /** Say something in the worker's live view that did not come from the worker. */
+  private note(workerID: string, text: string): void {
+    try {
+      this.opts.observer?.activity(workerID, { kind: "note", at: this.opts.now(), text });
+    } catch {
+      /* as above */
+    }
+  }
+
+  /** Record a provider's refusal, in memory for this process and in the index for the next. */
+  private denyStructuredOutput(model: string, code: string, message: string): void {
+    this.structuredOutputDenied.add(model);
+    this.opts.store.putModelCapability(model, {
+      structuredOutput: false,
+      at: this.opts.now(),
+      code,
+      message: message.slice(0, 300),
     });
   }
 
@@ -884,6 +1015,21 @@ export class WorkerManager {
   }
 
   /**
+   * The standing contract this worker is running under, if it has one yet.
+   *
+   * For the dashboard (§11 Phase 9). "What did the orchestrator actually tell
+   * it?" is the first question anybody asks about a worker that went sideways,
+   * and until now the only answer was to reconstruct the brief by reading
+   * `buildBrief` with the spec in hand. In memory only, so a worker from a
+   * previous process has none — the brief is rebuilt deterministically from the
+   * spec, which the record still carries.
+   */
+  briefOf(workerID: string): { system: string; text: string } | undefined {
+    const brief = this.workers.get(workerID)?.brief;
+    return brief ? { system: brief.system, text: brief.text } : undefined;
+  }
+
+  /**
    * Wait for a worker to stop needing the manager's attention.
    *
    * Resolves on any settled state, `blocked` included — a blocked worker is
@@ -984,6 +1130,67 @@ export class WorkerManager {
   }
 
   /**
+   * Whether {@link answer} would land, asked *before* anything is started.
+   *
+   * `answer()` is deliberately started-and-returned by `worker_message` (DD-1),
+   * which means its rejection arrives after the tool has already answered. That
+   * is fine for a failure nobody could have predicted and wrong for the three
+   * below, which are all knowable synchronously — and the cost of getting it
+   * wrong was measured in the field: two `worker_message` calls against a worker
+   * whose session no longer existed, both told "answer delivered", with the truth
+   * (`answer_failed: unknown worker w-001`) visible only to whoever thought to
+   * read `worker_output`. A write that did not land must not return a success
+   * string, so the tool asks this first.
+   *
+   * `orphaned` is the one worth naming separately. The row says `blocked` and it
+   * is telling the truth about what the worker was doing; what is gone is the
+   * *session*, along with the in-process handle holding the answer callback. No
+   * answer can ever reach it, so the recovery is `worker_recover`, not a retry.
+   */
+  /**
+   * Is this worker's session unreachable from this process?
+   *
+   * True when the index has a row that was still mid-flight — `spawned`,
+   * `preparing`, `running` or `blocked` — and this process holds no session for
+   * it. That is the whole of what "orphaned" means, and it is deliberately not
+   * the same question as "is its state `interrupted`": `interrupted` is what the
+   * *startup sweep* writes, and a worker can be orphaned without one having run
+   * (an index rebuilt from worktree manifests after startup, or a session lost
+   * under a manager that never restarted).
+   *
+   * A settled worker is never orphaned — there is nothing left to reach it for.
+   */
+  isOrphaned(workerID: string): boolean {
+    if (this.workers.has(workerID)) return false;
+    const stored = this.opts.store.getWorker(workerID);
+    if (!stored) return false;
+    return ORPHANABLE.has(stored.state);
+  }
+
+  answerability(workerID: string): Answerability {
+    const w = this.workers.get(workerID);
+    if (!w) {
+      const stored = this.opts.store.getWorker(workerID);
+      if (!stored) return { ok: false, code: "unknown", message: `unknown worker ${workerID}` };
+      return {
+        ok: false,
+        code: "orphaned",
+        message:
+          `worker ${workerID} belongs to a previous orchestrator process — its row says ${stored.state}, but the ` +
+          "session that would receive the answer is gone, so nothing can be delivered to it",
+      };
+    }
+    if (w.machine.state !== "blocked" || !w.answer) {
+      return {
+        ok: false,
+        code: "not_blocked",
+        message: `worker ${workerID} is ${w.machine.state}, not blocked; nothing is waiting for an answer`,
+      };
+    }
+    return { ok: true };
+  }
+
+  /**
    * Answer a blocked worker (§5's escalation channel).
    *
    * The same session is prompted again, so the worker still has every bit of its
@@ -991,11 +1198,13 @@ export class WorkerManager {
    * worker gets help, and the only way `blocked` is left.
    */
   async answer(workerID: string, text: string, decision?: "allow" | "deny"): Promise<WorkerRecord> {
+    const answerable = this.answerability(workerID);
+    if (!answerable.ok) throw new Error(answerable.message);
     const w = this.workers.get(workerID);
-    if (!w) throw new Error(`unknown worker ${workerID}`);
-    if (w.machine.state !== "blocked" || !w.answer) {
-      throw new Error(`worker ${workerID} is ${w.machine.state}, not blocked; nothing is waiting for an answer`);
-    }
+    const deliver = w?.answer;
+    // Both are ruled out by the check above. Restating them is what carries that
+    // across to the type system, which cannot see through the helper.
+    if (!w || !deliver) throw new Error(`unknown worker ${workerID}`);
     this.opts.store.appendEvent(workerID, "answered", { chars: text.length });
     // Resolve only once the worker is running again. A caller that got the
     // record back while it still said `blocked` would poll, see a settled state
@@ -1003,7 +1212,7 @@ export class WorkerManager {
     const resumed = new Promise<void>((resolve, reject) => {
       w.resumeSignal = { resolve, reject };
     });
-    w.answer({ kind: "answer", text, ...(decision === undefined ? {} : { decision }) });
+    deliver({ kind: "answer", text, ...(decision === undefined ? {} : { decision }) });
     w.answer = undefined;
     await resumed;
     return w.record.current;
@@ -1316,9 +1525,20 @@ export class WorkerManager {
     const stored = this.opts.store.getWorker(workerID);
     if (!stored) throw new Error(`unknown worker ${workerID}`);
     if (this.halted) throw new Error(`the manager is shutting down; ${workerID} cannot be recovered`);
-    if (stored.state !== "interrupted") {
+    // The gate is *session reachability*, not one particular state, and the
+    // difference is not academic — it was a worker nobody could rescue. A row
+    // left `blocked` by a dead process is as unreachable as one left `running`:
+    // the state describes what the worker was doing, and what decides whether
+    // anything can still be done to it is whether this process holds its
+    // session. Keying off `interrupted` alone meant a worker that had reached
+    // `blocked` before the crash was refused by `worker_recover` ("this one has
+    // settled, read worker_result") while `worker_result` correctly reported it
+    // as waiting for an answer that could never arrive. Both tools were right
+    // and the worker was stranded between them.
+    const orphaned = stored.state !== "interrupted" && this.isOrphaned(workerID);
+    if (stored.state !== "interrupted" && !orphaned) {
       throw new Error(
-        `worker ${workerID} is ${stored.state}, not interrupted — worker_recover is for workers a previous manager process left mid-flight. ` +
+        `worker ${workerID} is ${stored.state}, not interrupted — worker_recover is for workers whose session this process no longer has. ` +
           (isSettled(stored.state)
             ? "This one has settled; read worker_result."
             : "This one is live in this process; wait for it, or stop it with worker_stop."),
@@ -1329,6 +1549,22 @@ export class WorkerManager {
     // wrote the row and nothing else. Rebuild one around the stored record so
     // the run loop, the waiters and `dispose()` all see it like any other.
     const w = this.workers.get(workerID) ?? this.adopt(stored);
+
+    // An orphan reaches `interrupted` here rather than at startup, because
+    // startup is not when it became one: `rebuildIndex()` (DD-7) can put a row
+    // back from a worktree manifest long after `recover()` has run, and a
+    // session can be lost without this process restarting at all. The trail
+    // records the move under its own reason so it is distinguishable from the
+    // restart sweep.
+    if (orphaned) {
+      w.machine.apply("interrupt", { reason: "session_unreachable" });
+      this.update(w, { state: w.machine.state, reason: "session_unreachable" });
+      this.opts.store.appendEvent(workerID, "state:interrupted", {
+        from: stored.state,
+        trigger: "interrupt",
+        reason: "session_unreachable",
+      });
+    }
 
     if (action === "fail" || action === "discard") {
       const trigger = action === "fail" ? "fail" : "cancel";
@@ -1742,8 +1978,9 @@ export class WorkerManager {
     // gone terminal — which on OpenCode 1.18.25 is precisely the prompt that is
     // accepted with 204 and then silently dropped. Clearing it here would
     // produce a revision that does nothing at all, for 57 seconds, with no error.
-    // `formatRetried` and `structuredOutputOK` are kept latched too: the
-    // provider has not changed its mind about schema-constrained output.
+    // `formatRetried` is kept latched too, as is the model's recorded
+    // capability: the provider has not changed its mind about schema-constrained
+    // output between one round and the next.
 
     // `drive()` closed the previous subscription in its `finally`, so this round
     // needs a new one — awaited before the prompt goes out, for the reason
@@ -1848,6 +2085,12 @@ export class WorkerManager {
     if (wt.branch !== "") this.writeManifest(w);
     if (w.cancelRequested) return { kind: "cancelled", reason: w.cancelRequested };
 
+    // Made before the brief that names it, so a directory the filesystem refuses
+    // is a brief that says nothing about scratch rather than one that points at
+    // somewhere that is not there.
+    const scratch = rec.mode === "implement" ? ensureScratch(wt.path, rec.workerID) : undefined;
+    if (scratch !== undefined) this.opts.store.appendEvent(rec.workerID, "scratch_ready", { path: scratch });
+
     const base = buildBrief({
       workerID: rec.workerID,
       spec: rec.spec,
@@ -1856,6 +2099,7 @@ export class WorkerManager {
       baseSha: wt.baseSha,
       worktree: wt.path,
       ...(wt.branch === "" ? { shared: true } : {}),
+      ...(scratch === undefined ? {} : { scratch }),
     });
     // A reviewer's standing contract is the same as anyone's; only the turn's
     // instruction differs, because the thing it is being pointed at is not in
@@ -1934,8 +2178,12 @@ export class WorkerManager {
       if (quiet < this.opts.retrySettleMs) await sleepMs(this.opts.retrySettleMs - quiet);
     }
     w.lastPromptText = text;
-    w.usedFormat = this.structuredOutputOK;
+    w.usedFormat = this.supportsStructuredOutput(rec.model);
     w.turnStarted = false;
+    // The live view's only sight of the orchestrator's own side of the
+    // conversation. Without it a resumed or revised worker appears to start
+    // talking again for no reason.
+    this.note(rec.workerID, `prompt sent (${text.length} chars${w.usedFormat ? ", schema attached" : ""})`);
     await this.opts.backend.prompt(w.session!, {
       text,
       ...(w.brief?.system === undefined ? {} : { system: w.brief.system }),
@@ -2068,6 +2316,12 @@ export class WorkerManager {
     // idle timer, or a hung worker on a healthy server looks busy forever.
     if (isWorkerEvent(e)) w.lastWorkerEventAt = this.opts.now();
 
+    // The dashboard's tap (§11 Phase 9). First thing in the handler, before any
+    // branch can return, so what the dashboard shows is what the run loop saw
+    // rather than what it decided. Nothing downstream depends on it and nothing
+    // it does can change a disposition.
+    this.observe(w, e);
+
     // Evidence that the turn we prompted is under way. `busy` is the explicit
     // signal; real work arriving is the implicit one.
     if ((e.kind === "status" && e.busy) || e.kind === "tool" || e.kind === "text" || e.kind === "file.edited" || e.kind === "diff") {
@@ -2159,13 +2413,16 @@ export class WorkerManager {
       // that happens to arrive first spends the one-shot format retry and
       // latches structured output off for the whole backend's life.
       if (w.usedFormat && !w.formatRetried && !e.error.retryable && (e.error.code === "api" || e.error.code === "structured_output")) {
-        // The provider refused the constrained request. Latch it off for every
-        // later worker and re-send this turn plainly, once. Settling here would
-        // fail a worker for a capability it never needed.
+        // The provider refused the constrained request. Latch it off for THIS
+        // MODEL — every later worker on it, and every later process — and re-send
+        // this turn plainly, once. Settling here would fail a worker for a
+        // capability it never needed.
+        const model = w.record.current.model;
         w.formatRetried = true;
-        this.structuredOutputOK = false;
         w.retryAt = this.opts.now();
+        this.denyStructuredOutput(model, e.error.code, e.error.message);
         this.opts.store.appendEvent(w.record.current.workerID, "structured_output_unsupported", {
+          model,
           code: e.error.code,
           message: e.error.message.slice(0, 300),
         });
@@ -2239,6 +2496,7 @@ export class WorkerManager {
   private async enterBlocked(w: ManagedWorker, questions: readonly string[], reason: string): Promise<Disposition | undefined> {
     w.questions = questions;
     w.blockedAt = this.opts.now();
+    this.note(w.record.current.workerID, `blocked: ${reason}`);
     w.machine.apply("block", { reason });
     this.update(w, { state: "blocked", reason, questions: [...questions] });
     this.notify(w);

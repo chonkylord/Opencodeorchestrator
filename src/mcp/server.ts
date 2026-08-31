@@ -33,12 +33,13 @@ import { z } from "zod";
 import { ServeBackend } from "../opencode/index.js";
 import { MergeCoordinator, WorkerManager, type WorkerManagerOptions, fileMetrics } from "../manager/index.js";
 import { Store } from "../store/index.js";
+import { ActivityLog, type Dashboard, startDashboard } from "../observe/index.js";
 import { ensureExcluded } from "../workspace/index.js";
 import { type ServerConfig, loadConfig } from "./config.js";
 import { registerWorkerTools } from "./tools.js";
 
 export const SERVER_NAME = "opencode-orchestrator";
-export const SERVER_VERSION = "0.6.0";
+export const SERVER_VERSION = "0.7.0";
 
 const log = (line: string): void => console.error(`[orchestrator] ${line}`);
 
@@ -49,6 +50,10 @@ export interface Orchestrator {
   readonly merges: MergeCoordinator;
   readonly store: Store;
   readonly config: ServerConfig;
+  /** §11 Phase 9's live transcript ring. Present whether or not the dashboard bound a port. */
+  readonly activity: ActivityLog;
+  /** Absent when the dashboard is switched off, or when its port was unavailable. */
+  readonly dashboard?: Dashboard;
   readonly dispose: () => Promise<void>;
 }
 
@@ -80,6 +85,13 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
   await backend.start();
   log(`backend ready (repo ${config.repoRoot})`);
 
+  // Declared before the store, because the store's hooks close over it and the
+  // dashboard closes over the store. The `dashboard` binding is filled in below;
+  // events that arrive before it exists are simply not broadcast, which is
+  // correct — nothing can be watching yet.
+  const activity = new ActivityLog();
+  let dashboard: Dashboard | undefined;
+
   if (config.dbPath !== ":memory:") mkdirSync(dirname(config.dbPath), { recursive: true });
   // Before the first write into `.orchestrator/`, not when a worker first
   // prepares a worktree. The database and the run reports land there whether or
@@ -90,7 +102,10 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
   await ensureExcluded(config.repoRoot).catch((e: unknown) => {
     log(`could not exclude .orchestrator/ from git status: ${e instanceof Error ? e.message : String(e)}`);
   });
-  const store = new Store(config.dbPath);
+  const store = new Store(config.dbPath, {
+    onWorker: (record) => dashboard?.publishWorker(record.workerID),
+    onEvent: (event) => dashboard?.publishEvent(event),
+  });
 
   const manager = new WorkerManager({
     backend,
@@ -108,6 +123,9 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
     // §11 Phase 7's metrics. Rooted at the repository, beside the run reports,
     // and never on the wire — see `src/manager/metrics.ts`.
     ...(config.dbPath === ":memory:" ? {} : { metrics: fileMetrics(config.repoRoot) }),
+    // §11 Phase 9. The live transcript's only destination: into the ring, out to
+    // the dashboard, never into a tool result.
+    observer: { activity: (workerID, entry) => activity.append(workerID, entry) },
     ...tuning,
   });
 
@@ -124,8 +142,32 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
 
   const merges = new MergeCoordinator({ manager, store, repoRoot: config.repoRoot, log });
 
+  if (config.dashboardPort >= 0) {
+    dashboard = startDashboard({
+      manager,
+      store,
+      activity,
+      repoRoot: config.repoRoot,
+      port: config.dashboardPort,
+      log: (line) => log(`dashboard: ${line}`),
+      server: {
+        name: SERVER_NAME,
+        version: SERVER_VERSION,
+        repoRoot: config.repoRoot,
+        defaultModel: config.defaultModel,
+        workspace: config.workspace,
+        maxConcurrent: config.maxConcurrent,
+        maxRevisions: config.maxRevisions,
+        runBudgetTokens: config.runBudgetTokens,
+        waitMaxMs: config.waitMaxMs,
+        verifyTests: config.verifyTests,
+        startedAt: Date.now(),
+      },
+    });
+  }
+
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
-  registerWorkerTools(server, { manager, store, merges, repoRoot: config.repoRoot, log });
+  registerWorkerTools(server, { manager, store, merges, repoRoot: config.repoRoot, log, waitMaxMs: config.waitMaxMs });
   registerProbe(server);
 
   let disposed = false;
@@ -137,13 +179,17 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
     // complete — a merge killed mid-rollback is the one way this system could
     // leave a repository in a state nobody asked for), then stop the workers,
     // then the backend they talk to, then the index that recorded them.
+    // The dashboard first, and not because it is important: it holds open
+    // connections that would otherwise keep the process alive past everything
+    // else shutting down cleanly.
+    dashboard?.stop();
     await merges.drain().catch((e: unknown) => log(`merge drain: ${String(e)}`));
     await manager.dispose().catch((e: unknown) => log(`manager dispose: ${String(e)}`));
     await backend.dispose().catch((e: unknown) => log(`backend dispose: ${String(e)}`));
     store.close();
   };
 
-  return { server, manager, merges, store, config, dispose };
+  return { server, manager, merges, store, config, activity, ...(dashboard ? { dashboard } : {}), dispose };
 }
 
 /**
@@ -164,20 +210,59 @@ export function registerProbe(server: McpServer): void {
         "MEASUREMENT INSTRUMENT, not part of the orchestrator. Sleeps for delayMs and returns. Used to " +
         "find the host's tool-call timeout by calling it with increasing delays until the call fails; " +
         "the largest delay that still returns is the ceiling worker_wait's cap sits under. Do not call " +
-        "it in the course of ordinary work.",
+        "it in the course of ordinary work.\n\n" +
+        "Pass `progressEveryMs` to measure the OTHER ceiling: the one that applies while the call emits " +
+        "`notifications/progress`. Hosts may reset a tool-call timeout on progress, and whether this one " +
+        "does is the difference between a six-minute wave costing eight worker_wait calls and costing " +
+        "one. Measure both, then set ORCHESTRATOR_WAIT_MAX_MS to half of whichever ceiling you got.",
       inputSchema: {
         delayMs: z.number().int().min(0).max(600_000).describe("How long to sleep before returning, in milliseconds"),
+        progressEveryMs: z
+          .number()
+          .int()
+          .min(250)
+          .max(60_000)
+          .optional()
+          .describe("Emit a progress notification this often while sleeping. Omit for no progress at all."),
       },
       annotations: { readOnlyHint: true, openWorldHint: false, idempotentHint: true },
     },
-    async ({ delayMs }) => {
+    async ({ delayMs, progressEveryMs }, extra) => {
       const started = Date.now();
-      await new Promise((r) => setTimeout(r, delayMs));
+      const token = extra._meta?.progressToken;
+      let sent = 0;
+      const timer =
+        progressEveryMs !== undefined && token !== undefined
+          ? setInterval(() => {
+              sent += 1;
+              void extra
+                .sendNotification({
+                  method: "notifications/progress",
+                  params: { progressToken: token, progress: Date.now() - started, total: delayMs },
+                })
+                .catch(() => {
+                  /* the point of the probe is what the host does, not what it accepts */
+                });
+            }, progressEveryMs)
+          : undefined;
+      try {
+        await new Promise((r) => setTimeout(r, delayMs));
+      } finally {
+        if (timer) clearInterval(timer);
+      }
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify({ requestedMs: delayMs, actualMs: Date.now() - started, returned: true }),
+            text: JSON.stringify({
+              requestedMs: delayMs,
+              actualMs: Date.now() - started,
+              returned: true,
+              progressSent: sent,
+              // Absent means the host asked for no progress, so a run with
+              // `progressEveryMs` set and this false measured nothing new.
+              progressRequested: token !== undefined && progressEveryMs !== undefined,
+            }),
           },
         ],
       };

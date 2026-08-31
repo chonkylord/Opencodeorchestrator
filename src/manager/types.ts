@@ -105,6 +105,53 @@ export interface WorkerSpec {
 /** Where a worker works. See {@link WorkerSpec.workspace}. */
 export type WorkspaceMode = "shared" | "isolated";
 
+/**
+ * One thing a worker was seen doing, on its way past (§11 Phase 9).
+ *
+ * This is the *transcript*, and it exists for exactly one consumer: the local
+ * dashboard. `worker_output`'s description states the rule it must not break —
+ * "this is not the worker's transcript and there is no tool that returns one.
+ * The transcript is what the context firewall keeps out" — and that is still
+ * true of the tool surface. The firewall was never about the *information* being
+ * dangerous, only about what it costs to put a hundred thousand characters of it
+ * through a model's context window one wave at a time. A human watching a
+ * browser tab pays nothing for it.
+ *
+ * So the transcript takes the other exit: out of the manager, into a bounded
+ * in-memory ring, onto a loopback socket, and never into a tool result.
+ *
+ * Neutral by construction (DD-2): no field here names an OpenCode shape, so the
+ * dashboard survives the adapter changing under it.
+ */
+export interface ActivityInput {
+  readonly kind:
+    /** Assistant text as it is generated. Coalesced downstream into one entry per burst. */
+    | "text"
+    /** A tool call the worker made. */
+    | "tool"
+    /** A file the worker edited. */
+    | "file"
+    /** The worker asked for a permission, or asked the orchestrator a question. */
+    | "ask"
+    /** A provider or adapter error on this worker's stream. */
+    | "error"
+    /** Anything the orchestrator itself wants shown inline. */
+    | "note";
+  readonly at: number;
+  /** Untrusted worker text (DD-8). Bounded by the ring, never interpreted. */
+  readonly text?: string;
+  readonly tool?: string;
+  readonly file?: string;
+}
+
+/**
+ * Where {@link ActivityInput} goes. Optional everywhere: a manager with no
+ * observer behaves exactly as it did before Phase 9.
+ */
+export interface WorkerObserver {
+  readonly activity: (workerID: string, entry: ActivityInput) => void;
+}
+
 /** One claimed file change, straight from the worker's report (§4.2). */
 export interface ReportedChange {
   readonly file: string;

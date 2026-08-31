@@ -210,7 +210,16 @@ function nextStep(r: WorkerRecord, hint?: QueueHint): string {
  * is the null-dereference this whole function exists to prevent — and the empty
  * summary it would print instead reads exactly like a worker that did nothing.
  */
-export function renderBlocked(r: WorkerRecord, now: number): string {
+/**
+ * A worker waiting on an answer.
+ *
+ * `orphaned` is the correction Phase 9 owed this renderer. A `blocked` row whose
+ * session died with a previous process reads identically to a live one, and
+ * telling Claude to answer it sends it to a tool that cannot possibly work —
+ * which is exactly the loop that was measured in the field. When the session is
+ * unreachable this says so and names `worker_recover` instead.
+ */
+export function renderBlocked(r: WorkerRecord, now: number, orphaned = false): string {
   const questions = r.questions.slice(0, MAX_QUESTIONS).map((q) => `${QUOTE}${clampChars(q, QUESTION_CHARS)}`);
   const more = r.questions.length > MAX_QUESTIONS ? `\n  …and ${r.questions.length - MAX_QUESTIONS} more` : "";
   return [
@@ -218,12 +227,21 @@ export function renderBlocked(r: WorkerRecord, now: number): string {
       `${r.reason ? ` (${r.reason})` : ""} · ${duration(elapsedMs(r, now))} · ${spend(r.totalTokens, r.cost)}`,
     `Task: ${clampChars(r.task, TASK_CHARS)}`,
     "",
-    "The worker stopped to ask. It has no result yet — it is waiting, not finished,",
-    "and it will be timed out if nothing answers it. Its questions, in its own words:",
+    orphaned
+      ? "The worker stopped to ask, and then the process holding its session ended.\nIts questions are below, and NOTHING CAN ANSWER THEM ANY MORE:"
+      : "The worker stopped to ask. It has no result yet — it is waiting, not finished,\nand it will be timed out if nothing answers it. Its questions, in its own words:",
     questions.length > 0 ? questions.join("\n") + more : `${QUOTE}(the worker blocked without saying why)`,
     "",
-    `Answer with worker_message({id: "${r.workerID}", message: "…"}). The same session is`,
-    "reused, so the worker keeps everything it has already read and worked out.",
+    ...(orphaned
+      ? [
+          `worker_message would fail. Use worker_recover({id: "${r.workerID}", action: "resume"}) —`,
+          "its worktree is intact, so the orchestrator can salvage what it produced into a real",
+          `result. action: "discard" lets it go instead.`,
+        ]
+      : [
+          `Answer with worker_message({id: "${r.workerID}", message: "…"}). The same session is`,
+          "reused, so the worker keeps everything it has already read and worked out.",
+        ]),
   ].join("\n");
 }
 
@@ -833,5 +851,32 @@ export function sharedPathWarning(
     `WARNING: it claims paths already claimed by ${who}. They are in the SAME working tree, so they will not ` +
     "conflict — they will overwrite each other, and the last write wins with nothing to catch it. Narrow one " +
     'of the path lists, sequence them with `dependsOn`, or give one `workspace: "isolated"`.\n'
+  );
+}
+
+/**
+ * A capability the chosen model has been *observed* to lack (§11 Phase 9).
+ *
+ * Printed at spawn because that is when it can still be acted on. The refusal
+ * itself is discovered a second into the run and recorded as
+ * `structured_output_unsupported` in the audit trail — where, in the run this
+ * was written for, nobody read it, and the missing final report it explained
+ * looked like a worker that had simply not reported. One line here converts a
+ * buried forensic event into a fact Claude has before it decides anything.
+ *
+ * Only ever printed for a model something is actually known about: silence means
+ * the schema is going out with the prompt, which is the ordinary case.
+ */
+export function modelCapabilityNote(
+  manager: { supportsStructuredOutput(model: string): boolean },
+  model: string,
+): string {
+  if (manager.supportsStructuredOutput(model)) return "";
+  return (
+    `NOTE: ${model} has been measured rejecting schema-constrained replies, so this worker's turn goes out ` +
+    "without the report schema attached. It still reports — over the report file — but its report is prose " +
+    "the orchestrator parses rather than a structure the provider guarantees, so `reportSource` may be " +
+    "`report_file` or `none`. The measurements (diff, tests, discrepancies) are unaffected and are the half " +
+    "that carries the evidence. Pass an explicit `model` to use one that supports it.\n"
   );
 }

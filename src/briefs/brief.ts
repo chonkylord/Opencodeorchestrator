@@ -43,6 +43,13 @@ export interface BriefContext {
    * do not tidy anything you did not write".
    */
   readonly shared?: boolean;
+  /**
+   * Absolute path of this worker's scratch directory (§11 Phase 9).
+   *
+   * Undefined when none could be made, in which case the brief says nothing
+   * about scratch rather than pointing at a directory that is not there.
+   */
+  readonly scratch?: string;
 }
 
 const MODE_RULES: Readonly<Record<WorkerMode, readonly string[]>> = {
@@ -96,6 +103,22 @@ export function buildBrief(ctx: BriefContext): Brief {
 
   lines.push("## Constraints");
   lines.push(`- Work only inside ${worktree}. Never read or write outside it.`);
+  // Before the ownership rules rather than after, because it is the exception to
+  // them and a worker that reads "do not edit outside your paths" first will
+  // block on a scratch file instead of writing one. Only `implement` gets it:
+  // the read-only modes have `edit` denied at the session, so offering them a
+  // directory they cannot write to would be an invitation to a refused tool call.
+  if (ctx.scratch !== undefined && mode === "implement") {
+    lines.push(
+      `- Scratch space: \`${ctx.scratch}\`. Put throwaway files there — verification scripts,`,
+      "  captured output, notes to yourself, anything you need to write but are not delivering.",
+      "  It is inside your tree so it needs no permission, and it is excluded from the diff, so",
+      "  nothing you leave there is counted as your work or reported as an unclaimed change.",
+      "- Do not write scratch files to /tmp or anywhere else outside your tree. That reaches",
+      "  outside your jail, stops you at a permission wall, and costs you a turn waiting on an",
+      "  answer — use the directory above instead.",
+    );
+  }
   if (ctx.shared) {
     // The single most important thing a shared worker can be told, and the one
     // an isolated worker never needed to hear: the tree is not yours.

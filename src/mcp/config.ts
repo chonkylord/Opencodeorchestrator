@@ -22,6 +22,8 @@ import {
   clampConcurrency,
   parseModelPool,
 } from "../manager/index.js";
+import { DEFAULT_DASHBOARD_PORT } from "../observe/index.js";
+import { clampWaitMax } from "./tools.js";
 
 export interface ServerConfig {
   /** The repository the workers branch from. */
@@ -99,6 +101,32 @@ export interface ServerConfig {
    * other. `ORCHESTRATOR_WORKSPACE`.
    */
   readonly workspace: WorkspaceMode;
+  /**
+   * `worker_wait`'s cap, in milliseconds (§11 Phase 9).
+   *
+   * Defaults to 30,000 — half the one host ceiling anybody has measured. Raise
+   * it only after measuring your own with `orchestrator_timeout_probe`, and
+   * measure it *with* `progressEveryMs`, because a host that resets its timeout
+   * on progress notifications has a completely different ceiling from one that
+   * does not. Setting it past what your host will actually wait for does not
+   * buy longer waits; it turns every wait into a failed tool call, and a failed
+   * wait leaves a worker running with nobody watching it.
+   */
+  readonly waitMaxMs: number;
+  /**
+   * The local dashboard's port (§11 Phase 9), or a negative number to switch it
+   * off entirely.
+   *
+   * `ORCHESTRATOR_DASHBOARD_PORT`; `ORCHESTRATOR_DASHBOARD=0` turns it off. `0`
+   * asks the operating system for any free port, which is what you want when
+   * several orchestrators run at once — the URL is printed to stderr at startup
+   * either way.
+   *
+   * It binds 127.0.0.1 and serves `GET` only. That is not configurable: a
+   * dashboard reachable from the network, or one that can act on a worker, is a
+   * different and much more dangerous program than this one.
+   */
+  readonly dashboardPort: number;
 }
 
 /** `.orchestrator/` is already git-excluded for the worktrees; the index joins it. */
@@ -140,7 +168,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     // orchestrator is meant to be used in, and a typo should not silently opt a
     // user into the slower one.
     workspace: env["ORCHESTRATOR_WORKSPACE"] === "isolated" ? "isolated" : "shared",
+    waitMaxMs: clampWaitMax(numberOr(env["ORCHESTRATOR_WAIT_MAX_MS"])),
+    dashboardPort: dashboardPort(env),
   };
+}
+
+/**
+ * Off, on a fixed port, or on whatever the OS has.
+ *
+ * On by default. The whole point of Phase 9 is that a user running an
+ * orchestration can see it, and a dashboard you have to know an environment
+ * variable to switch on is one most people never learn exists. Opting out is one
+ * variable; a port collision costs a log line and nothing else.
+ */
+function dashboardPort(env: NodeJS.ProcessEnv): number {
+  if (env["ORCHESTRATOR_DASHBOARD"] === "0" || env["ORCHESTRATOR_DASHBOARD"] === "off") return -1;
+  const raw = numberOr(env["ORCHESTRATOR_DASHBOARD_PORT"]);
+  if (raw === undefined) return DEFAULT_DASHBOARD_PORT;
+  // A port outside the legal range is a typo, and a typo should not silently
+  // disable the dashboard — that is what the explicit off switch is for.
+  const port = Math.floor(raw);
+  return port >= 0 && port <= 65_535 ? port : DEFAULT_DASHBOARD_PORT;
 }
 
 function numberOr(raw: string | undefined): number | undefined {

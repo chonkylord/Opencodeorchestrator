@@ -35,6 +35,17 @@ a reviewer is routed away from the model that wrote the code so its critique is 
 independent read rather than the author marking its own homework, along with
 model-routing presets and worker priorities.
 
+Phase 9 came from **running the thing** rather than building more of it, and it
+has two halves. The first is [five defects one real orchestration
+found](docs/adr/0009-the-orchestration-loop-defects.md) — a `worker_message` that
+reported an answer delivered when the write had thrown, a `worker_recover` that
+refused the one worker nothing else could rescue, a worker with nowhere to put a
+scratch file, a model capability buried in an audit event nobody read, and the
+polling cost of a 30-second wait cap. The second is the **local dashboard** at
+`http://127.0.0.1:4180`: the context firewall has two sides, and until now the
+human was on the wrong one. See [ADR-0010](docs/adr/0010-the-dashboard.md) and
+[Watching a run](#watching-a-run-http12700141804180).
+
 **What this is not.** Phase 8 is `(ongoing)` and two of its six items are not
 here: **container sandboxing** is blocked in this environment rather than deferred
 (the Docker client is installed and there is no daemon, so nothing written for it
@@ -189,7 +200,8 @@ Where no second model is configured the review still happens, and `worker_result
 says in so many words that it is a second opinion from the same mind rather than
 independent evidence.
 
-**The rest of Phase 8 is next** — see [`projectplan.md`](projectplan.md) §11.
+**Phase 9 is done and its two remaining unknowns are named** — see
+[`projectplan.md`](projectplan.md) §11.
 
 ## Requirements
 
@@ -270,6 +282,9 @@ is one more thing to find.
 | `ORCHESTRATOR_RUN_BUDGET_TOKENS` | `2000000` | §8's global cap, in tokens across every worker sharing a `runID`. Per-worker budgets stop one worker running away; this stops a *wave* doing it — six workers each dutifully inside their own ceiling still spend six ceilings. Refuses a spawn rather than killing what is running, and is checked again before a queued worker opens a session. `0` disables it; there is no upper clamp, because a big number is somebody who has measured their own spend. |
 | `ORCHESTRATOR_MODEL_IMPLEMENT`<br>`ORCHESTRATOR_MODEL_RESEARCH`<br>`ORCHESTRATOR_MODEL_REVIEW` | *(unset)* | DD-9's per-mode model presets. Unset means every worker takes `ORCHESTRATOR_MODEL`. |
 | `ORCHESTRATOR_REVIEW_POOL` | *(unset)* | Comma-separated models a `review` worker may be routed to, in preference order — the first that is **not** the model which wrote the code under review. This is what makes a critique an independent read rather than the author marking its own homework. Unset means reviews fall back to the preset or the default, which may well be the author's own model; `worker_result` says which kind of review you got either way. |
+| `ORCHESTRATOR_DASHBOARD_PORT` | `4180` | The local dashboard's port. `0` takes any free port, which is what you want when several orchestrators run at once; the URL is printed to stderr at startup either way. A port outside 0–65535 falls back to the default rather than silently disabling it. |
+| `ORCHESTRATOR_DASHBOARD` | `1` | Set `0` or `off` to not start the dashboard at all. Nothing binds a socket; the transcript ring is still filled, since it costs nothing. |
+| `ORCHESTRATOR_WAIT_MAX_MS` | `30000` | `worker_wait`'s cap. The default is half the one host ceiling anybody has measured (60s, Claude Code 2.1.251). **Raise it only after measuring your own** — see [Making `worker_wait` wait longer](#making-worker_wait-wait-longer). A cap past what your host will actually wait for does not buy longer waits; it turns every wait into a failed tool call, and a failed wait leaves a worker running with nobody watching it. Clamped to 1s–600s. |
 | `ORCHESTRATOR_WORKSPACE` | `shared` | Where workers work. `shared` puts every worker in **your repository**, together, the way Claude's native subagents behave — no branch, nothing committed for you, no merge because the work is already in your tree. `isolated` gives each its own worktree and branch behind the gated merge: stronger evidence, at the cost of workers not seeing each other. Only an exact `isolated` opts out; a typo leaves you on the default. Per-worker override: `worker_spawn({workspace})`. |
 
 ```bash
@@ -282,6 +297,73 @@ claude mcp add orchestrator \
 `.orchestrator/` is added to the repository's `.git/info/exclude` — local and
 uncommitted, because your `.gitignore` is yours.
 
+### Watching a run: `http://127.0.0.1:4180`
+
+The server starts a dashboard and logs the URL. It is the other side of the
+context firewall.
+
+Everything under `src/mcp/` exists to keep worker transcripts *out* of Claude's
+context — a whole spawn→poll→result round trip costs under 2k tokens where the
+raw stream would cost fifty times that. It works, and it has a side effect nobody
+designed: the human, who has no context window and no token budget, ends up
+seeing **less than Claude does**. The dashboard is the same data with the
+opposite constraint — as much of it as there is, live, on a socket nobody is
+billed for.
+
+What it shows:
+
+- **Claude at the top, the workers below it**, as a graph. Dependency edges are
+  dashed and drawn under the row, so delegation and sequencing never read as the
+  same relationship. Node order is spawn order and never moves.
+- **Every worker's live activity** — its text as it generates, its tool calls,
+  its file edits, its questions. This is the transcript, and it is the one thing
+  no MCP tool will ever return you.
+- **Its brief**, so "what did Claude actually tell it?" is one click rather than a
+  reconstruction.
+- **Its result**, with the worker's claims and the orchestrator's measurements
+  visually distinct, and the discrepancies between them called out (DD-4).
+- The lifecycle trail, and the diff.
+
+Three things it deliberately does not do:
+
+- **It never acts.** Loopback-bound and `GET`-only; no endpoint stops a worker,
+  answers one or spawns one. Control stays on the MCP surface where it is Claude's
+  and is audited. A localhost page that can mutate a running orchestration is a
+  CSRF target for any other tab in the same browser.
+- **It never costs Claude a token.** No tool result grew for it and no tool was
+  added. The human's view got wider; the model's context did not move.
+- **It needs no build step and no network.** Three files, vanilla JS, served off
+  disk.
+
+A port already in use logs one line and is stepped over — the orchestration runs
+regardless. See [ADR-0010](docs/adr/0010-the-dashboard.md).
+
+### Making `worker_wait` wait longer
+
+A six-minute wave costs about eight `worker_wait` calls at the default cap, seven
+of which return "still running". The fix is not a bigger number: it is finding
+out what your host will actually tolerate.
+
+`worker_wait` emits `notifications/progress` every 10 seconds while it blocks. A
+host **may** reset its tool-call timeout when one arrives — the MCP spec permits
+it, and permits capping it too — so the ceiling with heartbeats can be much
+higher than without. Measure both with the probe that has been in this repo since
+Phase 0 for exactly this purpose:
+
+```
+orchestrator_timeout_probe({delayMs: 55000})                        # the plain ceiling
+orchestrator_timeout_probe({delayMs: 240000, progressEveryMs: 10000}) # with heartbeats
+```
+
+Increase `delayMs` until the call fails; the host says its own limit in the
+error. Then set `ORCHESTRATOR_WAIT_MAX_MS` to **half** whichever ceiling you got —
+the other half pays for the tool's own work and the transport, and a wait that
+loses its race with the host leaves a worker running unwatched.
+
+There is no way for an MCP server to do better than this. A server cannot start a
+turn on its host, so there is no "notify me when it is done" path to hook;
+progress notifications are the whole of what the protocol offers.
+
 ### The tools
 
 | Tool | What it is for |
@@ -290,10 +372,10 @@ uncommitted, because your `.gitignore` is yours.
 | `worker_status` | Where workers are. Cheap, safe to poll. |
 | `worker_wait` | Block until one — or any, or all, of several — settles, capped. Cheaper than polling. |
 | `worker_result` | The §4.3 result — the default thing to read. |
-| `worker_output` | The lifecycle audit trail, paginated. Debugging only. |
+| `worker_output` | The lifecycle audit trail, paginated. Debugging only. Not the transcript — that is on the dashboard. |
 | `worker_message` | Answer a blocked worker; the session is reused. |
 | `worker_revise` | Send a settled worker back with feedback; same session, capped, with a terminal report at the cap. |
-| `worker_recover` | Resolve a worker a crash left behind: resume (or salvage from its worktree), fail, or discard. |
+| `worker_recover` | Resolve a worker whose session this process no longer has — whatever state its row is in. Resume (or salvage from its worktree), fail, or discard. |
 | `worker_budget` | Give a worker more tokens or wall clock, so an exhausted one can be carried on rather than lost. |
 | `worker_stop` | Graceful abort, with the worktree snapshotted. |
 | `worker_list` | Inventory, filterable by state and run. |
@@ -350,6 +432,8 @@ src/briefs/     Task brief out, report in, and the reconciliation between them
 src/workspace/  Worktrees, snapshot commits, diffs, overlap, the gated merge, cleanup
 src/store/      SQLite — an index over worktrees that carry their own manifests
 src/mcp/        The MCP server and its thirteen tools — what Claude sees
+src/observe/    The other side of the firewall: the transcript ring, the snapshot, the dashboard server
+src/ui/         The dashboard itself — three files, no build step, no CDN
 test/ocmock/    Scriptable fake OpenCode server
 test/fixtures/  The golden repo
 docs/adr/       Decision records

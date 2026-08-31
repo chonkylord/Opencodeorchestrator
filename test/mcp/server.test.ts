@@ -79,6 +79,8 @@ describe("configuration", () => {
       // comma should cost nothing, like every other value in this file.
       reviewPool: ["acme/one", "acme/two"],
       workspace: "isolated",
+      waitMaxMs: 30_000,
+      dashboardPort: 4180,
     });
     // `:memory:` is a SQLite keyword, not a path, and must survive resolution.
     expect(loadConfig({ ORCHESTRATOR_DB: ":memory:" }, "/x").dbPath).toBe(":memory:");
@@ -157,6 +159,8 @@ describe("start-up and recovery (§9)", () => {
     // These suites are about ISOLATION — worktrees, branches, the merge gate.
     // Phase 8 made `shared` the product default, so they now say so explicitly.
     workspace: "isolated",
+    waitMaxMs: 30_000,
+    dashboardPort: -1,
     };
 
     const first = await createOrchestrator(config, { tickMs: 10, abortGraceMs: 200 });
@@ -210,6 +214,8 @@ describe("start-up and recovery (§9)", () => {
     models: {},
     reviewPool: [],
     workspace: "isolated",
+    waitMaxMs: 30_000,
+    dashboardPort: -1,
       },
       { tickMs: 10, abortGraceMs: 200 },
     );

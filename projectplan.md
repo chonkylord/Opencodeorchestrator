@@ -672,6 +672,103 @@ Verified live on **2026-08-30**: two concurrent workers in one checkout with a p
 - **Container sandboxing** — *blocked here, not deferred by choice.* The Docker client is installed and there is no daemon (`/var/run/docker.sock` does not exist), so nothing written for it could be run even once. An isolation mechanism that has never executed is worse than none.
 - **Smarter summarization** — *no measurement says it is needed.* §8's context targets were verified as met in Phase 3 and nothing since has moved them. Rewriting the render caps without evidence would change the one part of this system whose budget is already measured.
 
+### Phase 9 — Usability, and the dashboard ✅ COMPLETE
+
+Five defects a real orchestration found, and §15's deferred web dashboard.
+
+> Outcome: [ADR-0009](docs/adr/0009-the-orchestration-loop-defects.md) and
+> [ADR-0010](docs/adr/0010-the-dashboard.md). New: [`src/observe/`](src/observe/)
+> (the transcript ring, the snapshot builder, the dashboard server) and
+> [`src/ui/`](src/ui/) (three files, no build step). Tests: 59 new, **434 total
+> green** (5 skipped).
+
+**This phase was not planned. It came from running the system**, which every
+phase before it had done only at its own boundaries and never as somebody trying
+to get work done. One orchestration against a real repository, on the free-tier
+default, produced five findings — and not one of them is a mechanism failing. They
+are correct mechanisms reporting themselves incorrectly, which is the class of
+defect a passing suite is precisely the wrong instrument for.
+
+**The five, in the order the run ranked them:**
+
+- **`worker_wait` costs eight calls where it should cost one.** A six-minute task
+  spends ~8 blocking calls, seven of which return "still running". The proposed
+  fix — hook the host's background-task notification path — *does not exist for an
+  MCP server*, which is worth stating plainly because the suggestion recurs: a
+  server answers requests, it cannot start a turn. What the protocol does offer is
+  `notifications/progress`, which a host **may** treat as resetting its tool-call
+  timeout. So `worker_wait` now heartbeats every 10s, the cap moved into
+  `ORCHESTRATOR_WAIT_MAX_MS`, and `orchestrator_timeout_probe` gained
+  `progressEveryMs` so the ceiling *with* heartbeats can be measured rather than
+  assumed. **The default did not move**, and this is the one item here whose
+  benefit is conditional on a measurement nobody has taken yet.
+- **`worker_message` reported success on a failed write** — "Answer delivered to
+  w-001", twice, against an audit trail reading `answer_failed message=unknown
+  worker w-001`. DD-1's start-and-return was deferring the *knowable* failures
+  along with the unknowable ones. `answerability()` now answers synchronously
+  (`unknown` / `orphaned` / `not_blocked`), and everything else is caught by
+  racing the started promise for 1,200ms — real rejections arrive in tens of
+  milliseconds, a real success takes seconds, so the two never blur.
+- **No recovery path for a worker orphaned in `blocked`.** `worker_recover` gated
+  on `state === "interrupted"`, so it refused ("this one has settled, read
+  worker_result") while `worker_result` correctly said the worker was waiting for
+  an answer that could never arrive. Both tools right, worker stranded. The gate
+  now keys off **session reachability** — `isOrphaned()` — which is also correct
+  for two cases the run did not hit: an index rebuilt from manifests after the
+  startup sweep, and a session lost without a restart.
+- **The `/tmp` permission wall was avoidable.** A worker asked to write a
+  verification script had nowhere legal to put it: `/tmp` trips
+  `external_directory` (deliberately — that wall is a jail signal worth keeping)
+  and the worktree is the thing being reconciled, so a scratch file there reads as
+  an unclaimed change. Every `implement` worker now gets
+  `<tree>/.orchestrator/scratch/<id>` — inside the jail, already excluded from
+  every changed-file list — and the brief names it.
+- **Model routing ignored a capability gap.** `structured_output_unsupported`
+  fired at +1s and was recorded as an audit event nobody read. Worse: the latch
+  was a single manager-wide boolean, so one model's refusal silenced structured
+  output for **every** model the Phase 8 router might pick, and it lived only in
+  memory, so each new process re-bought the same failed turn. It is per
+  `provider/model` now, persisted in `meta`, and named at spawn.
+
+**And the dashboard — §15's, deferred out of v1 and by every phase since.**
+
+The reason to build it now is not telemetry. It is that this system's central
+design decision is a context firewall, and **a firewall has two sides.**
+`src/mcp/` keeps worker transcripts out of Claude's context and succeeds — under
+2k tokens for a whole round trip, against fifty times that for the raw stream. The
+side effect nobody designed is that the human, who has no context window and no
+token budget, ends up seeing *less than Claude does*. `worker_output` states the
+rule: "there is no tool that returns [the transcript]". That stays true. The
+transcript now takes the other exit — manager → bounded ring → SSE → browser —
+and reaches no tool result, ever.
+
+- Claude at the top of the graph, workers below, dependency edges dashed and
+  drawn beneath the row so delegation and sequencing never read alike. Node order
+  is spawn order and never moves.
+- Per worker: the live activity stream, the brief, the result, the trail, the diff.
+- **Loopback and `GET`-only.** Control stays on the MCP surface where it is
+  audited; a localhost page that can mutate an orchestration is a CSRF target for
+  any tab in the same browser. Enforced before routing, and asserted in the suite
+  along with the traversal guard.
+- **No build step, no CDN, no framework.** Three files off disk.
+- DD-8 (worker text enters the DOM only as `textContent`) and DD-4 (claims and
+  measurements never share a visual treatment) carry over. One rule is the
+  dashboard's own: **state is shape, never colour** — the states it renders are
+  exactly the set a colour-coded board renders illegibly to ~8% of men.
+
+The seam that made it cheap: **`Store.putWorker` and `Store.appendEvent` are
+already the choke points every state change passes through.** Two optional hooks
+there replaced what would otherwise have been a dozen publish calls threaded
+through the manager. Only the live transcript needed a manager tap, because only
+it does not pass through the index.
+
+**Not done, and stated rather than implied:** whether the `worker_wait` heartbeat
+actually buys a longer ceiling on Claude Code is **unmeasured** — the probe and
+the procedure are in the README, and the answer is one live session away. And the
+run's widest finding has no code in it at all: *worker quality tracked brief
+specificity far more than model choice.* Nothing here improves that, and no tool
+can — it is a property of what Claude writes into `worker_spawn`.
+
 **Total: ~3.5–4.5 weeks solo to a hardened v1.**
 
 ---
@@ -722,7 +819,12 @@ Everything above is structured so that wrong answers to any of these change **on
 - Arbitrary task DAGs (keep `dependsOn` flat for now)
 - ~~Automatic model selection based on task classification~~ — **partly built in Phase 8.** Selection by *mode* and by review diversity is automatic and deterministic ([ADR-0007](docs/adr/0007-model-routing-and-review-diversity.md)). Classification of the **task text** is still deferred, and deliberately: the only way to do it properly is a model call, and a wrong classification routes work to the wrong model silently.
 - ~~Cross-model adversarial review as default rather than option~~ — **built in Phase 8.** A reviewer is routed away from the author's model wherever another is configured; where none is, the review still happens and says it is not independent.
-- Web dashboard for run telemetry
+- ~~Web dashboard for run telemetry~~ — **built in Phase 9, and it is not
+  telemetry.** The context firewall has two sides and the human was on the wrong
+  one: `src/mcp/` keeps the worker transcript out of Claude's context so
+  successfully that the person whose repository is being edited could see less
+  than the model. The dashboard is the same data with the opposite constraint —
+  live, loopback, read-only, and free ([ADR-0010](docs/adr/0010-the-dashboard.md)).
 - Orchestrator-in-a-container for remote/CI execution
 
 ---
