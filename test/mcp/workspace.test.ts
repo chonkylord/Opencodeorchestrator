@@ -61,6 +61,7 @@ async function harness(mockOpts: Parameters<typeof OCMock.start>[0] = {}): Promi
     // Off in tests: a fixed port would collide across parallel test files, and
     // nothing here is asserting on the dashboard.
     dashboardPort: -1,
+    permissionMode: "full",
   };
   const orchestrator = await createOrchestrator(config, {
     tickMs: 10,

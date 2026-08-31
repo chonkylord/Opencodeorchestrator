@@ -79,6 +79,7 @@ async function harness(
     waitMaxMs: 30_000,
     // A fixed port would collide with the other suites running alongside.
     dashboardPort: -1,
+    permissionMode: "full",
     ...configOver,
   };
   const orchestrator = await createOrchestrator(config, {

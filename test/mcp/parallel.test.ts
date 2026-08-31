@@ -76,6 +76,7 @@ async function harness(
     // Off in tests: a fixed port would collide across parallel test files, and
     // nothing here is asserting on the dashboard.
     dashboardPort: -1,
+    permissionMode: "full",
     ...configOver,
   };
   const orchestrator = await createOrchestrator(config, {

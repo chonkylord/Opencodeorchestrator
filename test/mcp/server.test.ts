@@ -81,6 +81,7 @@ describe("configuration", () => {
       workspace: "isolated",
       waitMaxMs: 30_000,
       dashboardPort: 4180,
+      permissionMode: "full",
     });
     // `:memory:` is a SQLite keyword, not a path, and must survive resolution.
     expect(loadConfig({ ORCHESTRATOR_DB: ":memory:" }, "/x").dbPath).toBe(":memory:");
@@ -161,6 +162,7 @@ describe("start-up and recovery (§9)", () => {
     workspace: "isolated",
     waitMaxMs: 30_000,
     dashboardPort: -1,
+    permissionMode: "full",
     };
 
     const first = await createOrchestrator(config, { tickMs: 10, abortGraceMs: 200 });
@@ -216,6 +218,7 @@ describe("start-up and recovery (§9)", () => {
     workspace: "isolated",
     waitMaxMs: 30_000,
     dashboardPort: -1,
+    permissionMode: "full",
       },
       { tickMs: 10, abortGraceMs: 200 },
     );

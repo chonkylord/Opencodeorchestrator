@@ -12,6 +12,7 @@ export {
   type CreateSessionOptions,
   type EventStream,
   type EventStreamOptions,
+  FULL_PERMISSIONS,
   HEADLESS_PERMISSIONS,
   type ModelRef,
   NotImplementedError,

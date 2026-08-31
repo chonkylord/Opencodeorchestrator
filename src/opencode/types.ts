@@ -67,6 +67,30 @@ export const HEADLESS_PERMISSIONS: readonly PermissionRule[] = [
   { permission: "bash", pattern: "**", action: "allow" },
 ];
 
+/**
+ * Everything, including the permissions this adapter does not know the names of.
+ *
+ * The wildcard entry is the load-bearing one. {@link HEADLESS_PERMISSIONS} names
+ * two permissions because those are the two Phase 0 measured; a provider that
+ * adds a third gets `ask` for it by default, and `ask` in a headless run is not a
+ * safeguard — it is a worker waiting on an answer from nobody until a watchdog
+ * kills it. `*` means a permission nobody here has heard of cannot become a
+ * deadlock. The named entries stay in front of it because an implementation that
+ * matches specific rules before wildcards should find the same answer either way,
+ * and one that does not, fails loudly rather than subtly.
+ */
+export const FULL_PERMISSIONS: readonly PermissionRule[] = [
+  { permission: "edit", pattern: "**", action: "allow" },
+  { permission: "bash", pattern: "**", action: "allow" },
+  { permission: "webfetch", pattern: "**", action: "allow" },
+  // The jail signal, granted. See ADR-0011.
+  { permission: "external_directory", pattern: "**", action: "allow" },
+  // An interactive anti-loop guard, which is the one thing a headless worker
+  // cannot be. The manager bounds loops three other ways.
+  { permission: "doom_loop", pattern: "**", action: "allow" },
+  { permission: "*", pattern: "**", action: "allow" },
+];
+
 // ---------------------------------------------------------------------------
 // Handles
 // ---------------------------------------------------------------------------

@@ -34,6 +34,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import {
+  FULL_PERMISSIONS,
   HEADLESS_PERMISSIONS,
   type PermissionReply,
   type OCEvent,
@@ -171,7 +172,7 @@ export const MAX_RETRY_BACKOFF_MS = 30_000;
 export const DEFAULT_RUN_BUDGET_TOKENS = 2_000_000;
 
 /**
- * What an `implement` worker is allowed, on top of the adapter's headless set.
+ * What an `implement` worker is allowed in `jailed` mode (§11 Phase 10).
  *
  * `doom_loop` is an interactive anti-loop guard, and interactive is the one
  * thing a headless worker cannot be: left at `ask` it does not stop a runaway,
@@ -179,15 +180,40 @@ export const DEFAULT_RUN_BUDGET_TOKENS = 2_000_000;
  * bounds loops three ways — idle watchdog, wall clock, token budget — so the
  * guard is redundant here and the prompt is pure deadlock.
  *
- * `external_directory` is deliberately *not* widened. Phase 0 called it "a
+ * `external_directory` is deliberately *not* widened here. Phase 0 called it "a
  * useful jail signal for §8", and it is: a worker reaching outside its worktree
  * raises a question the orchestrator can surface, rather than silently writing
  * where it should not.
+ *
+ * **This is no longer the default.** `full` is — see {@link FULL_PERMISSIONS}
+ * and `docs/adr/0011-full-permissions.md`. This set is what
+ * `ORCHESTRATOR_PERMISSIONS=jailed` restores, and it is the only mode in which
+ * `worker_message`'s `decision` parameter has anything to decide.
  */
-const IMPLEMENT_PERMISSIONS: readonly PermissionRule[] = Object.freeze([
+const JAILED_IMPLEMENT_PERMISSIONS: readonly PermissionRule[] = Object.freeze([
   ...HEADLESS_PERMISSIONS,
   { permission: "doom_loop", pattern: "**", action: "allow" },
 ]);
+
+/** What an `implement` worker is allowed in `full` mode. Everything. */
+const FULL_IMPLEMENT_PERMISSIONS: readonly PermissionRule[] = Object.freeze([...FULL_PERMISSIONS]);
+
+/**
+ * How much a worker is allowed to do (§11 Phase 10).
+ *
+ * - `full` — everything, and **nothing ever stops to ask**. A permission request
+ *   that arrives anyway is granted in band by the manager rather than escalated
+ *   to Claude, so a worker never spends a turn on a wall it was always going to
+ *   be let through.
+ * - `jailed` — the pre-Phase-10 behaviour: `external_directory` is left at the
+ *   provider's default, so a worker reaching outside its tree stops and asks
+ *   Claude, who decides with `worker_message({decision})`.
+ *
+ * Read-only modes are unaffected by either. See {@link READ_ONLY_PERMISSIONS}.
+ */
+export type PermissionMode = "full" | "jailed";
+
+export const DEFAULT_PERMISSION_MODE: PermissionMode = "full";
 
 /** Read-only modes (DD-10), enforced twice: at the session and at the prompt. */
 const READ_ONLY_PERMISSIONS: readonly PermissionRule[] = Object.freeze([
@@ -304,6 +330,14 @@ export interface WorkerManagerOptions {
    * "manager re-ran independently"). On when a spec supplies a command.
    */
   readonly verifyTests?: boolean;
+  /**
+   * How much an `implement` worker may do (§11 Phase 10). Defaults to `full`.
+   *
+   * `jailed` restores the worktree boundary as a thing a worker stops and asks
+   * about. It does not change what `research` and `review` workers may do —
+   * DD-10 is a correctness property, not a safety setting.
+   */
+  readonly permissionMode?: PermissionMode;
   /** Constrain the reply to the report schema. Off only to debug a provider. */
   readonly structuredOutput?: boolean;
   /**
@@ -688,6 +722,7 @@ export class WorkerManager {
       abortGraceMs: options.abortGraceMs ?? 10_000,
       retrySettleMs: options.retrySettleMs ?? 2_000,
       verifyTests: options.verifyTests ?? true,
+      permissionMode: options.permissionMode ?? DEFAULT_PERMISSION_MODE,
       structuredOutput: options.structuredOutput ?? true,
       now: options.now ?? Date.now,
       newWorkerID: options.newWorkerID ?? (() => `w-${(++this.seq).toString().padStart(3, "0")}`),
@@ -762,6 +797,35 @@ export class WorkerManager {
       observer.activity(w.record.current.workerID, entry);
     } catch {
       /* an observer is a diagnostic; it does not get to fail a worker */
+    }
+  }
+
+  /**
+   * Grant a permission request without involving Claude (§11 Phase 10).
+   *
+   * Returns whether it landed. `false` means the backend does not know the
+   * request — which is what it says when the turn that raised it is already
+   * over — and the caller escalates instead, so a worker is never left waiting
+   * on a grant that went nowhere.
+   *
+   * The turn is untouched either way: the worker is parked at its tool call and
+   * carries straight on with everything it was in the middle of. That is the
+   * whole economic argument for `full` mode, and it is measured rather than
+   * assumed — Phase 6's demo had a worker end on 47,531 tokens after two
+   * escalations against 7,715 for one that never escalated.
+   */
+  private async grantInBand(w: ManagedWorker, requestID: string, permission: string): Promise<boolean> {
+    const workerID = w.record.current.workerID;
+    try {
+      const answered = await this.opts.backend.respond(w.session!, requestID, "once");
+      this.opts.store.appendEvent(workerID, "permission_auto_granted", { requestID, permission, accepted: answered });
+      if (answered) this.note(workerID, `permission granted automatically: ${permission}`);
+      return answered;
+    } catch (e) {
+      // An adapter that cannot answer is not a worker that has to die: the
+      // escalation path still works and is one prompt away.
+      this.opts.store.appendEvent(workerID, "permission_reply_failed", { requestID, permission, message: String(e) });
+      return false;
     }
   }
 
@@ -2130,7 +2194,12 @@ export class WorkerManager {
       cwd: wt.path,
       title: rec.workerID,
       model: rec.model,
-      permissions: rec.mode === "implement" ? IMPLEMENT_PERMISSIONS : READ_ONLY_PERMISSIONS,
+      permissions:
+        rec.mode === "implement"
+          ? this.opts.permissionMode === "full"
+            ? FULL_IMPLEMENT_PERMISSIONS
+            : JAILED_IMPLEMENT_PERMISSIONS
+          : READ_ONLY_PERMISSIONS,
     });
     w.session = session;
     this.update(w, { sessionID: session.sessionID });
@@ -2336,6 +2405,24 @@ export class WorkerManager {
 
     if (isBlocking(e)) {
       const questions = "questions" in e ? [...e.questions] : "permission" in e ? [permissionQuestion(e)] : ["the worker is blocked"];
+
+      // §11 Phase 10: in `full` mode a permission request is granted here and
+      // the worker never stops. It is not an escalation and is not recorded as
+      // one — Claude is not being asked anything, so a row in the trail saying
+      // it was would be a lie the dashboard would then draw.
+      //
+      // Only a *permission* takes this path. A `question.asked` is the worker
+      // asking Claude something substantive, and no permission setting makes
+      // that answerable by a rule.
+      if (isAnswerable(e) && this.opts.permissionMode === "full") {
+        const granted = await this.grantInBand(w, e.requestID, e.permission);
+        if (granted) return undefined;
+        // The backend does not know the request — the turn moved on, or it was
+        // answered twice. Fall through and escalate, which works from a session
+        // rather than from a live request. Deliberately no abort first, for the
+        // reason `enterBlocked` states at length.
+      }
+
       this.opts.store.appendEvent(w.record.current.workerID, "escalation", { questions });
 
       // §11 Phase 7: a *permission* request can now be answered in band, so the

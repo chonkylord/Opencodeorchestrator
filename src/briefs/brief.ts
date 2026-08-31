@@ -102,7 +102,18 @@ export function buildBrief(ctx: BriefContext): Brief {
   lines.push("");
 
   lines.push("## Constraints");
-  lines.push(`- Work only inside ${worktree}. Never read or write outside it.`);
+  // Phase 10 granted `external_directory`, so the old line — "never read or write
+  // outside it" — described a wall that no longer exists. A constraint the runtime
+  // does not enforce is worth stating only if it is worth obeying, and this one
+  // is: what changed is that reaching out is now a *choice the worker makes* and
+  // the orchestrator sees afterwards in the diff, rather than one it is stopped
+  // at. So it is phrased as scope discipline, which is true, instead of as a
+  // boundary, which is not.
+  lines.push(
+    `- Your work belongs in ${worktree}. Read outside it when you genuinely need to —`,
+    "  a sibling package, a config file, the standard library — and write outside it only",
+    "  if the task actually calls for it. Nothing stops you; the diff records you.",
+  );
   // Before the ownership rules rather than after, because it is the exception to
   // them and a worker that reads "do not edit outside your paths" first will
   // block on a scratch file instead of writing one. Only `implement` gets it:

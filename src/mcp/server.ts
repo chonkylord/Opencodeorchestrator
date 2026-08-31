@@ -113,6 +113,7 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
     repoRoot: config.repoRoot,
     defaultModel: config.defaultModel,
     verifyTests: config.verifyTests,
+    permissionMode: config.permissionMode,
     maxConcurrent: config.maxConcurrent,
     maxRevisions: config.maxRevisions,
     maxRetries: config.maxRetries,

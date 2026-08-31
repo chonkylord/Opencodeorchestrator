@@ -17,6 +17,7 @@ import {
   DEFAULT_MAX_RETRIES,
   DEFAULT_MAX_REVISIONS,
   DEFAULT_RUN_BUDGET_TOKENS,
+  type PermissionMode,
   type WorkerMode,
   type WorkspaceMode,
   clampConcurrency,
@@ -127,6 +128,21 @@ export interface ServerConfig {
    * different and much more dangerous program than this one.
    */
   readonly dashboardPort: number;
+  /**
+   * How much an `implement` worker may do (§11 Phase 10).
+   *
+   * `full` (the default) grants everything and answers any permission request
+   * in band, so a worker never stops at a wall and never spends a turn asking to
+   * be let through one. `ORCHESTRATOR_PERMISSIONS=jailed` restores the worktree
+   * boundary: `external_directory` becomes a question Claude answers with
+   * `worker_message({decision})`.
+   *
+   * Neither setting touches `research` and `review` workers. DD-10 keeps those
+   * read-only because reconciliation depends on it — a read-only worker whose
+   * diff is not empty is a finding — and that is a correctness property rather
+   * than a safety one.
+   */
+  readonly permissionMode: PermissionMode;
 }
 
 /** `.orchestrator/` is already git-excluded for the worktrees; the index joins it. */
@@ -170,6 +186,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
     workspace: env["ORCHESTRATOR_WORKSPACE"] === "isolated" ? "isolated" : "shared",
     waitMaxMs: clampWaitMax(numberOr(env["ORCHESTRATOR_WAIT_MAX_MS"])),
     dashboardPort: dashboardPort(env),
+    // Anything but an exact "jailed" means full, mirroring ORCHESTRATOR_WORKSPACE:
+    // the default is the mode the orchestrator is meant to run in, and a typo
+    // should not silently move somebody to the one that stops and asks.
+    permissionMode: env["ORCHESTRATOR_PERMISSIONS"] === "jailed" ? "jailed" : "full",
   };
 }
 
