@@ -769,6 +769,111 @@ run's widest finding has no code in it at all: *worker quality tracked brief
 specificity far more than model choice.* Nothing here improves that, and no tool
 can — it is a property of what Claude writes into `worker_spawn`.
 
+---
+
+### Phase 10 — Full worker permissions ✅ COMPLETE
+
+Workers are granted everything, and nothing stops to ask.
+
+> Outcome: [ADR-0011](docs/adr/0011-full-permissions.md). Changed:
+> [`src/opencode/types.ts`](src/opencode/types.ts) (`FULL_PERMISSIONS`),
+> [`src/manager/worker.ts`](src/manager/worker.ts) (the mode fork and
+> `grantInBand`), [`src/mcp/config.ts`](src/mcp/config.ts)
+> (`ORCHESTRATOR_PERMISSIONS`) and [`src/briefs/brief.ts`](src/briefs/brief.ts)
+> (a constraint that no longer describes a wall). Tests: 17 new, **451 total
+> green** (5 skipped).
+
+**Requested by the operator, and the reversal of a Phase 0 decision.**
+`IMPLEMENT_PERMISSIONS` granted `edit` and `bash` across `**` and switched off
+`doom_loop`; the one thing it left alone was `external_directory`, which Phase 0
+called "a useful jail signal for §8" and which it was. `full` grants that too,
+and then `*` across `**` on top.
+
+**The wildcard is the load-bearing entry rather than a flourish.**
+`HEADLESS_PERMISSIONS` names two permissions because those are the two Phase 0
+measured. A provider that introduces a third gets the default action for it, and
+in a headless run that default is a deadlock — `ask` is not a safeguard when
+there is nobody to ask, it is a worker waiting until a watchdog kills it.
+
+**`grantInBand()`, and what measuring it actually found.** A provider can still
+raise a request the ruleset does not cover, and in `full` mode the honest
+response is not to wake Claude about it: the manager answers `once` itself, the
+worker carries on mid-turn, and the trail records `permission_auto_granted` —
+**not** an `escalation`, because Claude was not asked anything and a row claiming
+otherwise is a lie the dashboard would draw as a blocked worker. If `respond()`
+reports the backend does not know the request, the code falls through to the
+existing escalation rather than leaving the worker waiting on a grant that went
+nowhere.
+
+Then it was run against a live provider, and the result is worth stating plainly:
+**on OpenCode 1.18.25 that path never executes.** The same task in both modes,
+measured 2026-08-31 — `jailed` blocked on `external_directory` at 18 s having
+spent ~0 tokens and written nothing; `full` completed in 20 s on 10,606 tokens
+with the file written outside the worktree and **no permission event of any kind
+in the trail**. 1.18.25 consults the session ruleset, finds everything allowed,
+and raises nothing. The auto-grant is a fallback for a version that behaves
+differently; it is covered by `ocmock`, which raises a request without consulting
+anything, and it is dead code against this provider. It stays — its cost is one
+branch, and the failure it guards against is a worker wedged forever. See
+`docs/phase0-facts.md` §5.
+
+**Read-only modes are not part of this.** `research` and `review` keep `edit` and
+`bash` denied in **both** modes. That looks like an inconsistency and is not:
+DD-10 is a correctness property rather than a safety setting. Reconciliation
+depends on it — for a worker that cannot write, `claimed_not_changed` is switched
+off (Phase 8 found three of four models listing the file they had reviewed), and
+the reverse check, *a read-only worker whose diff is not empty has done something
+it could not do*, is one of the strongest signals this system produces. Granting
+reviewers write access would not make them more useful; it would delete a check.
+
+**What is given up, stated rather than implied.** §13's "prompt injection via
+repo content → hijacked worker" listed four mitigations and the first of them —
+"workers sandboxed to worktree" — is **gone in the default mode**. That row has
+been corrected rather than left to age. What remains is real but weaker: worker
+output is still untrusted (DD-8), the manager still never executes report
+content, and the diff still records what was touched. The difference is that
+reaching outside the tree used to be *a question asked before the fact* and is
+now *a finding available after it*. Two things make the trade less bad and
+neither makes it disappear: Phase 8 already put workers in the user's own
+checkout by default, where there was no worktree boundary to protect in the first
+place; and container sandboxing — the mitigation §13 actually wanted — remains
+the right answer and remains unbuilt, for the same reason as in Phase 8, which is
+that there is no Docker daemon in this environment.
+
+**What is gained.** No worker ever spends a turn on a wall. Phase 6's demo
+measured the alternative: three asks in one four-worker run, and the worker that
+escalated twice ended on 47,531 tokens against 7,715 for the one that never did.
+
+**Also in this phase**, from the first end-to-end run of the server against a live
+provider — which is also the first time Phase 9's dashboard had ever seen a real
+worker rather than synthetic data:
+
+- **The suite had never been run against Phase 10.** It typechecked; that was
+  all anyone knew. Eleven failures: eight were the new default doing exactly what
+  it says (tests that need a worker to *stop*, which no longer happens by
+  default) and now pin `jailed`; three were older than this phase and only fail
+  on macOS, where `tmpdir()` sits behind a symlink and the fixture handed out a
+  path git would never report back. The real pre-Phase-10 baseline on that
+  machine was 431/3, not the 434/0 recorded from Linux.
+- **The dashboard works against a real worker.** Confirmed in a browser: the
+  delegation graph draws, the activity stream fills over SSE, and the Result tab
+  keeps DD-4's separation visible — "what the worker says it did — its own words,
+  a claim" above "what git and the test run say — measured", the second half
+  including the orchestrator's own re-run of `npm test`.
+- **Per-worker scratch dirs behave as Phase 9 designed them.**
+  `<tree>/.orchestrator/scratch/<id>` is created for every `implement` worker,
+  and a file written into it leaves `git status` clean — checked with a canary
+  rather than inferred from the exclude rules.
+- **`nextStep()` told Claude to answer a worker nothing could answer.** Phase 9
+  taught `renderBlocked` that a `blocked` worker whose session died needs
+  `worker_recover`; the status line beside it went on naming `worker_message`, so
+  the two halves of one tool result disagreed. `manager.isOrphaned()` is now
+  threaded through `worker_status` and `worker_wait` as well.
+
+**Still unmeasured, and unchanged by this phase:** whether Claude Code resets its
+tool-call timeout on `notifications/progress`. The probe and the procedure are in
+the README; `ORCHESTRATOR_WAIT_MAX_MS` stays at 30,000 ms until somebody runs it.
+
 **Total: ~3.5–4.5 weeks solo to a hardened v1.**
 
 ---
@@ -793,7 +898,7 @@ can — it is a property of what Claude writes into `worker_spawn`.
 | Runaway workers / cost blowout | Idle watchdog, hard timeout, per-worker + global budgets — **all built by Phase 7**; the global one is per `runID` and refuses a spawn rather than killing what is running |
 | Merge hell on parallel waves | Overlap detection pre-merge; sequential gated merges; integration-point ownership rules; cap recommended parallelism |
 | Infinite fix loops | Revision caps with terminal actionable reports |
-| Prompt injection via repo content → hijacked worker | Workers sandboxed to worktree; output treated as untrusted; manager never executes report content; optional container mode later |
+| Prompt injection via repo content → hijacked worker | **Weaker than it was, deliberately — see [ADR-0011](docs/adr/0011-full-permissions.md).** "Workers sandboxed to worktree" was the first mitigation here and **no longer holds in the default `full` mode**: `external_directory` is granted, so a worker talked into it by something it reads can write anywhere this process can. What remains: output treated as untrusted (DD-8); manager never executes report content; the diff records what was touched, so the reach is a finding after the fact rather than a question before it. `ORCHESTRATOR_PERMISSIONS=jailed` restores the boundary for anyone who wants it back. Container mode is the mitigation this row actually wants, and it remains unbuilt — no Docker daemon in this environment. |
 | MCP host timeouts | Async pattern (DD-1) is structural, not a patch |
 | Flaky tests breaking merge gates | Gate re-runs failures once before declaring red; config to mark known-flaky suites |
 | Manager crash orphans worktrees | SQLite recovery + orphan scan — **built in Phase 7**: a crashed worker is salvaged from its worktree into a real result, and the orphan scan prunes only past a TTL |

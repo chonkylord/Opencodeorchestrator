@@ -508,7 +508,7 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         const lines: string[] = [];
         for (const id of ids) {
           const r = find(id);
-          lines.push(r ? statusLine(r, t, manager.queueHint(id)) : `${id} [unknown] — no such worker`);
+          lines.push(r ? statusLine(r, t, manager.queueHint(id), manager.isOrphaned(id)) : `${id} [unknown] — no such worker`);
         }
         return ok(lines.join("\n"));
       }
@@ -526,7 +526,7 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
       const shown = active.slice(0, LIST_ROWS_MAX);
       const queued = shown.filter((r) => manager.queueHint(r.workerID) !== undefined).length;
       const trailer = queued > 0 ? `\n(${queued} of these have not started: ${hintSlots(manager)})` : "";
-      return ok(shown.map((r) => statusLine(r, t, manager.queueHint(r.workerID))).join("\n") + trailer);
+      return ok(shown.map((r) => statusLine(r, t, manager.queueHint(r.workerID), manager.isOrphaned(r.workerID))).join("\n") + trailer);
     },
   );
 
@@ -595,7 +595,7 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         if (targets.length === 1) {
           const r = await manager.wait(targets[0]!, budget);
           const waited = now() - started;
-          const line = statusLine(r, now(), manager.queueHint(r.workerID));
+          const line = statusLine(r, now(), manager.queueHint(r.workerID), manager.isOrphaned(r.workerID));
           return ok(
             isSettled(r.state)
               ? `${line}\n(settled after ${Math.round(waited / 1000)}s of waiting)`
@@ -605,7 +605,9 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         }
         const chosen = mode ?? "any";
         const { records, settled } = await manager.waitMany(targets, { mode: chosen, timeoutMs: budget });
-        return ok(renderWaitMany(records, settled, chosen, now() - started, now(), (w) => manager.queueHint(w)));
+        return ok(
+          renderWaitMany(records, settled, chosen, now() - started, now(), (w) => manager.queueHint(w), (w) => manager.isOrphaned(w)),
+        );
       } catch (e) {
         return fail(`Could not wait on ${targets.join(", ")}: ${message(e)}`);
       } finally {
@@ -723,7 +725,12 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
               "`permission_required`): whether to grant it. Defaults to allow. Deny when the worker is " +
               "reaching somewhere it should not — that is what the permission wall is for. A worker that " +
               "asked to write scratch files OUTSIDE its tree does not need this granted: tell it about the " +
-              "scratch directory its brief already gave it and deny the reach.",
+              "scratch directory its brief already gave it and deny the reach.\n" +
+              "ONLY BITES IN `jailed` MODE. On the default `ORCHESTRATOR_PERMISSIONS=full` the orchestrator " +
+              "grants every permission at the session and answers any request that arrives anyway itself, so " +
+              "no permission ever reaches you to be decided and a worker in `permission_required` is not a " +
+              "state you will normally see. The parameter is kept rather than removed because the mode it " +
+              "serves is one environment variable away.",
           ),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },

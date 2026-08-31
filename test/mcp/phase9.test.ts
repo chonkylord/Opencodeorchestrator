@@ -217,6 +217,49 @@ describe("worker_result tells a blocked worker's story truthfully", () => {
     expect(res.text).toContain("NOTHING CAN ANSWER THEM ANY MORE");
     expect(res.text).toContain("worker_recover");
   });
+
+  // §11 Phase 10. `renderBlocked` learned this in Phase 9 and the status line did
+  // not, so the two halves of one tool call disagreed: `worker_result` said the
+  // session was gone while the `next:` hint beside it still said to answer the
+  // worker. Both now come from `manager.isOrphaned`.
+
+  test("worker_status gives the same advice as worker_result about an unreachable worker", async () => {
+    const { client, orchestrator } = await harness({ report: BLOCKED, dropPromptsWithinMs: 30 });
+    const id = idFrom((await call(client, "worker_spawn", { task: "create hello.txt" })).text);
+    await pollUntil(client, id, /blocked/);
+    orchestrator.manager.halt();
+
+    const res = await call(client, "worker_status", { ids: [id] });
+    expect(res.text).toContain("worker_recover");
+    // The one that mattered: sending Claude to a tool that cannot possibly work
+    // is worse than saying nothing, because it looks like progress.
+    expect(res.text).not.toContain("worker_message");
+  });
+
+  test("a live blocked worker is still pointed at worker_message by worker_status", async () => {
+    // The negative half. A hint that names `worker_recover` for every blocked
+    // worker would be just as wrong, in the other direction.
+    const { client } = await harness({ report: BLOCKED, dropPromptsWithinMs: 30 });
+    const id = idFrom((await call(client, "worker_spawn", { task: "create hello.txt" })).text);
+    await pollUntil(client, id, /blocked/);
+
+    const res = await call(client, "worker_status", { ids: [id] });
+    expect(res.text).toContain("worker_message");
+    expect(res.text).not.toContain("worker_recover");
+  });
+
+  test("worker_wait's status line carries the same correction", async () => {
+    // `wait` resolves on `blocked` as well as on settled, so it renders the same
+    // line from a different call path — and had the same bug.
+    const { client, orchestrator } = await harness({ report: BLOCKED, dropPromptsWithinMs: 30 });
+    const id = idFrom((await call(client, "worker_spawn", { task: "create hello.txt" })).text);
+    await pollUntil(client, id, /blocked/);
+    orchestrator.manager.halt();
+
+    const res = await call(client, "worker_wait", { ids: [id], timeoutMs: 2_000 });
+    expect(res.text).toContain("worker_recover");
+    expect(res.text).not.toContain("worker_message");
+  });
 });
 
 describe("worker_spawn surfaces a model capability instead of burying it", () => {

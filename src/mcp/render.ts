@@ -140,8 +140,15 @@ function ordinal(n: number): string {
  * The `next:` hint is not decoration. The whole surface is spawn-and-poll, and a
  * state whose follow-up is obvious to whoever wrote the state machine is not
  * obvious to a model three tool calls into a task it is also reasoning about.
+ *
+ * `orphaned` is the same correction {@link renderBlocked} took in Phase 9,
+ * arriving one release late. That renderer already knew a `blocked` worker whose
+ * session died cannot be answered; this line did not, and went on naming
+ * `worker_message` — so `worker_result` told Claude one thing and the status
+ * line beside it told Claude another. Threaded rather than recomputed here,
+ * because only the manager knows which sessions this process holds.
  */
-export function statusLine(r: WorkerRecord, now: number, hint?: QueueHint): string {
+export function statusLine(r: WorkerRecord, now: number, hint?: QueueHint, orphaned = false): string {
   const idle = duration(Math.max(0, now - r.updatedAt));
   // Two counters, two labels. Before Phase 6 this line printed `resumes` under
   // the word "revisions", which was only ever harmless because nothing could
@@ -153,7 +160,7 @@ export function statusLine(r: WorkerRecord, now: number, hint?: QueueHint): stri
   const queue = hint ? ` · ${queueNote(hint)}` : "";
   return (
     `${r.workerID} [${r.state}${r.reason ? `: ${r.reason}` : ""}] ${duration(elapsedMs(r, now))} elapsed · ` +
-    `${idle} since last activity${rev} · ${spend(r.totalTokens, r.cost)}${queue} · next: ${nextStep(r, hint)}\n` +
+    `${idle} since last activity${rev} · ${spend(r.totalTokens, r.cost)}${queue} · next: ${nextStep(r, hint, orphaned)}\n` +
     `  task: ${clampChars(r.task, TASK_CHARS)}`
   );
 }
@@ -168,7 +175,7 @@ export function listRow(r: WorkerRecord, now: number): string {
 }
 
 /** What a caller should do next, given where the worker is. */
-function nextStep(r: WorkerRecord, hint?: QueueHint): string {
+function nextStep(r: WorkerRecord, hint?: QueueHint, orphaned = false): string {
   switch (r.state) {
     case "spawned":
       // The one place the state alone gives the wrong advice. `worker_wait` on a
@@ -183,7 +190,15 @@ function nextStep(r: WorkerRecord, hint?: QueueHint): string {
     case "running":
       return "worker_wait, or worker_status again";
     case "blocked":
-      return "worker_result to read the questions, then worker_message to answer";
+      // Only `blocked` branches on `orphaned`, though the manager will report it
+      // for the other live states too. Those have a different answer already —
+      // a `running` worker whose process died is moved to `interrupted` by
+      // `recover()`, and `interrupted` has its own line below — so branching on
+      // it here would be a second name for a condition that is handled, which is
+      // the exact mistake this parameter exists to undo.
+      return orphaned
+        ? `worker_recover({id: "${r.workerID}", action: "resume"}) — it asked, then its session died; nothing can answer it`
+        : "worker_result to read the questions, then worker_message to answer";
     case "completed":
       // Three real options and they are not interchangeable, so the hint names
       // the fork rather than the first one: read it, then either take the work
@@ -284,6 +299,7 @@ export function renderWaitMany(
   waitedMs: number,
   now: number,
   hintOf: (workerID: string) => QueueHint | undefined,
+  orphanedOf: (workerID: string) => boolean = () => false,
 ): string {
   const waited = `${Math.round(waitedMs / 1000)}s`;
   const pending = records.filter((r) => !settled.includes(r.workerID));
@@ -297,7 +313,7 @@ export function renderWaitMany(
         : `${settled.length} of ${records.length} settled after ${waited}; still working: ${pending.map((r) => r.workerID).join(", ")}.`;
   return [
     head,
-    ...records.map((r) => statusLine(r, now, hintOf(r.workerID))),
+    ...records.map((r) => statusLine(r, now, hintOf(r.workerID), orphanedOf(r.workerID))),
     pending.length > 0
       ? "Call worker_wait again to keep waiting, or go and do something else and come back to worker_status."
       : "Next: worker_result on each, then workspace_merge for the ones you want to land.",
