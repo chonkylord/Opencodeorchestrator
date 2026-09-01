@@ -284,7 +284,7 @@ is one more thing to find.
 | `ORCHESTRATOR_REVIEW_POOL` | *(unset)* | Comma-separated models a `review` worker may be routed to, in preference order — the first that is **not** the model which wrote the code under review. This is what makes a critique an independent read rather than the author marking its own homework. Unset means reviews fall back to the preset or the default, which may well be the author's own model; `worker_result` says which kind of review you got either way. |
 | `ORCHESTRATOR_DASHBOARD_PORT` | `4180` | The local dashboard's port. `0` takes any free port, which is what you want when several orchestrators run at once; the URL is printed to stderr at startup either way. A port outside 0–65535 falls back to the default rather than silently disabling it. |
 | `ORCHESTRATOR_DASHBOARD` | `1` | Set `0` or `off` to not start the dashboard at all. Nothing binds a socket; the transcript ring is still filled, since it costs nothing. |
-| `ORCHESTRATOR_WAIT_MAX_MS` | `30000` | `worker_wait`'s cap. The default is half the one host ceiling anybody has measured (60s, Claude Code 2.1.251). **Raise it only after measuring your own** — see [Making `worker_wait` wait longer](#making-worker_wait-wait-longer). A cap past what your host will actually wait for does not buy longer waits; it turns every wait into a failed tool call, and a failed wait leaves a worker running with nobody watching it. Clamped to 1s–600s. |
+| `ORCHESTRATOR_WAIT_MAX_MS` | `30000` | `worker_wait`'s cap. The default is half the *plain* ceiling measured on Claude Code 2.1.251 (60s) — the one that applies to a call sending no progress. `worker_wait` does send progress, and on that same host the ceiling with heartbeats is **at least 600s** (the probe's own limit, not the host's), so `300000` is the measured setting there and cuts a six-minute wave from ~8 blocking calls to 2. **Raise it only after measuring your own** — see [Making `worker_wait` wait longer](#making-worker_wait-wait-longer). A cap past what your host will actually wait for does not buy longer waits; it turns every wait into a failed tool call, and a failed wait leaves a worker running with nobody watching it. Clamped to 1s–600s. |
 | `ORCHESTRATOR_WORKSPACE` | `shared` | Where workers work. `shared` puts every worker in **your repository**, together, the way Claude's native subagents behave — no branch, nothing committed for you, no merge because the work is already in your tree. `isolated` gives each its own worktree and branch behind the gated merge: stronger evidence, at the cost of workers not seeing each other. Only an exact `isolated` opts out; a typo leaves you on the default. Per-worker override: `worker_spawn({workspace})`. |
 | `ORCHESTRATOR_PERMISSIONS` | `full` | How much an `implement` worker may do (ADR-0011). `full` grants `edit`, `bash`, `webfetch`, `external_directory`, `doom_loop` and then `*` — everything, including permissions this adapter has never heard of, because the provider's default for an unknown one is `ask` and `ask` in a headless run is a worker waiting on nobody until a watchdog kills it. Nothing stops to ask, so **a worker can write anywhere this process can**; the diff records the reach instead of a permission wall preventing it. `jailed` restores the worktree boundary: `external_directory` becomes a question that reaches you as a `blocked` worker, answered with `worker_message({decision})` — the only mode in which that parameter does anything. Only an exact `jailed` opts out; a typo leaves you on the default. Neither setting touches `research` and `review` workers, which stay read-only in both: DD-10 is a correctness property (a read-only worker whose diff is not empty is a finding) rather than a safety one. |
 
@@ -360,6 +360,25 @@ Increase `delayMs` until the call fails; the host says its own limit in the
 error. Then set `ORCHESTRATOR_WAIT_MAX_MS` to **half** whichever ceiling you got —
 the other half pays for the tool's own work and the transport, and a wait that
 loses its race with the host leaves a worker running unwatched.
+
+**On Claude Code 2.1.251 this has now been run, and the answer is yes.** Without
+progress the ceiling is 60 s, exactly as Phase 3 measured. With `progressEveryMs:
+10000`, 240,000 ms returned normally, and so did **600,000 ms** — the largest
+delay the probe accepts. So the ceiling there is not 600 s, it is *at least* 600
+s; the instrument ran out before the host did. Half of that verified floor is
+what to use:
+
+```bash
+claude mcp add orchestrator --env ORCHESTRATOR_WAIT_MAX_MS=300000 -- bun run "$PWD/src/mcp/server.ts"
+```
+
+That turns a six-minute wave from about eight blocking calls into two. **The
+compiled default stays at 30,000 ms** on purpose — a host that ignores progress
+is still possible, the default has to be safe on one, and the two failure modes
+are not symmetric: too small costs an extra tool call, while too large loses the
+call's result and leaves a worker running with nobody watching it. Raising it is
+a decision you make about *your* host, which is why it is an environment variable
+and not a new default. See `docs/phase0-facts.md` §7 for both numbers.
 
 There is no way for an MCP server to do better than this. A server cannot start a
 turn on its host, so there is no "notify me when it is done" path to hook;

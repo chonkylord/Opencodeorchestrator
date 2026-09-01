@@ -701,7 +701,10 @@ defect a passing suite is precisely the wrong instrument for.
   `ORCHESTRATOR_WAIT_MAX_MS`, and `orchestrator_timeout_probe` gained
   `progressEveryMs` so the ceiling *with* heartbeats can be measured rather than
   assumed. **The default did not move**, and this is the one item here whose
-  benefit is conditional on a measurement nobody has taken yet.
+  benefit is conditional on a measurement nobody has taken yet. *(Taken in Phase
+  10: the host does reset on progress, and the ceiling with heartbeats is at
+  least 600 s against 60 s without. The default still did not move — see there
+  for why.)*
 - **`worker_message` reported success on a failed write** — "Answer delivered to
   w-001", twice, against an audit trail reading `answer_failed message=unknown
   worker w-001`. DD-1's start-and-return was deferring the *knowable* failures
@@ -764,7 +767,8 @@ it does not pass through the index.
 
 **Not done, and stated rather than implied:** whether the `worker_wait` heartbeat
 actually buys a longer ceiling on Claude Code is **unmeasured** — the probe and
-the procedure are in the README, and the answer is one live session away. And the
+the procedure are in the README, and the answer is one live session away.
+*(Phase 10 had one. It does: ≥600 s with heartbeats against 60 s without.)* And the
 run's widest finding has no code in it at all: *worker quality tracked brief
 specificity far more than model choice.* Nothing here improves that, and no tool
 can — it is a property of what Claude writes into `worker_spawn`.
@@ -870,9 +874,25 @@ worker rather than synthetic data:
   the two halves of one tool result disagreed. `manager.isOrphaned()` is now
   threaded through `worker_status` and `worker_wait` as well.
 
-**Still unmeasured, and unchanged by this phase:** whether Claude Code resets its
-tool-call timeout on `notifications/progress`. The probe and the procedure are in
-the README; `ORCHESTRATOR_WAIT_MAX_MS` stays at 30,000 ms until somebody runs it.
+**And Phase 9's one unmeasured item, measured.** Whether Claude Code resets its
+tool-call timeout on `notifications/progress` was the item Phase 9 flagged as
+"conditional on a measurement nobody has taken yet". It has been taken, on the
+same host and version as the original 60 s figure. The control reproduced that
+figure exactly — 55,000 ms with no progress, `progressSent: 0`. Then, with
+`progressEveryMs: 10000`, **240,000 ms returned normally, and so did 600,000 ms**:
+the largest delay the probe accepts. So the ceiling with heartbeats is not 600 s,
+it is *at least* 600 s — the instrument ran out before the host did, and writing
+it as a floor rather than a ceiling is the difference between what was measured
+and what would be convenient.
+
+**The compiled default stays at 30,000 ms**, and that is a decision rather than an
+oversight. A host that ignores progress is still possible, the default has to be
+safe on one, and the two failure modes are not symmetric: too small costs one
+extra tool call, while too large loses the call's result and leaves a worker
+running with nobody watching it. `ORCHESTRATOR_WAIT_MAX_MS=300000` — half the
+verified floor — is the setting for this host, and it turns a six-minute wave
+from about eight blocking calls into two. Both numbers are in
+`docs/phase0-facts.md` §7; the README says how to apply it.
 
 **Total: ~3.5–4.5 weeks solo to a hardened v1.**
 
@@ -912,7 +932,7 @@ the README; `ORCHESTRATOR_WAIT_MAX_MS` stays at 30,000 ms until somebody runs it
 3. ~~Session resume semantics?~~ **Resolved:** yes, context is retained across prompts to the same session.
 4. ~~Permission config granularity — sufficient for headless?~~ **Resolved:** yes — inline per-session ruleset, or CLI `--auto`. A full edit+bash run completed with zero pending permission requests.
 5. ~~Can one serve instance handle 4+ concurrent sessions without degradation?~~ **Resolved in Phase 1:** yes at 4 — four worktree sessions on one server all completed with no cross-talk, at ~1.4–1.9× single-session latency. One run, one free-tier model; re-measure before going past 4. **Re-measured twice in Phase 5** (2026-08-29, OpenCode 1.18.25): the four-session probe again (11.4–15.3 s, zero foreign-session events), and the first end-to-end measurement *through the orchestrator* — three concurrent workers plus a queued dependent, driven by a live Claude Code session on the free tier, all four completing with no rate limiting and no cross-talk. The §11 Phase 5 default is **3**; more than four, paid providers under rate limits, and minutes-long workers are all still unmeasured. See `docs/phase0-facts.md`. **Phase 6's v1 demo closed the last of those three** (2026-08-29): a revision round ran 212 s to a clean completion, an order of magnitude past Phase 5's 23.8–48.7 s, with the watchdogs and the token polling holding throughout. More than four concurrent, and paid providers under rate limits, are still unmeasured; the default stays at 3.
-6. ~~Claude Code's actual MCP tool timeout in the target environment?~~ **Resolved in Phase 3: 60 seconds.** Measured on Claude Code 2.1.251 with the orchestrator registered as a real MCP server — 55,000 ms returns, 60,000 ms fails, and the host states its own limit in the error. `worker_wait`'s 30,000 ms cap is now half a measured ceiling instead of a guess. See `docs/phase0-facts.md` §7.
+6. ~~Claude Code's actual MCP tool timeout in the target environment?~~ **Resolved in Phase 3: 60 seconds.** Measured on Claude Code 2.1.251 with the orchestrator registered as a real MCP server — 55,000 ms returns, 60,000 ms fails, and the host states its own limit in the error. `worker_wait`'s 30,000 ms cap is now half a measured ceiling instead of a guess. **Re-measured in Phase 10** (2026-08-31, same host and version): that 60 s applies to a call sending no progress. With `progressEveryMs: 10000` the same host returned normally at 240,000 ms *and* at 600,000 ms — the probe's own maximum — so with heartbeats the ceiling is **at least** 600 s and was never actually reached. `worker_wait` heartbeats unconditionally, so that is the ceiling that applies to it; the default still stays at 30,000 ms, because it has to be safe on a host that ignores progress. See `docs/phase0-facts.md` §7.
 
 Everything above is structured so that wrong answers to any of these change **one adapter file or one config default** — not the architecture.
 

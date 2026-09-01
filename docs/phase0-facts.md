@@ -106,13 +106,17 @@ None of these are drop-in replacements for §6's gated merge, but building git p
 
 ## 7. The host (not OpenCode)
 
-One fact here, and it is the one DD-1 is calibrated against. It is about *Claude
-Code*, not about OpenCode, which is why it sits in its own section: an OpenCode
-version bump does not invalidate it, and a host upgrade does.
+Two facts here, and they are what DD-1 is calibrated against. They are about
+*Claude Code*, not about OpenCode, which is why they sit in their own section: an
+OpenCode version bump does not invalidate them, and a host upgrade does.
+
+They are the same host, the same version, three days apart, and they disagree by
+a factor of ten — because the second call emits progress and the first does not.
 
 | Fact | Status | Detail |
 |---|---|---|
 | **Claude Code's MCP tool-call timeout is 60 s** | **verified (phase 3)** · *resolves unresolved #1* | Measured on **Claude Code 2.1.251**, on **2026-08-28**, with the orchestrator registered as a real MCP server (`--mcp-config`, `--strict-mcp-config`) in a headless `claude -p` session, using `orchestrator_timeout_probe` — the instrument Phase 0 built for exactly this and could not run. `delayMs` of 30,000, 45,000 and 55,000 all returned normally (the last as `{"requestedMs":55000,"actualMs":55002,"returned":true}`); 60,000 failed, and the host named its own limit in the error: `MCP server "orchestrator" tool "orchestrator_timeout_probe" timed out after 60s`. So it is a hard 60 s deadline on the call, not a shorter budget that happens to round to one. The failure is per tool call — the session continues and the server stays connected — but the call's result is lost, which for a long `worker_wait` means a worker still running with nobody watching. **`worker_wait`'s cap therefore stays at §7's 30,000 ms, now as a measured half of the ceiling rather than a guess.** The remaining 30 s absorbs the tool's own work, the transport, and any host that lowers the limit. |
+| **With `notifications/progress`, the same host waits at least 600 s** | **verified (phase 10)** · *closes §11 Phase 9's one unmeasured item* | Measured **2026-08-31**, on the **same Claude Code 2.1.251** as the row above, with the orchestrator registered as a real MCP server in a live session. The control first: `{delayMs: 55000}` with no progress returned `{"actualMs":55001,"progressSent":0}`, reproducing the 60 s row exactly. Then `{delayMs: 240000, progressEveryMs: 10000}` — **four times the plain ceiling** — returned normally, `{"actualMs":240003,"progressSent":23}`. Then `{delayMs: 600000, progressEveryMs: 10000}`, the largest delay the probe accepts, also returned normally: `{"actualMs":600002,"progressSent":59}`. **So this host does reset its tool-call timeout on progress, and the MCP spec's "may" is a "does" here.** What is *not* known is the ceiling: 600 s is the instrument's limit, not the host's, so this is a measured **floor** and the honest way to write it is `≥600 s`. Since `worker_wait` heartbeats every 10 s unconditionally (§11 Phase 9), this is the ceiling that actually applies to it. **The compiled default stays at 30,000 ms anyway**, and that is deliberate: a host that does *not* reset on progress is still possible, the default has to be safe on one, and the failure mode is asymmetric — too small costs an extra tool call, too large loses the call's result and leaves a worker running with nobody watching it. On this host, set `ORCHESTRATOR_WAIT_MAX_MS=300000` — half of the verified floor — and a six-minute wave costs two `worker_wait` calls instead of eight. |
 
 ---
 
