@@ -107,9 +107,22 @@
       add("circle", { cx: 6, cy: 6, r: 4.4, fill: "none", stroke: ink, "stroke-width": 1.4 });
       add("path", { d: "M6 1.6 A4.4 4.4 0 0 1 6 10.4 Z", fill: ink });
     } else if (queued) {
-      add("circle", { cx: 6, cy: 6, r: 4.2, fill: "none", stroke: ink, "stroke-width": 1.4, "stroke-dasharray": "2 2" });
+      // The one dashed ring that turns: the two live states are the two that
+      // move, so a glance at a still frame is not the only way to read them.
+      // Motion is decoration on top of the shape, never instead of it — see the
+      // reduced-motion rule in app.css, which stops both and loses nothing.
+      add("circle", {
+        class: "g-queued",
+        cx: 6,
+        cy: 6,
+        r: 4.2,
+        fill: "none",
+        stroke: ink,
+        "stroke-width": 1.4,
+        "stroke-dasharray": "2 2",
+      });
     } else if (ACTIVE.has(state)) {
-      add("circle", { cx: 6, cy: 6, r: 4.2, fill: ink });
+      add("circle", { class: "g-active", cx: 6, cy: 6, r: 4.2, fill: ink });
     } else if (SETTLED.has(state)) {
       add("rect", { x: 2, y: 2, width: 8, height: 8, fill: ink });
     } else if (state === "interrupted") {

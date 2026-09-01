@@ -322,6 +322,48 @@ button {
   fill: var(--ink);
 }
 
+/*
+ * The two live glyphs move. Everything else on this board is a still frame, so
+ * the only two states where work is actually happening are the only two things
+ * that animate, and "is anything running?" is answerable from across the room.
+ * Motion is layered on top of the shape, never carrying meaning by itself: with
+ * reduced motion on, the dot is a filled dot and the ring is a dashed ring, and
+ * the board reads exactly as before.
+ */
+.g-active {
+  animation: glyph-blink 1.5s ease-in-out infinite;
+}
+
+@keyframes glyph-blink {
+  50% {
+    opacity: 0.18;
+  }
+}
+
+/*
+ * transform-origin resolves against the nearest viewBox, which for a glyph is
+ * always "0 0 12 12" — including the nested <svg> the graph places by x/y — so
+ * 6px 6px is the centre of the ring in both places it is drawn.
+ */
+.g-queued {
+  transform-box: view-box;
+  transform-origin: 6px 6px;
+  animation: glyph-spin 3.2s linear infinite;
+}
+
+@keyframes glyph-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .g-active,
+  .g-queued {
+    animation: none;
+  }
+}
+
 .legend {
   display: flex;
   flex-wrap: wrap;
