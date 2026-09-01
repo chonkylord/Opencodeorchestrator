@@ -15,7 +15,7 @@
  *   exist nowhere else*, and the tool description says so in those words.
  * - The orphan scan **reports** by default. §9 says "report or prune"; the safe
  *   half is the default, and the unsafe half needs the same `force`.
- * - Nothing outside the orchestrator's own directories is ever removed. The
+ * - Nothing outside Dispatched Code's own directories is ever removed. The
  *   main worktree — the user's checkout — is filtered out by path before any
  *   removal is considered, not merely absent from the list by luck.
  *
@@ -29,7 +29,7 @@ import { existsSync, rmSync, statSync } from "node:fs";
 import { resolve, sep } from "node:path";
 
 import { git, gitLine } from "./git.js";
-import { ORCHESTRATOR_DIR, defaultWorktreeRoot, resolveRepoRoot } from "./worktree.js";
+import { LEGACY_STATE_DIR, STATE_DIR, defaultWorktreeRoot, resolveRepoRoot } from "./worktree.js";
 
 /** What the index knows about one worker, as far as cleanup cares. */
 export interface CleanupCandidate {
@@ -75,7 +75,7 @@ export interface Orphan {
  * §9's orphan TTL: how old an orphan must be before pruning will touch it.
  *
  * Twenty-four hours, because the failure this protects against is pruning a
- * worktree belonging to a *concurrently running* orchestrator — another process,
+ * worktree belonging to a *concurrently running* instance — another process,
  * or this one before its index caught up — and an hour is not obviously longer
  * than a slow wave. It is a floor on carelessness, not a retention policy.
  */
@@ -112,7 +112,7 @@ export interface CleanupOptions {
    * Defaults to {@link DEFAULT_ORPHAN_TTL_MS}. `0` disables the age check, which
    * is what a test wants and what an operator cleaning up after a known-dead run
    * may want; it is never the default, because the orphan a scan is most likely
-   * to find on a busy machine is another orchestrator's live worktree.
+   * to find on a busy machine is another Dispatched Code's live worktree.
    */
   readonly orphanTtlMs?: number;
 }
@@ -356,12 +356,13 @@ async function containedWhere(repoRoot: string, sha: string, containers: readonl
  * The path check is the whole safety property and it is done here rather than at
  * a call site, because there is exactly one function that can delete a directory
  * and it should be the one that knows which directories are deletable. A path
- * outside the orchestrator's worktree root — the user's checkout above all — is
+ * outside Dispatched Code's worktree root — the user's checkout above all — is
  * left alone and reported as not removed.
  */
 async function removeWorktree(repoRoot: string, path: string, worktreeRoot: string): Promise<boolean> {
   const target = resolve(path);
-  if (!isUnder(target, worktreeRoot) && !target.includes(`${sep}${ORCHESTRATOR_DIR}${sep}`)) return false;
+  const underState = [STATE_DIR, LEGACY_STATE_DIR].some((d) => target.includes(`${sep}${d}${sep}`));
+  if (!isUnder(target, worktreeRoot) && !underState) return false;
   await git(repoRoot, ["worktree", "remove", "--force", target], { allowFailure: true });
   if (existsSync(target)) rmSync(target, { recursive: true, force: true });
   await git(repoRoot, ["worktree", "prune"], { allowFailure: true });

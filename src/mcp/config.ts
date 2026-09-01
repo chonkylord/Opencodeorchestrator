@@ -7,7 +7,7 @@
  * one more thing to find. `env` is the channel the host already has.
  *
  * Every value has a defensible default, so the zero-configuration launch —
- * `claude mcp add orchestrator -- bun run src/mcp/server.ts` — orchestrates the
+ * `claude mcp add dispatched-code -- bun run src/mcp/server.ts` — orchestrates the
  * directory the host started in.
  */
 
@@ -24,6 +24,7 @@ import {
   parseModelPool,
 } from "../manager/index.js";
 import { DEFAULT_DASHBOARD_PORT } from "../observe/index.js";
+import { LEGACY_STATE_DIR, stateDir } from "../workspace/index.js";
 import { clampWaitMax } from "./tools.js";
 
 export interface ServerConfig {
@@ -81,14 +82,14 @@ export interface ServerConfig {
    * DD-9's per-mode model presets (§11 Phase 8).
    *
    * Configuration has always had a slot for these; Phase 8 is where something
-   * reads them. `ORCHESTRATOR_MODEL_IMPLEMENT` / `_RESEARCH` / `_REVIEW`.
+   * reads them. `DISPATCHED_CODE_MODEL_IMPLEMENT` / `_RESEARCH` / `_REVIEW`.
    */
   readonly models: Partial<Record<WorkerMode, string>>;
   /**
    * Models a `review` worker may be routed to, so it is not the model that wrote
    * the code (§11 Phase 8, §15's "cross-model adversarial review").
    *
-   * `ORCHESTRATOR_REVIEW_POOL`, comma-separated and in preference order.
+   * `DISPATCHED_CODE_REVIEW_POOL`, comma-separated and in preference order.
    */
   readonly reviewPool: readonly string[];
   /**
@@ -99,14 +100,14 @@ export interface ServerConfig {
    * committed for you, and there is no merge because the work is already in your
    * tree. `isolated` gives each worker its own worktree and branch behind the
    * gated merge — stronger evidence, at the cost of workers not seeing each
-   * other. `ORCHESTRATOR_WORKSPACE`.
+   * other. `DISPATCHED_CODE_WORKSPACE`.
    */
   readonly workspace: WorkspaceMode;
   /**
    * `worker_wait`'s cap, in milliseconds (§11 Phase 9).
    *
    * Defaults to 30,000 — half the one host ceiling anybody has measured. Raise
-   * it only after measuring your own with `orchestrator_timeout_probe`, and
+   * it only after measuring your own with `dispatched_code_timeout_probe`, and
    * measure it *with* `progressEveryMs`, because a host that resets its timeout
    * on progress notifications has a completely different ceiling from one that
    * does not. Setting it past what your host will actually wait for does not
@@ -118,9 +119,9 @@ export interface ServerConfig {
    * The local dashboard's port (§11 Phase 9), or a negative number to switch it
    * off entirely.
    *
-   * `ORCHESTRATOR_DASHBOARD_PORT`; `ORCHESTRATOR_DASHBOARD=0` turns it off. `0`
+   * `DISPATCHED_CODE_DASHBOARD_PORT`; `DISPATCHED_CODE_DASHBOARD=0` turns it off. `0`
    * asks the operating system for any free port, which is what you want when
-   * several orchestrators run at once — the URL is printed to stderr at startup
+   * several instances run at once — the URL is printed to stderr at startup
    * either way.
    *
    * It binds 127.0.0.1 and serves `GET` only. That is not configurable: a
@@ -133,7 +134,7 @@ export interface ServerConfig {
    *
    * `full` (the default) grants everything and answers any permission request
    * in band, so a worker never stops at a wall and never spends a turn asking to
-   * be let through one. `ORCHESTRATOR_PERMISSIONS=jailed` restores the worktree
+   * be let through one. `DISPATCHED_CODE_PERMISSIONS=jailed` restores the worktree
    * boundary: `external_directory` becomes a question Claude answers with
    * `worker_message({decision})`.
    *
@@ -145,8 +146,20 @@ export interface ServerConfig {
   readonly permissionMode: PermissionMode;
 }
 
-/** `.orchestrator/` is already git-excluded for the worktrees; the index joins it. */
-export const DEFAULT_DB_RELATIVE = ".orchestrator/orchestrator.db";
+/**
+ * The index's default location: the state directory, which is already
+ * git-excluded for the worktrees, and the index joins it.
+ *
+ * Both halves of the name move together. A checkout still on `.orchestrator/`
+ * keeps `orchestrator.db`, because pointing a renamed server at a new filename
+ * inside an old directory would hand it an empty index — and an empty index is
+ * not a cosmetic loss: it is every worker row, every event and every merge the
+ * previous process recorded.
+ */
+export function defaultDbPath(repoRoot: string): string {
+  const dir = stateDir(repoRoot);
+  return resolve(repoRoot, dir, dir === LEGACY_STATE_DIR ? "orchestrator.db" : "dispatched-code.db");
+}
 
 /**
  * DD-9's default. Free-tier, needs no configured credentials, and rejects
@@ -154,42 +167,124 @@ export const DEFAULT_DB_RELATIVE = ".orchestrator/orchestrator.db";
  */
 export const DEFAULT_MODEL_ENV = "opencode/muse-spark-1.2-contributor-free";
 
+/** The prefix every setting carries. */
+export const ENV_PREFIX = "DISPATCHED_CODE_";
+/** What that prefix was before the rename to Dispatched Code. */
+export const LEGACY_ENV_PREFIX = "ORCHESTRATOR_";
+
+/**
+ * Every setting this server reads, without its prefix.
+ *
+ * Listed once and used twice — by {@link loadConfig} to read them and by
+ * {@link deprecatedEnv} to report the old spellings still in use. A setting
+ * added to one and forgotten in the other would be a setting that silently
+ * stopped honouring its old name, which is the one failure this whole
+ * arrangement exists to prevent.
+ */
+export const SETTINGS = [
+  "REPO",
+  "DB",
+  "MODEL",
+  "BASE_URL",
+  "VERIFY_TESTS",
+  "MAX_CONCURRENT",
+  "MAX_REVISIONS",
+  "MAX_RETRIES",
+  "RUN_BUDGET_TOKENS",
+  "MODEL_IMPLEMENT",
+  "MODEL_RESEARCH",
+  "MODEL_REVIEW",
+  "REVIEW_POOL",
+  "WORKSPACE",
+  "WAIT_MAX_MS",
+  "DASHBOARD",
+  "DASHBOARD_PORT",
+  "PERMISSIONS",
+] as const;
+
+export type Setting = (typeof SETTINGS)[number];
+
+/**
+ * One setting, under whichever name the environment spells it.
+ *
+ * The new name wins when both are set. That is the only defensible precedence:
+ * somebody who has written the new spelling has migrated on purpose, and a
+ * stale line in a shell profile should not quietly outrank it. The launch says
+ * so on stderr rather than leaving it to be discovered — see {@link
+ * deprecatedEnv}.
+ */
+function read(env: NodeJS.ProcessEnv, setting: Setting): string | undefined {
+  return env[`${ENV_PREFIX}${setting}`] ?? env[`${LEGACY_ENV_PREFIX}${setting}`];
+}
+
+/** A setting the environment names the old way. */
+export interface EnvDeprecation {
+  /** The `ORCHESTRATOR_*` name that is set. */
+  readonly legacy: string;
+  /** The `DISPATCHED_CODE_*` name that replaces it. */
+  readonly replacement: string;
+  /**
+   * Both names are set, so the old one is doing nothing at all.
+   *
+   * Worth separating from a plain deprecation: a variable that is merely old
+   * still works, and a variable that is being ignored is a setting the user
+   * believes is in force and is not.
+   */
+  readonly shadowed: boolean;
+}
+
+/**
+ * Which settings this launch is reading under their pre-rename names.
+ *
+ * Separate from {@link loadConfig} rather than returned alongside the config,
+ * because it is a startup diagnostic and not part of what the server is
+ * configured to do — and because every caller of `loadConfig` that does not
+ * write to stderr should not have to know this exists.
+ */
+export function deprecatedEnv(env: NodeJS.ProcessEnv = process.env): readonly EnvDeprecation[] {
+  return SETTINGS.filter((s) => env[`${LEGACY_ENV_PREFIX}${s}`] !== undefined).map((s) => ({
+    legacy: `${LEGACY_ENV_PREFIX}${s}`,
+    replacement: `${ENV_PREFIX}${s}`,
+    shadowed: env[`${ENV_PREFIX}${s}`] !== undefined,
+  }));
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): ServerConfig {
-  const repoRoot = resolve(env["ORCHESTRATOR_REPO"] ?? cwd);
-  const rawDb = env["ORCHESTRATOR_DB"];
+  const repoRoot = resolve(read(env, "REPO") ?? cwd);
+  const rawDb = read(env, "DB");
   return {
     repoRoot,
-    dbPath: rawDb === undefined ? resolve(repoRoot, DEFAULT_DB_RELATIVE) : rawDb === ":memory:" ? rawDb : resolve(rawDb),
-    defaultModel: env["ORCHESTRATOR_MODEL"] ?? DEFAULT_MODEL_ENV,
-    ...(env["ORCHESTRATOR_BASE_URL"] === undefined ? {} : { baseUrl: env["ORCHESTRATOR_BASE_URL"] }),
+    dbPath: rawDb === undefined ? defaultDbPath(repoRoot) : rawDb === ":memory:" ? rawDb : resolve(rawDb),
+    defaultModel: read(env, "MODEL") ?? DEFAULT_MODEL_ENV,
+    ...(read(env, "BASE_URL") === undefined ? {} : { baseUrl: read(env, "BASE_URL") as string }),
     // Opt-out rather than opt-in: the manager's own test run is the evidence
     // behind a worker's "tests pass", and DD-4 is worth less without it.
-    verifyTests: env["ORCHESTRATOR_VERIFY_TESTS"] !== "0",
+    verifyTests: read(env, "VERIFY_TESTS") !== "0",
     // Clamped rather than validated: an unparseable or absurd value should start
     // the server on the default, not refuse to launch. A host that will not come
     // up because of a typo in one env var is worse than one that runs at 3.
-    maxConcurrent: clampConcurrency(numberOr(env["ORCHESTRATOR_MAX_CONCURRENT"])),
+    maxConcurrent: clampConcurrency(numberOr(read(env, "MAX_CONCURRENT"))),
     // Clamped, not validated, for the same reason as the cap above: a typo in an
     // env var should start the server on the default rather than refuse to launch.
-    maxRevisions: clampRevisions(numberOr(env["ORCHESTRATOR_MAX_REVISIONS"])),
-    maxRetries: clampRetries(numberOr(env["ORCHESTRATOR_MAX_RETRIES"])),
-    runBudgetTokens: clampRunBudget(numberOr(env["ORCHESTRATOR_RUN_BUDGET_TOKENS"])),
+    maxRevisions: clampRevisions(numberOr(read(env, "MAX_REVISIONS"))),
+    maxRetries: clampRetries(numberOr(read(env, "MAX_RETRIES"))),
+    runBudgetTokens: clampRunBudget(numberOr(read(env, "RUN_BUDGET_TOKENS"))),
     models: {
-      ...(env["ORCHESTRATOR_MODEL_IMPLEMENT"] ? { implement: env["ORCHESTRATOR_MODEL_IMPLEMENT"] } : {}),
-      ...(env["ORCHESTRATOR_MODEL_RESEARCH"] ? { research: env["ORCHESTRATOR_MODEL_RESEARCH"] } : {}),
-      ...(env["ORCHESTRATOR_MODEL_REVIEW"] ? { review: env["ORCHESTRATOR_MODEL_REVIEW"] } : {}),
+      ...(read(env, "MODEL_IMPLEMENT") ? { implement: read(env, "MODEL_IMPLEMENT") as string } : {}),
+      ...(read(env, "MODEL_RESEARCH") ? { research: read(env, "MODEL_RESEARCH") as string } : {}),
+      ...(read(env, "MODEL_REVIEW") ? { review: read(env, "MODEL_REVIEW") as string } : {}),
     },
-    reviewPool: parseModelPool(env["ORCHESTRATOR_REVIEW_POOL"]),
-    // Anything but an exact "isolated" means shared: the default is the mode the
-    // orchestrator is meant to be used in, and a typo should not silently opt a
-    // user into the slower one.
-    workspace: env["ORCHESTRATOR_WORKSPACE"] === "isolated" ? "isolated" : "shared",
-    waitMaxMs: clampWaitMax(numberOr(env["ORCHESTRATOR_WAIT_MAX_MS"])),
+    reviewPool: parseModelPool(read(env, "REVIEW_POOL")),
+    // Anything but an exact "isolated" means shared: the default is the mode
+    // Dispatched Code is meant to be used in, and a typo should not silently opt
+    // a user into the slower one.
+    workspace: read(env, "WORKSPACE") === "isolated" ? "isolated" : "shared",
+    waitMaxMs: clampWaitMax(numberOr(read(env, "WAIT_MAX_MS"))),
     dashboardPort: dashboardPort(env),
-    // Anything but an exact "jailed" means full, mirroring ORCHESTRATOR_WORKSPACE:
-    // the default is the mode the orchestrator is meant to run in, and a typo
+    // Anything but an exact "jailed" means full, mirroring DISPATCHED_CODE_WORKSPACE:
+    // the default is the mode Dispatched Code is meant to run in, and a typo
     // should not silently move somebody to the one that stops and asks.
-    permissionMode: env["ORCHESTRATOR_PERMISSIONS"] === "jailed" ? "jailed" : "full",
+    permissionMode: read(env, "PERMISSIONS") === "jailed" ? "jailed" : "full",
   };
 }
 
@@ -202,8 +297,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.c
  * variable; a port collision costs a log line and nothing else.
  */
 function dashboardPort(env: NodeJS.ProcessEnv): number {
-  if (env["ORCHESTRATOR_DASHBOARD"] === "0" || env["ORCHESTRATOR_DASHBOARD"] === "off") return -1;
-  const raw = numberOr(env["ORCHESTRATOR_DASHBOARD_PORT"]);
+  const off = read(env, "DASHBOARD");
+  if (off === "0" || off === "off") return -1;
+  const raw = numberOr(read(env, "DASHBOARD_PORT"));
   if (raw === undefined) return DEFAULT_DASHBOARD_PORT;
   // A port outside the legal range is a typo, and a typo should not silently
   // disable the dashboard — that is what the explicit off switch is for.

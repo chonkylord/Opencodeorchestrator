@@ -66,7 +66,7 @@ async function harness(
   cleanup.push(() => backend.dispose());
   await backend.start();
 
-  const dbPath = join(repo.path, "orchestrator.db");
+  const dbPath = join(repo.path, "dispatched-code.db");
   const store = new Store(dbPath);
   cleanup.push(() => store.close());
 
@@ -196,7 +196,7 @@ describe("§11 Phase 7 AC: kill -9 mid-run, restart, clean recovery", () => {
     h.manager.halt();
 
     // Same mock: a server that outlived the manager, which is what
-    // ORCHESTRATOR_BASE_URL produces in practice.
+    // DISPATCHED_CODE_BASE_URL produces in practice.
     const second = await restart(h, { recoverGraceMs: 4_000 });
     await second.recover();
     second.recoverWorker(spawned.workerID, "resume");
@@ -595,7 +595,7 @@ describe("the metrics log", () => {
     const r = await manager.spawn(spec({ runID: "metrics-run" }));
     await manager.wait(r.workerID, 6_000);
 
-    const dir = join(repo, ".orchestrator", "metrics");
+    const dir = join(repo, ".dispatched-code", "metrics");
     const files = readdirSync(dir);
     expect(files).toHaveLength(1);
     const lines = readFileSync(join(dir, files[0]!), "utf8").trim().split("\n");

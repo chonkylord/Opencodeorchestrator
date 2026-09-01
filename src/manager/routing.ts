@@ -21,8 +21,8 @@
  *   based on task classification", and the honest classifier available here is
  *   the *mode*, which Claude states explicitly. Guessing a category out of a
  *   one-line task description would route work to the wrong model silently, and
- *   the only way to do it properly is a model call — a dependency the
- *   orchestrator has never taken and should not take for a routing hint.
+ *   the only way to do it properly is a model call — a dependency
+ *   Dispatched Code has never taken and should not take for a routing hint.
  * - **It is not random.** A reviewer is picked deterministically, because a
  *   system whose whole value is evidence should produce the same route twice for
  *   the same inputs. "Which model reviewed this?" must have an answer that does

@@ -37,7 +37,7 @@ this precedence:
    experiment, and silently overriding an explicit parameter would make it a
    suggestion. The route still records that such a review is not independent.
 2. **Review diversity.** A reviewer with a known author model takes the first
-   candidate that differs from it, from `ORCHESTRATOR_REVIEW_POOL`, then the
+   candidate that differs from it, from `DISPATCHED_CODE_REVIEW_POOL`, then the
    `review` preset, then the default.
 3. **The mode preset**, then **the default**.
 
@@ -54,7 +54,7 @@ model configured, which is everyone until they set a pool.
 model selection based on task classification", and the only honest classifier
 available is the *mode*, which Claude states explicitly. Guessing a category out
 of a one-line task would route work to the wrong model silently, and doing it
-properly needs a model call — a dependency the orchestrator has never taken and
+properly needs a model call — a dependency Dispatched Code has never taken and
 should not take for a routing hint.
 
 ## Decision 2: the reviewer's worktree is the author's snapshot, not its base

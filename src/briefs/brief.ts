@@ -55,7 +55,7 @@ export interface BriefContext {
 const MODE_RULES: Readonly<Record<WorkerMode, readonly string[]>> = {
   implement: [
     "You may create, edit and delete files inside this worktree, and run shell commands.",
-    "Do not commit. The orchestrator snapshots your work for you when you finish.",
+    "Do not commit. Dispatched Code snapshots your work for you when you finish.",
   ],
   research: [
     "You are read-only. Do not create, edit or delete any file, and do not run commands that mutate state.",
@@ -106,7 +106,7 @@ export function buildBrief(ctx: BriefContext): Brief {
   // outside it" — described a wall that no longer exists. A constraint the runtime
   // does not enforce is worth stating only if it is worth obeying, and this one
   // is: what changed is that reaching out is now a *choice the worker makes* and
-  // the orchestrator sees afterwards in the diff, rather than one it is stopped
+  // Dispatched Code sees afterwards in the diff, rather than one it is stopped
   // at. So it is phrased as scope discipline, which is true, instead of as a
   // boundary, which is not.
   lines.push(
@@ -170,7 +170,7 @@ export function buildBrief(ctx: BriefContext): Brief {
     "```",
     "",
     "This report is the only channel by which your work is read. Anything not in it is",
-    "invisible to the orchestrator. `changes` is checked against the real git diff, so list",
+    "invisible to Dispatched Code. `changes` is checked against the real git diff, so list",
     "exactly what you changed: claiming a file you did not touch is worse than claiming nothing.",
     'If you cannot finish, report status "blocked" with your question, or "failed" with what broke.',
   );
@@ -209,7 +209,7 @@ export function buildAnswerPrompt(questions: readonly string[], answer: string):
     for (const q of questions) lines.push(`> ${q}`);
     lines.push("");
   }
-  lines.push("The orchestrator answers:");
+  lines.push("Dispatched Code answers:");
   lines.push(...answer.split("\n").map((l) => `> ${l}`));
   lines.push("");
   lines.push(
@@ -238,7 +238,7 @@ export function buildRevisionPrompt(feedback: string, round: number, maxRounds: 
   const lines: string[] = [];
   lines.push(`Revision ${round} of at most ${maxRounds}. Your previous attempt was reviewed and is not accepted yet.`);
   lines.push("");
-  lines.push("The orchestrator's feedback:");
+  lines.push("Dispatched Code's feedback:");
   lines.push(...feedback.split("\n").map((l) => `> ${l}`));
   lines.push("");
   lines.push(
@@ -259,8 +259,8 @@ export function buildRevisionPrompt(feedback: string, round: number, maxRounds: 
     "",
     "## How to report",
     "",
-    "Leave `changes` **empty**. It means *files you edited*, and you edit nothing — the",
-    "orchestrator checks it against your own git diff, so listing the files you reviewed there",
+    "Leave `changes` **empty**. It means *files you edited*, and you edit nothing —",
+    "Dispatched Code checks it against your own git diff, so listing the files you reviewed there",
     "reports you as having changed them and produces a false finding about your own work.",
     "The files you are commenting on go in `risks` and `followUps`, named in the text.",
     "",
@@ -296,7 +296,7 @@ export interface ReviewTarget {
    * which is exactly what happened before this field existed.
    */
   readonly atSnapshot: boolean;
-  /** What the orchestrator's own reconciliation already found, if anything. */
+  /** What Dispatched Code's own reconciliation already found, if anything. */
   readonly discrepancies: readonly string[];
 }
 
@@ -310,7 +310,7 @@ export interface ReviewTarget {
  *    content and the summary is another model's output; both are exactly the
  *    prompt-injection surface DD-8 names, and a reviewer that follows an
  *    instruction it found inside a diff is a reviewer that has been captured.
- * 2. **The reviewer is told what the orchestrator already measured.** It is not
+ * 2. **The reviewer is told what Dispatched Code already measured.** It is not
  *    asked to re-derive whether the tests pass — the manager ran them itself —
  *    so its rounds are spent on the thing a diff-reader can actually add.
  */
@@ -331,7 +331,7 @@ export function buildReviewPrompt(target: ReviewTarget): string {
   );
   if (target.discrepancies.length > 0) {
     lines.push("");
-    lines.push("The orchestrator has already reconciled its claims against the diff and found:");
+    lines.push("Dispatched Code has already reconciled its claims against the diff and found:");
     for (const d of target.discrepancies) lines.push(`- ${d}`);
     lines.push("Those are settled. Do not spend your round re-finding them.");
   }

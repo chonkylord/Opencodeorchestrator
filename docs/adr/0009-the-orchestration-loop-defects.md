@@ -52,13 +52,13 @@ reset, a single `worker_wait` can cover the whole six minutes. So:
   client supplied a progress token. Costs one tiny frame per tick; silent when no
   token was sent, because a progress notification nothing can correlate is noise
   the host discards.
-- The cap moves out of the source and into `ORCHESTRATOR_WAIT_MAX_MS`, clamped to
+- The cap moves out of the source and into `DISPATCHED_CODE_WAIT_MAX_MS`, clamped to
   1 s – 600 s.
 - **The default does not move.** 30,000 ms is still half of the one ceiling
   anybody has measured, and a cap past what a host will actually wait for does
   not produce longer waits — it produces failed tool calls, and a failed wait
   leaves a worker running with nobody watching it.
-- `orchestrator_timeout_probe` gains `progressEveryMs`, so the ceiling *with*
+- `dispatched_code_timeout_probe` gains `progressEveryMs`, so the ceiling *with*
   heartbeats can be measured on a real host rather than assumed. That instrument
   was kept in Phase 0 for exactly this: "a host upgrade can move that ceiling".
 
@@ -133,7 +133,7 @@ unclaimed work and reads as a discrepancy — a false finding in the one channel
 DD-4 depends on for true ones.
 
 **The decision.** A third place, which is both inside the jail and outside the
-measurement: `<tree>/.orchestrator/scratch/<workerID>`. `.orchestrator/` is
+measurement: `<tree>/.dispatched-code/scratch/<workerID>`. `.dispatched-code/` is
 already git-excluded and already filtered out of every changed-file list, so
 nothing written there can reach a diff, a snapshot or a reconciliation, and no
 permission is needed to write it. The brief names the directory and says not to

@@ -111,7 +111,7 @@ describe("persistence", () => {
 
   test("survives a close and reopen on disk", () => {
     const dir = tempDir();
-    const path = join(dir, "orchestrator.db");
+    const path = join(dir, "dispatched-code.db");
     const first = new Store(path);
     first.createRun({ id: "run-1", repoRoot: "/repo" });
     first.putWorker(record({ state: "running" }));

@@ -2,7 +2,7 @@
  * The local dashboard (§11 Phase 9; §15's "web dashboard for run telemetry",
  * which every phase since v1 has deferred).
  *
- * The problem it solves is not telemetry. It is that **the orchestrator's whole
+ * The problem it solves is not telemetry. It is that **Dispatched Code's whole
  * design is a context firewall, and a firewall has two sides.** Everything in
  * `src/mcp/` exists to keep worker transcripts out of Claude's context, and it
  * works — a spawn→poll→result round trip costs under 2k tokens where the raw
@@ -132,7 +132,7 @@ export function startDashboard(opts: DashboardOptions): Dashboard | undefined {
   } catch (e) {
     unsubscribeActivity();
     log(`could not start on ${DASHBOARD_HOST}:${opts.port ?? DEFAULT_DASHBOARD_PORT} — ${String(e)}`);
-    log("the orchestrator is running normally; only the dashboard is unavailable");
+    log("Dispatched Code is running normally; only the dashboard is unavailable");
     return undefined;
   }
 

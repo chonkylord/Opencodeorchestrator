@@ -87,7 +87,7 @@ function fixture(records: WorkerRecord[] = [record()], orphans: string[] = []): 
     port: 0,
     log: () => {},
     server: {
-      name: "opencode-orchestrator",
+      name: "dispatched-code",
       version: "test",
       repoRoot: repo.path,
       defaultModel: "opencode/muse",
@@ -129,7 +129,7 @@ describe("the static UI", () => {
   test("the page is the dashboard rather than whatever else is on disk", async () => {
     const { dash } = fixture();
     const html = await (await get(dash, "/")).text();
-    expect(html).toContain("<title>Orchestrator</title>");
+    expect(html).toContain("<title>Dispatched Code</title>");
     expect(html).toContain('id="graph"');
   });
 });
@@ -149,7 +149,7 @@ describe("it refuses everything it has no business doing", () => {
     for (const path of ["/../package.json", "/%2e%2e%2fpackage.json", "/../../etc/passwd", "/..%2F..%2Fpackage.json"]) {
       const res = await get(dash, path);
       expect(res.status).toBe(404);
-      expect(await res.text()).not.toContain("opencode-orchestrator");
+      expect(await res.text()).not.toContain("dispatched-code");
     }
   });
 
@@ -206,7 +206,7 @@ describe("/api/worker/:id/detail", () => {
   test("brings the brief, the spec, the trail and the transcript in one call", async () => {
     const { dash, store, activity } = fixture();
     store.appendEvent("w-001", "state:running", { from: "preparing" });
-    store.appendEvent("w-001", "scratch_ready", { path: "/x/.orchestrator/scratch/w-001" });
+    store.appendEvent("w-001", "scratch_ready", { path: "/x/.dispatched-code/scratch/w-001" });
     activity.append("w-001", { kind: "text", at: now, text: "reading houses.js" });
 
     const body = await getJson(dash, "/api/worker/w-001/detail");
@@ -342,7 +342,7 @@ describe("failing to start is not failing to orchestrate", () => {
       port: first.dash.port,
       log: (l) => lines.push(l),
       server: {
-        name: "opencode-orchestrator",
+        name: "dispatched-code",
         version: "test",
         repoRoot: repo.path,
         defaultModel: "opencode/muse",

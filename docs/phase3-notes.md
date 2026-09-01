@@ -9,6 +9,13 @@ file records all three with the method used to get them, so the next person can
 repeat rather than trust them. It also records what was *not* built, and two bugs
 in earlier phases that this one surfaced.
 
+**On the names in this file.** Everything quoted here — commands, prompts, tool
+calls, the host's errors, Claude's own words — is reproduced as it ran on
+2026-08-28, when the project was called OpenCode Orchestrator. So the probe is
+`orchestrator_timeout_probe`, the server's local alias is `orchestrator`, and
+the tools come through as `mcp__orchestrator__*`. A measurement rewritten to
+match a later name is no longer a measurement.
+
 ---
 
 ## 1. The host's MCP tool-call timeout — 60 s
@@ -17,9 +24,9 @@ Phase 0's first unresolved item, open since the beginning, because the
 measurement needs a live Claude Code session with the server registered and
 Phase 3 is the first phase to have one.
 
-**Method.** `orchestrator_timeout_probe` (built in Phase 0, kept for exactly
-this) registered as a real MCP server in a headless session and called with
-increasing delays:
+**Method.** The timeout probe (built in Phase 0, kept for exactly this)
+registered as a real MCP server in a headless session and called with increasing
+delays.
 
 ```bash
 claude -p --strict-mcp-config --mcp-config mcp.json \
@@ -68,7 +75,7 @@ struck.
 > end-to-end.
 
 **Setup.** The golden repo (`test/fixtures/golden/`) in a temp git repository,
-the orchestrator registered over `--mcp-config`, and **only** the orchestrator's
+Dispatched Code registered over `--mcp-config`, and **only** Dispatched Code's
 tools allowed — no `Bash`, no `Edit`, no `Read`. Claude could not have touched
 the repository itself even if it had decided to; everything it knows about the
 work arrived through the tool surface.
@@ -116,7 +123,7 @@ tokens spent by the worker — none of which reached Claude.
 > files … with nothing out-of-scope.
 
 That paragraph is the part worth keeping. Nothing in the prompt taught Claude to
-separate what the worker claimed from what the orchestrator verified; the tool
+separate what the worker claimed from what Dispatched Code verified; the tool
 descriptions did, which is what §7 means by "delegation heuristics live in the
 tool descriptions so Claude self-calibrates" and what DD-8 needs in order to be
 more than a comment in a design document.
@@ -233,7 +240,7 @@ completed. The record now clears the reason on completion.
 
 ## 6. Things worth knowing before Phase 4 builds on this
 
-- **`createOrchestrator(config, tuning?)` is the seam the tests use.** It builds
+- **`createDispatchedCode(config, tuning?)` is the seam the tests use.** It builds
   the backend, index and manager and returns them alongside the `McpServer`, so a
   test can drive the real server over `InMemoryTransport` instead of calling
   handlers directly. That matters more than it sounds: a zod schema the SDK

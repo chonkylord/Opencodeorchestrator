@@ -156,7 +156,7 @@ follow, and all three are properties somebody could break without noticing:
   ignored, and the worker ran to completion anyway.
 - The default cap is **3**, not the 4 Phase 1 measured. That measurement is one
   run, four sessions, one free-tier model (`docs/phase0-facts.md` "Unresolved" 2),
-  and it says so itself. `ORCHESTRATOR_MAX_CONCURRENT` moves it for anyone who
+  and it says so itself. `DISPATCHED_CODE_MAX_CONCURRENT` moves it for anyone who
   has measured their own provider.
 - Retries with backoff are **not** here. If a provider rate-limits under
   concurrency, the honest response is a row in the fact sheet and a lower

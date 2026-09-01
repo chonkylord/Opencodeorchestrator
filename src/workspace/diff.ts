@@ -33,7 +33,7 @@
  */
 
 import { git } from "./git.js";
-import { ORCHESTRATOR_DIR, REPORT_FILE } from "./worktree.js";
+import { LEGACY_STATE_DIR, REPORT_FILE, STATE_DIR } from "./worktree.js";
 
 /** §8's number. The default page and the hard ceiling on one. */
 export const DIFF_LINES_DEFAULT = 400;
@@ -50,7 +50,9 @@ export const DIFF_BYTES_MAX = 8 * 1024 * 1024;
 /** Untracked files rendered per call. Beyond this they are named, not shown. */
 const UNTRACKED_MAX = 50;
 
-const EXCLUDED = [ORCHESTRATOR_DIR, REPORT_FILE];
+// Both state-directory names, for the reason `worktree.ts` gives: exclusion is
+// cheap and a state directory that reaches a diff is a false discrepancy.
+const EXCLUDED = [STATE_DIR, LEGACY_STATE_DIR, REPORT_FILE];
 const EXCLUDE_PATHSPECS = EXCLUDED.map((p) => `:(exclude)${p}`);
 
 export interface DiffOptions {
@@ -191,10 +193,10 @@ export async function readCommitDiff(
 // ---------------------------------------------------------------------------
 
 /**
- * Caller-supplied paths, plus the orchestrator's own exclusions.
+ * Caller-supplied paths, plus Dispatched Code's own exclusions.
  *
  * The exclusions are not optional and are not the caller's to drop:
- * `.orchestrator/` holds the worker manifest and the index, and a `worker_diff`
+ * The state directory holds the worker manifest and the index, and a `worker_diff`
  * that renders them is showing Claude its own bookkeeping as if a worker had
  * written it.
  */

@@ -28,7 +28,7 @@ export type WorkerState =
   | "preparing"
   /** A prompt is in flight and the event stream is being consumed. */
   | "running"
-  /** The worker asked for something. Only the orchestrator can move it on. */
+  /** The worker asked for something. Only Dispatched Code can move it on. */
   | "blocked"
   /** Work finished and was snapshotted. Phase 4 may still merge it. */
   | "completed"
@@ -87,7 +87,7 @@ const FINAL: ReadonlySet<WorkerState> = new Set<WorkerState>([
 /**
  * Outcomes that mean "this worker will not produce more work without a new
  * instruction" — what a caller polling for an answer is waiting on. `blocked`
- * counts: the worker has stopped and the orchestrator has to act.
+ * counts: the worker has stopped and Dispatched Code has to act.
  */
 const SETTLED: ReadonlySet<WorkerState> = new Set<WorkerState>([
   "blocked",
@@ -130,7 +130,7 @@ export type Trigger =
   | "start"
   /** The worker asked a question or hit a permission wall. */
   | "block"
-  /** The orchestrator answered; same session, new prompt. */
+  /** Dispatched Code answered; same session, new prompt. */
   | "resume"
   /** Terminal event arrived and the report says the work is done. */
   | "complete"
@@ -182,7 +182,7 @@ export const TRANSITIONS: readonly Transition[] = Object.freeze([
   { from: "preparing", trigger: "exhaust_budget", to: "over_budget", note: "§8's run cap stopped it before it opened a session" },
   { from: "preparing", trigger: "interrupt", to: "interrupted", note: "manager died mid-setup" },
 
-  { from: "running", trigger: "block", to: "blocked", note: "worker asked; only the orchestrator can unblock it" },
+  { from: "running", trigger: "block", to: "blocked", note: "worker asked; only Dispatched Code can unblock it" },
   { from: "running", trigger: "complete", to: "completed", note: "terminal event, report parsed, snapshot taken" },
   { from: "running", trigger: "fail", to: "failed", note: "typed error, dead server, or an unusable report" },
   { from: "running", trigger: "timeout", to: "timed_out", note: "hard deadline or idle watchdog" },

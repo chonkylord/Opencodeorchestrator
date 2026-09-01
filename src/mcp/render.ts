@@ -62,7 +62,7 @@ const ROUND_FEEDBACK_CHARS = 300;
 const ROUND_SUMMARY_CHARS = 200;
 
 /**
- * Marks text the *worker* wrote, as opposed to the orchestrator's own findings.
+ * Marks text the *worker* wrote, as opposed to Dispatched Code's own findings.
  *
  * DD-8 in one character. A question arrives as a quoted line; a discrepancy
  * never does, because a discrepancy is what `git` said.
@@ -250,7 +250,7 @@ export function renderBlocked(r: WorkerRecord, now: number, orphaned = false): s
     ...(orphaned
       ? [
           `worker_message would fail. Use worker_recover({id: "${r.workerID}", action: "resume"}) —`,
-          "its worktree is intact, so the orchestrator can salvage what it produced into a real",
+          "its worktree is intact, so Dispatched Code can salvage what it produced into a real",
           `result. action: "discard" lets it go instead.`,
         ]
       : [
@@ -552,7 +552,7 @@ export function renderMerge(record: MergeRecord, now: number): string {
   const next =
     o.state === "succeeded"
       ? `The work is on ${o.integrationBranch}. Review it (worker_diff per worker), then land it yourself —\n` +
-        "the orchestrator never writes to your branch or your working tree."
+        "Dispatched Code never writes to your branch or your working tree."
       : "Nothing was left half-merged. Read the failing step below: a conflict wants one of the two\n" +
         "workers respawned against the other's result; a red gate wants the worker's own fix. The\n" +
         "workers are untouched and still `completed`, so a new merge can be started once they are.";
@@ -655,7 +655,7 @@ export function renderReviseStarted(
  * runaway into a dead end: Claude knows it may not ask again and knows nothing
  * else. This says what was tried each round, what actually changed between them,
  * what is still wrong, and what the remaining options are — because at this
- * point the decision genuinely is Claude's, and the orchestrator's job is to
+ * point the decision genuinely is Claude's, and Dispatched Code's job is to
  * hand over everything it measured while getting here.
  *
  * Everything the worker wrote is quoted and capped (DD-8); everything git and
@@ -739,7 +739,7 @@ export function renderRevisionCap(report: RevisionCapReport): string {
   if (capped) {
     lines.push(
       "",
-      `Raising \`ORCHESTRATOR_MAX_REVISIONS\` above ${report.maxRevisions} is possible and is a decision about this repository rather than this worker. Nothing here does it for you.`,
+      `Raising \`DISPATCHED_CODE_MAX_REVISIONS\` above ${report.maxRevisions} is possible and is a decision about this repository rather than this worker. Nothing here does it for you.`,
     );
   } else {
     lines.push(
@@ -794,8 +794,8 @@ export function renderRecovered(outcome: RecoverOutcome, maxRevisions: number): 
     // it is only known once the work starts — so this says what will be decided
     // rather than pretending to know it.
     "If its session survived the crash it is re-attached and monitored. If it did not — the ordinary case —",
-    "it is settled from its worktree instead: snapshot, measured diff, your test command re-run by the",
-    "orchestrator, reconciliation. Either way you get a result and a branch worth merging; what is gone is",
+    "it is settled from its worktree instead: snapshot, measured diff, your test command re-run by",
+    "Dispatched Code, reconciliation. Either way you get a result and a branch worth merging; what is gone is",
     "the worker's own report, which died with the process that was holding it.",
     "",
     `Next: worker_wait({ids: ["${r.workerID}"]}), then worker_result. If it comes back short of done, its`,
@@ -891,7 +891,7 @@ export function modelCapabilityNote(
   return (
     `NOTE: ${model} has been measured rejecting schema-constrained replies, so this worker's turn goes out ` +
     "without the report schema attached. It still reports — over the report file — but its report is prose " +
-    "the orchestrator parses rather than a structure the provider guarantees, so `reportSource` may be " +
+    "Dispatched Code parses rather than a structure the provider guarantees, so `reportSource` may be " +
     "`report_file` or `none`. The measurements (diff, tests, discrepancies) are unaffected and are the half " +
     "that carries the evidence. Pass an explicit `model` to use one that supports it.\n"
   );

@@ -62,7 +62,7 @@ async function harness(
   cleanup.push(() => backend.dispose());
   await backend.start();
 
-  const dbPath = join(repo.path, "orchestrator.db");
+  const dbPath = join(repo.path, "dispatched-code.db");
   const store = new Store(dbPath);
   cleanup.push(() => store.close());
 
@@ -135,7 +135,7 @@ describe("spawn to completed", () => {
       .map((e) => e.kind)
       .filter((k) => k.startsWith("state:"));
     expect(states).toEqual(["state:preparing", "state:running", "state:completed"]);
-    expect(existsSync(join(repo, ".orchestrator", "worktrees", spawned.workerID))).toBe(true);
+    expect(existsSync(join(repo, ".dispatched-code", "worktrees", spawned.workerID))).toBe(true);
   });
 
   test("the worktree carries its own manifest (DD-7)", async () => {
@@ -143,7 +143,7 @@ describe("spawn to completed", () => {
     const w = await manager.spawn(spec());
     const done = await manager.wait(w.workerID, 5_000);
 
-    const manifest = JSON.parse(readFileSync(join(done.worktree, ".orchestrator", "worker.json"), "utf8"));
+    const manifest = JSON.parse(readFileSync(join(done.worktree, ".dispatched-code", "worker.json"), "utf8"));
     expect(manifest).toMatchObject({ version: 1, workerID: w.workerID, runID: "run-1", branch: `worker/${w.workerID}` });
     // Written again once the session exists, so a rebuilt index can still find it.
     expect(manifest.sessionID).toBe(done.sessionID);
@@ -384,7 +384,7 @@ describe("reconciliation in the loop (DD-4)", () => {
     expect(done.result!.reportSource).toBe("none");
     expect(done.result!.changes.paths).toEqual(["hello.txt"]);
     expect(done.result!.discrepancies.some((d) => d.kind === "unparseable_report")).toBe(true);
-    expect(renderResult(done.result!)).toContain("the orchestrator's own measurement");
+    expect(renderResult(done.result!)).toContain("Dispatched Code's own measurement");
   });
 
   test("§5's secondary channel: a report.json in the worktree is used when the reply is empty", async () => {
@@ -431,7 +431,7 @@ describe("worker modes (DD-10)", () => {
     // §11 Phase 10 / ADR-0011. Until then this was `HEADLESS_PERMISSIONS` plus
     // `doom_loop`, with `external_directory` deliberately left at `ask` as §8's
     // jail signal. That signal is now granted by default; the set it was part of
-    // is what `ORCHESTRATOR_PERMISSIONS=jailed` restores, asserted in
+    // is what `DISPATCHED_CODE_PERMISSIONS=jailed` restores, asserted in
     // `test/manager/phase10.test.ts`.
     expect((create.body as Record<string, unknown>)["permission"]).toEqual([
       { permission: "edit", pattern: "**", action: "allow" },

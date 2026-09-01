@@ -3,7 +3,7 @@
  *
  * All four came out of one real run rather than from reading the code, and the
  * suite is written the same way round: produce the state the run reached, then
- * assert on what the orchestrator does about it.
+ * assert on what Dispatched Code does about it.
  *
  * The state that matters most is the one nothing could rescue. A worker reaches
  * `blocked`, the process holding its session dies, and a second process opens
@@ -71,7 +71,7 @@ async function harness(
   const backend = new ServeBackend({ baseUrl: mock.baseUrl });
   cleanup.push(() => backend.dispose());
   await backend.start();
-  const store = new Store(join(repo.path, "orchestrator.db"));
+  const store = new Store(join(repo.path, "dispatched-code.db"));
   cleanup.push(() => store.close());
   const manager = new WorkerManager({
     backend,
@@ -169,9 +169,9 @@ describe("answerability — a write that did not land must not look like one", (
     expect(a.ok).toBe(false);
     if (!a.ok) {
       expect(a.code).toBe("orphaned");
-      expect(a.message).toContain("previous orchestrator process");
+      expect(a.message).toContain("previous Dispatched Code process");
     }
-    await expect(next.answer(id, "the palette file")).rejects.toThrow(/previous orchestrator process/);
+    await expect(next.answer(id, "the palette file")).rejects.toThrow(/previous Dispatched Code process/);
   });
 });
 
@@ -259,7 +259,7 @@ describe("every implement worker gets scratch space inside its jail", () => {
     writeFileSync(join(scratch, "verify.js"), "console.log('scratch')\n");
     await waitFor(() => h.manager.get(id)?.state === "completed", 10_000, "the worker to complete");
     const result = h.manager.get(id)?.result;
-    expect(result?.changes.paths ?? []).not.toContain(".orchestrator/scratch/${id}/verify.js");
+    expect(result?.changes.paths ?? []).not.toContain(".dispatched-code/scratch/${id}/verify.js");
     for (const p of result?.changes.paths ?? []) expect(p).not.toContain("scratch");
     for (const d of result?.discrepancies ?? []) expect(d.file ?? "").not.toContain("scratch");
   });
@@ -288,7 +288,7 @@ describe("every implement worker gets scratch space inside its jail", () => {
 });
 
 describe("the observer sees the run loop, and cannot break it", () => {
-  test("a worker's frames reach the observer in the orchestrator's own vocabulary", async () => {
+  test("a worker's frames reach the observer in Dispatched Code's own vocabulary", async () => {
     const seen: Array<{ id: string; kind: string }> = [];
     const h = await harness({}, { observer: { activity: (id, e) => seen.push({ id, kind: e.kind }) } });
     const id = (await h.manager.spawn(spec())).workerID;
@@ -296,7 +296,7 @@ describe("the observer sees the run loop, and cannot break it", () => {
 
     expect(seen.length).toBeGreaterThan(0);
     expect(seen.every((e) => e.id === id)).toBe(true);
-    // `note` is the orchestrator's own side of the conversation; without it a
+    // `note` is Dispatched Code's own side of the conversation; without it a
     // resumed worker appears to start talking again for no reason.
     expect(seen.some((e) => e.kind === "note")).toBe(true);
     // Liveness ticks are not activity and must never reach the dashboard.

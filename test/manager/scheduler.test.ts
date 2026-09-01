@@ -57,7 +57,7 @@ async function harness(
   cleanup.push(() => backend.dispose());
   await backend.start();
 
-  const store = new Store(join(repo.path, "orchestrator.db"));
+  const store = new Store(join(repo.path, "dispatched-code.db"));
   cleanup.push(() => store.close());
 
   const manager = new WorkerManager({
@@ -476,7 +476,7 @@ describe("restart semantics (ADR-0004)", () => {
     const backend = new ServeBackend({ baseUrl: mock.baseUrl });
     cleanup.push(() => backend.dispose());
     await backend.start();
-    const dbPath = join(repo.path, "orchestrator.db");
+    const dbPath = join(repo.path, "dispatched-code.db");
 
     const first = new Store(dbPath);
     const managerA = new WorkerManager({ backend, store: first, repoRoot: repo.path, tickMs: 10, maxConcurrent: 1, verifyTests: false });

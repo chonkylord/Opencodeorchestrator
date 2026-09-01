@@ -1,8 +1,8 @@
 /**
  * The manager's own vocabulary — the data contracts from `projectplan.md` §4.
  *
- * Nothing here names an OpenCode shape (DD-2). A `WorkerRecord` is what the
- * orchestrator knows about a worker; a `WorkerResult` is what Claude is shown.
+ * Nothing here names an OpenCode shape (DD-2). A `WorkerRecord` is what
+ * Dispatched Code knows about a worker; a `WorkerResult` is what Claude is shown.
  */
 
 import type { MergeOutcome, MergeState } from "../workspace/merge.js";
@@ -86,7 +86,7 @@ export interface WorkerSpec {
   /**
    * Where this worker does its work (§11 Phase 8's shared-workspace mode).
    *
-   * - `shared` — **the repository you pointed the orchestrator at**, directly.
+   * - `shared` — **the repository you pointed Dispatched Code at**, directly.
    *   Every worker sees every other worker's edits as they happen, which is how
    *   Claude's own subagents behave and is the default. Nothing is committed for
    *   you and nothing is merged: the work is simply in your tree when it is done,
@@ -131,11 +131,11 @@ export interface ActivityInput {
     | "tool"
     /** A file the worker edited. */
     | "file"
-    /** The worker asked for a permission, or asked the orchestrator a question. */
+    /** The worker asked for a permission, or asked Dispatched Code a question. */
     | "ask"
     /** A provider or adapter error on this worker's stream. */
     | "error"
-    /** Anything the orchestrator itself wants shown inline. */
+    /** Anything Dispatched Code itself wants shown inline. */
     | "note";
   readonly at: number;
   /** Untrusted worker text (DD-8). Bounded by the ring, never interpreted. */

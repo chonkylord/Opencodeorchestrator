@@ -1,6 +1,6 @@
 # Handoff: implement Phase 1 — the OpenCode adapter
 
-You are picking up the **Claude → OpenCode Subagent Orchestrator** at
+You are picking up **Dispatched Code** at
 `chonkylord/Opencodeorchestrator`. Phase 0 is complete and pushed. Your job is
 Phase 1, and only Phase 1.
 

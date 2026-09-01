@@ -2,7 +2,7 @@
 
 **Status:** accepted (Phase 4)
 **Amended by [ADR-0008](0008-shared-workspace.md) (Phase 8).** The rule below —
-that the orchestrator never writes to the user's working tree — held for every
+that Dispatched Code never writes to the user's working tree — held for every
 phase up to 8 and still holds for `isolated` workers. Phase 8's `shared` mode, now
 the default, does write files there by request. What ADR-0003 was actually
 protecting is unchanged and unchangeable: **`git reset --hard` never runs in the
@@ -37,7 +37,7 @@ available answer.
 
 ## Decision 1: every merge operation runs in a dedicated integration worktree
 
-`git worktree add .orchestrator/integration/<mergeID> -b integration/<mergeID>
+`git worktree add .dispatched-code/integration/<mergeID> -b integration/<mergeID>
 <base-sha>`, created at the start of a merge and removed at the end. The merge,
 the test gate and — above all — the rollback all run with that directory as
 their cwd. `config.repoRoot` is read from, never written to.
@@ -46,14 +46,14 @@ their cwd. `config.repoRoot` is read from, never written to.
 real repository. A human may have it open, on a branch of their choosing, with
 uncommitted work in the tree. `git merge` there is rude. `git reset --hard`
 there — which *is* the rollback, on the failure path, which is the path a merge
-pipeline exists for — destroys work the orchestrator never created and cannot
+pipeline exists for — destroys work Dispatched Code never created and cannot
 restore. There is no undo, no reflog entry for an uncommitted file, and no way
 to tell the user what they lost. It is the single most dangerous thing in the
 phase and it is entirely preventable by choosing the right cwd once.
 
 Consequences we accepted deliberately:
 
-- **`.orchestrator/` is already in `.git/info/exclude`** (written by
+- **`.dispatched-code/` is already in `.git/info/exclude`** (written by
   `createWorktree` since Phase 2), so the integration worktree is invisible to
   the user's `git status` without touching their `.gitignore`.
 - **The branch is the deliverable; the worktree is scaffolding.** The
@@ -61,7 +61,7 @@ Consequences we accepted deliberately:
   Everything worth keeping is a commit on `integration/<mergeID>`, which
   survives, and which `workspace_cleanup` can then treat as a container that
   makes worker branches safe to prune.
-- **The orchestrator never lands anything on the user's branch.** A green merge
+- **Dispatched Code never lands anything on the user's branch.** A green merge
   ends with a branch and a sentence saying where it is. Fast-forwarding the
   user's own branch is a separate, explicit act, and Phase 4 does not do it at
   all — not even offered behind a flag. A tool that can write to the user's
@@ -94,7 +94,7 @@ They work. They are also the wrong tool here, for four measured reasons:
    `worker/<id>` is not available, and that name is load-bearing in three
    places: §9's orphan scan globs `worker/*`, DD-7's manifest correlates a
    worktree to a worker id, and `workspace_cleanup` distinguishes the
-   orchestrator's branches from the user's by prefix.
+   Dispatched Code's branches from the user's by prefix.
 
 2. **No base ref.** The worktree branches from whatever HEAD happens to be at
    the moment of the call. Phase 2 made `createWorktree` resolve a ref to a
@@ -105,7 +105,7 @@ They work. They are also the wrong tool here, for four measured reasons:
    invalidate overlap detection, which is a wrong answer rather than an error.
 
 3. **The worktrees live outside the repository**, under
-   `~/.local/share/opencode/worktree/<sha>/<name>`. `.orchestrator/` and its
+   `~/.local/share/opencode/worktree/<sha>/<name>`. `.dispatched-code/` and its
    `info/exclude` entry do not reach there; neither does "delete the temp repo
    and the run is gone", which is what makes the test fixtures safe.
 

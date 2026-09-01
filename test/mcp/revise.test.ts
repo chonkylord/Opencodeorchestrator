@@ -4,7 +4,7 @@
  * The §11 Phase 6 acceptance criterion is here and it is one test: **a seeded
  * failing worker receives feedback, fixes it, and passes** — where "fails" is a
  * real assertion failure in the golden repo's own suite and "passes" is the
- * orchestrator re-running that suite itself. A test that stubbed either end
+ * dispatched re-running that suite itself. A test that stubbed either end
  * would be checking that the manager can copy a boolean.
  *
  * The other half of the AC — that the loop terminates at the cap with an
@@ -21,7 +21,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { OCMock } from "../ocmock/server.js";
-import { createOrchestrator, type ManagerTuning, type Orchestrator } from "../../src/mcp/server.js";
+import { createDispatchedCode, type ManagerTuning, type DispatchedCode } from "../../src/mcp/server.js";
 import type { ServerConfig } from "../../src/mcp/config.js";
 import { GOLDEN_TEST_COMMAND, breakGoldenRepo, makeGoldenRepo } from "../fixtures/golden.js";
 import { sleep } from "../helpers.js";
@@ -66,10 +66,10 @@ const claims = (summary: string): Record<string, unknown> => ({
 
 interface Harness {
   client: Client;
-  orchestrator: Orchestrator;
+  dispatched: DispatchedCode;
   mock: OCMock;
   repo: string;
-  /** Kept so a test can start a *second* orchestrator over the same database. */
+  /** Kept so a test can start a *second* dispatched over the same database. */
   config: ServerConfig;
 }
 
@@ -93,7 +93,7 @@ async function harness(
 
   const config: ServerConfig = {
     repoRoot: repo.path,
-    dbPath: join(repo.path, ".orchestrator", "orchestrator.db"),
+    dbPath: join(repo.path, ".dispatched-code", "dispatched-code.db"),
     defaultModel: "ocmock/test-model",
     baseUrl: mock.baseUrl,
     verifyTests: false,
@@ -113,21 +113,21 @@ async function harness(
     permissionMode: "full",
     ...configOver,
   };
-  const orchestrator = await createOrchestrator(config, {
+  const dispatched = await createDispatchedCode(config, {
     tickMs: 10,
     budgetPollMs: 20,
     abortGraceMs: 400,
     retrySettleMs: 40,
     ...tuning,
   });
-  cleanup.push(() => orchestrator.dispose());
+  cleanup.push(() => dispatched.dispose());
 
   const client = new Client({ name: "test-host", version: "0.0.0" });
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-  await Promise.all([orchestrator.server.connect(serverSide), client.connect(clientSide)]);
+  await Promise.all([dispatched.server.connect(serverSide), client.connect(clientSide)]);
   cleanup.push(() => client.close());
 
-  return { client, orchestrator, mock, repo: repo.path, config };
+  return { client, dispatched, mock, repo: repo.path, config };
 }
 
 function git(cwd: string, args: string[]): string {
@@ -180,11 +180,11 @@ async function waitSettled(client: Client, id: string, ms = 25_000): Promise<str
 // ---------------------------------------------------------------------------
 
 describe("§11 Phase 6 AC: a seeded failing worker receives feedback, fixes it, and passes", () => {
-  test("round 1 fails the orchestrator's own test run; round 2 passes it", async () => {
+  test("round 1 fails Dispatched Code's own test run; round 2 passes it", async () => {
     // The repo is seeded so `npm test` genuinely fails on an assertion. The
     // worker "fixes" it wrongly the first time and correctly the second, and
     // both times it CLAIMS the tests pass — so the only thing that can tell the
-    // rounds apart is the orchestrator running the suite itself (§4.3). That is
+    // rounds apart is Dispatched Code running the suite itself (§4.3). That is
     // the property this test exists for.
     const h = await harness({ report: claims("Fixed sum().") }, { verifyTests: true }, {}, true);
 
@@ -204,7 +204,7 @@ describe("§11 Phase 6 AC: a seeded failing worker receives feedback, fixes it, 
 
     await waitSettled(h.client, id);
     const first = await call(h.client, "worker_result", { id });
-    // It claimed the suite passes; the orchestrator ran it and it does not.
+    // It claimed the suite passes; Dispatched Code ran it and it does not.
     expect(first.text).toContain("test_claim_unverified");
 
     // Now Claude does what Phase 6 exists for.
@@ -221,12 +221,12 @@ describe("§11 Phase 6 AC: a seeded failing worker receives feedback, fixes it, 
     await waitSettled(h.client, id);
     const second = await call(h.client, "worker_result", { id });
     expect(second.text).toContain("completed");
-    // The claim is now true, and the orchestrator's own run is what says so.
+    // The claim is now true, and Dispatched Code's own run is what says so.
     expect(second.text).not.toContain("test_claim_unverified");
     expect(second.text).toContain("Corrected the initial value of total.");
 
     // And the fix is really on disk in the worker's worktree, not just claimed.
-    const worktree = join(h.repo, ".orchestrator", "worktrees", id, "src", "stats.js");
+    const worktree = join(h.repo, ".dispatched-code", "worktrees", id, "src", "stats.js");
     expect(readFileSync(worktree, "utf8")).toContain("let total = 0;");
   }, 60_000);
 });
@@ -272,7 +272,7 @@ describe("the loop terminates at the cap with a report Claude can act on", () =>
     expect(text).toContain("workspace_merge");
     expect(text).toContain("worker_diff");
     expect(text).toContain("Spawn a replacement");
-    expect(text).toContain("ORCHESTRATOR_MAX_REVISIONS");
+    expect(text).toContain("DISPATCHED_CODE_MAX_REVISIONS");
 
     // The worker itself is untouched by the refusal.
     const status = await call(h.client, "worker_status", { ids: [id] });
@@ -481,13 +481,13 @@ describe("a review worker critiques another worker's diff", () => {
 
     // Read-only means read-only: it changed nothing, and the measurement says so
     // rather than the mode saying so.
-    const record = h.orchestrator.manager.get(reviewerID)!;
+    const record = h.dispatched.manager.get(reviewerID)!;
     expect(record.mode).toBe("review");
     expect(record.result!.changes.files).toBe(0);
     expect(record.result!.discrepancies).toEqual([]);
     // Its own worktree — not a mount of the author's, so its own measured diff
     // stays empty and a reviewer that writes something is visible.
-    const author2 = h.orchestrator.manager.get(authorID)!;
+    const author2 = h.dispatched.manager.get(authorID)!;
     expect(record.worktree).not.toBe(author2.worktree);
     // **At the author's SNAPSHOT, not its base** — corrected in Phase 8. Phase 6
     // branched from the base, so the files the reviewer could read were the
@@ -593,19 +593,19 @@ describe("§11 Phase 7's tools over the wire", () => {
   }, 30_000);
 
   test("worker_recover settles an interrupted worker and keeps its worktree", async () => {
-    // The whole flow, not a simulation of it: one orchestrator is killed mid-run
+    // The whole flow, not a simulation of it: one process is killed mid-run
     // with `halt()` (which writes nothing and drops the registry, exactly as a
-    // `kill -9` does), and a **second** orchestrator is started over the same
-    // database. `createOrchestrator` runs `recover()` on the way up, so the
+    // `kill -9` does), and a **second** dispatched is started over the same
+    // database. `createDispatchedCode` runs `recover()` on the way up, so the
     // interrupted row is produced by the real startup path.
     const h = await harness({ workMs: 3_000 });
     const id = idFrom((await call(h.client, "worker_spawn", { task: "a long one", runID: "run-1" })).text);
     const deadline = Date.now() + 8_000;
-    while (Date.now() < deadline && h.orchestrator.manager.get(id)?.state !== "running") await sleep(20);
-    const worktree = h.orchestrator.manager.get(id)!.worktree;
-    h.orchestrator.manager.halt();
+    while (Date.now() < deadline && h.dispatched.manager.get(id)?.state !== "running") await sleep(20);
+    const worktree = h.dispatched.manager.get(id)!.worktree;
+    h.dispatched.manager.halt();
 
-    const second = await createOrchestrator(h.config, { tickMs: 10, retrySettleMs: 40, recoverGraceMs: 200 });
+    const second = await createDispatchedCode(h.config, { tickMs: 10, retrySettleMs: 40, recoverGraceMs: 200 });
     cleanup.push(() => second.dispose());
     const client2 = new Client({ name: "test-host-2", version: "0.0.0" });
     const [c2, s2] = InMemoryTransport.createLinkedPair();
@@ -623,7 +623,7 @@ describe("§11 Phase 7's tools over the wire", () => {
     expect(existsSync(worktree)).toBe(true);
   }, 40_000);
 
-  test("a restarted orchestrator salvages an interrupted worker into a real result", async () => {
+  test("a restarted dispatched salvages an interrupted worker into a real result", async () => {
     // The §11 Phase 7 AC end to end and over the wire: kill the manager mid-run,
     // restart, and get back a worker with a measured diff and a mergeable branch
     // rather than a row that says something went wrong.
@@ -632,10 +632,10 @@ describe("§11 Phase 7's tools over the wire", () => {
       (await call(h.client, "worker_spawn", { task: "a long one", runID: "run-1", ownedPaths: ["hello.txt"] })).text,
     );
     const deadline = Date.now() + 8_000;
-    while (Date.now() < deadline && h.orchestrator.manager.get(id)?.state !== "running") await sleep(20);
-    h.orchestrator.manager.halt();
+    while (Date.now() < deadline && h.dispatched.manager.get(id)?.state !== "running") await sleep(20);
+    h.dispatched.manager.halt();
 
-    const second = await createOrchestrator(h.config, { tickMs: 10, retrySettleMs: 40, recoverGraceMs: 200 });
+    const second = await createDispatchedCode(h.config, { tickMs: 10, retrySettleMs: 40, recoverGraceMs: 200 });
     cleanup.push(() => second.dispose());
     const client2 = new Client({ name: "test-host-3", version: "0.0.0" });
     const [c2, s2] = InMemoryTransport.createLinkedPair();
@@ -703,7 +703,7 @@ describe("shared-workspace warnings over the wire", () => {
 async function waitForSession(h: Harness, id: string, ms = 15_000): Promise<string> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
-    const sessionID = h.orchestrator.manager.get(id)?.sessionID;
+    const sessionID = h.dispatched.manager.get(id)?.sessionID;
     if (sessionID) return sessionID;
     await sleep(10);
   }

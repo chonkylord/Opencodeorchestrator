@@ -1,7 +1,7 @@
 /**
  * Real tests, run by `npm test` with the node built-in runner and no deps.
  *
- * Named `checks.mjs` rather than `*.test.mjs` deliberately: the orchestrator's
+ * Named `checks.mjs` rather than `*.test.mjs` deliberately: Dispatched Code's
  * own suite globs for test files, and a fixture whose tests get collected by the
  * outer runner is a fixture that breaks the build it is meant to support.
  */

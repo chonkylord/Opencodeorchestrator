@@ -2,7 +2,7 @@
 
 **Status:** accepted (Phase 8)
 **Date:** 2026-08-30
-**Amends [ADR-0003](0003-integration-worktree.md)**, which said the orchestrator
+**Amends [ADR-0003](0003-integration-worktree.md)**, which said Dispatched Code
 never writes to the user's working tree. In `shared` mode it does — deliberately,
 by request, and with the one genuinely destructive operation still forbidden.
 
@@ -31,7 +31,7 @@ the option.**
 ## Decision 1: `shared` workers work in the repository itself
 
 No worktree, no branch. `WorkerSpec.workspace` chooses per worker;
-`ORCHESTRATOR_WORKSPACE` sets the default and only an exact `isolated` opts out,
+`DISPATCHED_CODE_WORKSPACE` sets the default and only an exact `isolated` opts out,
 because a typo should not silently move somebody to the slower mode.
 
 What follows from having no branch:
@@ -39,7 +39,7 @@ What follows from having no branch:
 - **Nothing is merged.** `workspace_merge` refuses a shared worker and says why.
   The work is already in the tree; there is nothing for a gate to stand between.
 - **Nothing is committed.** DD-5 has the manager snapshot so the worker does not
-  have to, which is right in a worktree the orchestrator owns. In the user's
+  have to, which is right in a worktree Dispatched Code owns. In the user's
   checkout `git add -A` would sweep up whatever else they had in progress, onto
   whatever branch they happen to be on, and call it one worker's snapshot. So the
   changes are left uncommitted, for a human to read and commit — which is also
@@ -52,7 +52,7 @@ What follows from having no branch:
 
 ADR-0003's rule existed for a specific operation, not a general squeamishness:
 the merge pipeline's rollback is `git reset --hard`, and run in the user's
-checkout it destroys work the orchestrator never created and cannot restore.
+checkout it destroys work Dispatched Code never created and cannot restore.
 
 That rule is **unchanged**. Shared mode does not merge, so it never rolls back,
 and the refusal in `requireMergeable()` is structural rather than advisory — a
@@ -60,7 +60,7 @@ worker with no branch cannot enter the pipeline at all. `workspace_cleanup` has
 the mirror guard: anything at or above the repository root is not ours to remove,
 whatever a candidate row claims.
 
-The honest summary of the trade: **the orchestrator will now write files into
+The honest summary of the trade: **Dispatched Code will now write files into
 your tree. It will still never commit, reset, checkout or delete there.**
 
 ## Decision 3: attribution is best-effort, and says so
@@ -155,7 +155,7 @@ exact filenames. The regression test uses a glob.
 ## Consequences
 
 - **§8's jail signal is weaker.** An isolated worker reaching outside its worktree
-  raises `external_directory`, which the orchestrator surfaces. A shared worker's
+  raises `external_directory`, which Dispatched Code surfaces. A shared worker's
   worktree *is* the repository, so anything inside the repo is in bounds and
   `ownedPaths` becomes the only boundary — enforced by reporting rather than by
   the sandbox. Anyone who wants the wall back should use `isolated`.

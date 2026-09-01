@@ -180,7 +180,7 @@ describe("the orphan scan (§9)", () => {
   });
 
   test("§9's TTL: a fresh orphan is reported and left alone, however forceful the ask", async () => {
-    // The failure this exists for is pruning another orchestrator's *live*
+    // The failure this exists for is pruning another instance's *live*
     // worktree — or this one's, before its index has caught up. Both look
     // exactly like an orphan to a scan, and neither is one.
     const root = repo();

@@ -13,10 +13,12 @@
 export { COMMIT_IDENTITY, type GitOptions, type GitOutcome, WorkspaceError, git, gitLine } from "./git.js";
 export {
   type CreateWorktreeOptions,
+  LEGACY_STATE_DIR,
   MANIFEST_FILE,
-  ORCHESTRATOR_DIR,
   REPORT_FILE,
   SCRATCH_DIR,
+  STATE_DIR,
+  stateDir,
   ensureScratch,
   scratchPath,
   type Snapshot,

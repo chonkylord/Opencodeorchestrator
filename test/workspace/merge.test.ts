@@ -214,7 +214,7 @@ describe("the gated merge (§6.3)", () => {
     const a = await worker(root, "w-001", { "alpha.txt": "alpha\n" });
     const outcome = await runMerge({ mergeID: "m-009", repoRoot: root, candidates: [a] });
 
-    expect(existsSync(join(root, ".orchestrator", "integration", "m-009"))).toBe(false);
+    expect(existsSync(join(root, ".dispatched-code", "integration", "m-009"))).toBe(false);
     // The branch is the deliverable and it survives the scaffolding.
     expect(await shaOf(root, outcome.integrationBranch)).toBe(outcome.headSha);
     // And git agrees the worktree is gone, rather than merely the directory.
@@ -222,12 +222,12 @@ describe("the gated merge (§6.3)", () => {
     expect(worktrees).not.toContain("m-009");
   });
 
-  test("`.orchestrator/` never enters a merge commit", async () => {
+  test("`.dispatched-code/` never enters a merge commit", async () => {
     const root = repo();
     const a = await worker(root, "w-001", { "alpha.txt": "alpha\n" });
     const outcome = await runMerge({ mergeID: "m-010", repoRoot: root, candidates: [a] });
     const tree = await gitLine(root, ["ls-tree", "-r", "--name-only", outcome.integrationBranch]);
-    expect(tree).not.toContain(".orchestrator");
+    expect(tree).not.toContain(".dispatched-code");
   });
 
   test("candidates from different bases are reported rather than silently merged", async () => {

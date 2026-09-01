@@ -42,7 +42,7 @@ describe("the transition table", () => {
 
   test("every non-final state has a way out", () => {
     // A state with no exits that is not marked final is a worker that hangs
-    // forever with no error — the worst possible failure mode for an orchestrator.
+    // forever with no error — the worst possible failure mode for a system like this one.
     for (const s of WORKER_STATES) {
       if (!isFinal(s)) expect(triggersFrom(s).length).toBeGreaterThan(0);
     }

@@ -61,7 +61,7 @@ async function harness(
   cleanup.push(() => backend.dispose());
   await backend.start();
 
-  const store = new Store(join(repo.path, "orchestrator.db"));
+  const store = new Store(join(repo.path, "dispatched-code.db"));
   cleanup.push(() => store.close());
 
   const manager = new WorkerManager({

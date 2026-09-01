@@ -2,7 +2,7 @@
  * The MCP server (§3.5, §11 Phase 3) — the process the host actually launches.
  *
  * Wire it into Claude Code with:
- *   claude mcp add orchestrator -- bun run <repo>/src/mcp/server.ts
+ *   claude mcp add dispatched-code -- bun run <repo>/src/mcp/server.ts
  *
  * One process owns one backend, one index and one manager, and the startup order
  * below is not arbitrary:
@@ -34,16 +34,16 @@ import { ServeBackend } from "../opencode/index.js";
 import { MergeCoordinator, WorkerManager, type WorkerManagerOptions, fileMetrics } from "../manager/index.js";
 import { Store } from "../store/index.js";
 import { ActivityLog, type Dashboard, startDashboard } from "../observe/index.js";
-import { ensureExcluded } from "../workspace/index.js";
-import { type ServerConfig, loadConfig } from "./config.js";
+import { ensureExcluded, stateDir } from "../workspace/index.js";
+import { type ServerConfig, deprecatedEnv, loadConfig } from "./config.js";
 import { registerWorkerTools } from "./tools.js";
 
-export const SERVER_NAME = "opencode-orchestrator";
+export const SERVER_NAME = "dispatched-code";
 export const SERVER_VERSION = "0.7.0";
 
-const log = (line: string): void => console.error(`[orchestrator] ${line}`);
+const log = (line: string): void => console.error(`[dispatched-code] ${line}`);
 
-export interface Orchestrator {
+export interface DispatchedCode {
   readonly server: McpServer;
   readonly manager: WorkerManager;
   /** Phase 4's gated merge, tracked separately from the workers it merges. */
@@ -76,7 +76,7 @@ export type ManagerTuning = Omit<Partial<WorkerManagerOptions>, "backend" | "sto
  * rejects at registration time, or a tool that answers correctly to a direct
  * call and not at all to a protocol one.
  */
-export async function createOrchestrator(config: ServerConfig, tuning: ManagerTuning = {}): Promise<Orchestrator> {
+export async function createDispatchedCode(config: ServerConfig, tuning: ManagerTuning = {}): Promise<DispatchedCode> {
   const backend = new ServeBackend({
     cwd: config.repoRoot,
     ...(config.baseUrl === undefined ? {} : { baseUrl: config.baseUrl }),
@@ -93,14 +93,16 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
   let dashboard: Dashboard | undefined;
 
   if (config.dbPath !== ":memory:") mkdirSync(dirname(config.dbPath), { recursive: true });
-  // Before the first write into `.orchestrator/`, not when a worker first
+  // Before the first write into the state directory, not when a worker first
   // prepares a worktree. The database and the run reports land there whether or
   // not any worker ever starts, so a run that spawned nothing — or whose every
   // spawn was refused — used to leave the directory visible in the user's
   // `git status`. Best-effort: a repository we cannot write an exclude into is
   // not a reason to refuse to start.
   await ensureExcluded(config.repoRoot).catch((e: unknown) => {
-    log(`could not exclude .orchestrator/ from git status: ${e instanceof Error ? e.message : String(e)}`);
+    log(
+      `could not exclude ${stateDir(config.repoRoot)}/ from git status: ${e instanceof Error ? e.message : String(e)}`,
+    );
   });
   const store = new Store(config.dbPath, {
     onWorker: (record) => dashboard?.publishWorker(record.workerID),
@@ -196,7 +198,7 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
 /**
  * The Phase 0 instrument, kept.
  *
- * It is not part of the orchestrator's real surface — every production tool
+ * It is not part of Dispatched Code's real surface — every production tool
  * returns in under two seconds (DD-1) — but it is the only way to measure the
  * ceiling that claim is calibrated against, and a host upgrade can move that
  * ceiling. Deleting it would mean rebuilding it the next time the number is in
@@ -204,18 +206,18 @@ export async function createOrchestrator(config: ServerConfig, tuning: ManagerTu
  */
 export function registerProbe(server: McpServer): void {
   server.registerTool(
-    "orchestrator_timeout_probe",
+    "dispatched_code_timeout_probe",
     {
       title: "Host tool-call timeout probe",
       description:
-        "MEASUREMENT INSTRUMENT, not part of the orchestrator. Sleeps for delayMs and returns. Used to " +
+        "MEASUREMENT INSTRUMENT, not part of Dispatched Code. Sleeps for delayMs and returns. Used to " +
         "find the host's tool-call timeout by calling it with increasing delays until the call fails; " +
         "the largest delay that still returns is the ceiling worker_wait's cap sits under. Do not call " +
         "it in the course of ordinary work.\n\n" +
         "Pass `progressEveryMs` to measure the OTHER ceiling: the one that applies while the call emits " +
         "`notifications/progress`. Hosts may reset a tool-call timeout on progress, and whether this one " +
         "does is the difference between a six-minute wave costing eight worker_wait calls and costing " +
-        "one. Measure both, then set ORCHESTRATOR_WAIT_MAX_MS to half of whichever ceiling you got.",
+        "one. Measure both, then set DISPATCHED_CODE_WAIT_MAX_MS to half of whichever ceiling you got.",
       inputSchema: {
         delayMs: z.number().int().min(0).max(600_000).describe("How long to sleep before returning, in milliseconds"),
         progressEveryMs: z
@@ -273,14 +275,23 @@ export function registerProbe(server: McpServer): void {
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  const orchestrator = await createOrchestrator(config);
+  // Before anything else writes to stderr, so a stale variable name is the first
+  // thing in the log rather than a line somebody scrolls past.
+  for (const d of deprecatedEnv()) {
+    log(
+      d.shadowed
+        ? `${d.legacy} is set but ignored — ${d.replacement} is set too and wins`
+        : `${d.legacy} is deprecated and still honoured; rename it to ${d.replacement}`,
+    );
+  }
+  const dispatched = await createDispatchedCode(config);
 
   let shuttingDown = false;
   const shutdown = (signal: string): void => {
     if (shuttingDown) return;
     shuttingDown = true;
     log(`${signal} — stopping workers and shutting down`);
-    void orchestrator
+    void dispatched
       .dispose()
       .catch((e: unknown) => log(`shutdown: ${String(e)}`))
       .finally(() => process.exit(0));
@@ -288,7 +299,7 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-  await orchestrator.server.connect(new StdioServerTransport());
+  await dispatched.server.connect(new StdioServerTransport());
   log(
     `ready on stdio · db ${config.dbPath} · model ${config.defaultModel} · ` +
       `max ${config.maxConcurrent} concurrent · max ${config.maxRevisions} revisions · ` +

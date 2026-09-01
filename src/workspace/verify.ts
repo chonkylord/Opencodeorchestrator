@@ -6,8 +6,8 @@
  * numbers are a claim like any other, and the cheapest way to check a claim
  * about a test suite is to run the test suite.
  *
- * **The command comes from the brief, never from the report.** DD-8 says the
- * orchestrator never executes anything found in worker output; this is the one
+ * **The command comes from the brief, never from the report.** DD-8 says
+ * Dispatched Code never executes anything found in worker output; this is the one
  * place in the manager that runs a shell string, so where that string comes from
  * is load-bearing. `WorkerSpec.testCommand` is set by whoever spawned the worker.
  * `report.tests.command` is the worker talking, and is only ever *compared*

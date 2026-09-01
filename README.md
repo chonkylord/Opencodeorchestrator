@@ -1,6 +1,6 @@
-# Claude → OpenCode Subagent Orchestrator
+# Dispatched Code
 
-An MCP server that lets Claude delegate implementation work to parallel OpenCode
+**claude → opencode.** An MCP server that lets Claude delegate implementation work to parallel OpenCode
 workers — by default in your own repository, together, the way Claude's native
 subagents work — and see back only structured results, never worker transcripts.
 
@@ -111,7 +111,7 @@ w-001: completed | changed: src/geometry.js
 That last line is the point: your own half-finished work is never credited to a
 worker. Give each worker `ownedPaths` and the middle line shrinks to nothing.
 
-The orchestrator will write files into your tree. It will **never** commit, reset,
+Dispatched Code will write files into your tree. It will **never** commit, reset,
 checkout or delete there — `git reset --hard` in your checkout is the one thing
 [ADR-0003](docs/adr/0003-integration-worktree.md) forbade and Phase 8 did not move.
 
@@ -119,8 +119,8 @@ Pass `workspace: "isolated"` for a worker that should get its own worktree and
 branch behind the test gate instead — stronger evidence, at the cost of it not
 seeing its siblings' work.
 
-The merge never runs in your checkout. It runs in an integration worktree the
-orchestrator creates under `.orchestrator/` and removes afterwards, so
+The merge never runs in your checkout. It runs in an integration worktree
+Dispatched Code creates under `.dispatched-code/` and removes afterwards, so
 `git reset --hard` — which is the rollback, on the path a merge pipeline exists
 for — can never reach a file you have not committed. A green merge leaves a
 branch and tells you where it is; landing it is yours to do.
@@ -132,7 +132,7 @@ Took 6s · gate: `npm test`
   w-002: merged → 4f1c8ade · tests green
 
 The work is on integration/m-001. Review it (worker_diff per worker), then land it yourself —
-the orchestrator never writes to your branch or your working tree.
+Dispatched Code never writes to your branch or your working tree.
 ```
 
 A worker that got something wrong goes back to the same session rather than being
@@ -167,12 +167,12 @@ The worktrees are the durable state (DD-7), so a restart does not ask the worker
 what it did — it reads the repository:
 
 ```
-[orchestrator] recovered 1 interrupted worker(s) from a previous process
+[dispatched-code] recovered 1 interrupted worker(s) from a previous process
 AFTER RECOVER: interrupted | manager_restart
 RECOVER: resuming
 FINAL: completed
 FILES: 2  src/stats.js, test/checks.mjs
-TESTS: npm test — re-run by the orchestrator, green
+TESTS: npm test — re-run by Dispatched Code, green
 SNAPSHOT: 4e1e271884
 REPORT SOURCE: none
 ```
@@ -257,10 +257,10 @@ OC_E2E=1 OC_E2E_AGENTS=1 bun test test/e2e        # + the AGENTS.md pickup probe
 ## Run the MCP server
 
 ```bash
-claude mcp add orchestrator -- bun run "$PWD/src/mcp/server.ts"
+claude mcp add dispatched-code -- bun run "$PWD/src/mcp/server.ts"
 ```
 
-That is the whole setup: with no configuration the server orchestrates the
+That is the whole setup: with no configuration the server works on the
 directory the host launched it in.
 
 ### Configuration
@@ -271,32 +271,60 @@ is one more thing to find.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `ORCHESTRATOR_REPO` | `process.cwd()` | The repository workers branch from. Worktrees are created under `<repo>/.orchestrator/worktrees/`. |
-| `ORCHESTRATOR_DB` | `<repo>/.orchestrator/orchestrator.db` | The SQLite index. `:memory:` works and means the run is not restartable. |
-| `ORCHESTRATOR_MODEL` | `opencode/muse-spark-1.2-contributor-free` | `provider/model` for workers that do not name one. The default is free-tier and needs no credentials. |
-| `ORCHESTRATOR_BASE_URL` | *(unset — spawn a server)* | Attach to an OpenCode server something else already owns, instead of spawning one. |
-| `ORCHESTRATOR_VERIFY_TESTS` | `1` | Re-run the brief's test command after a worker finishes. Set `0` to turn the independent verification off; DD-4 is worth less without it. |
-| `ORCHESTRATOR_MAX_CONCURRENT` | `3` | How many workers may run at once — counting `preparing`, `running` and `blocked`. Spawns past it are **queued**, not rejected. Phase 1 measured four concurrent sessions on one server completing with no cross-talk; that is one run on one free-tier model, so the default leaves headroom inside it. Raise it after measuring your own provider under load, not before. Clamped to 1–32; an unparseable value falls back to the default rather than refusing to start. |
-| `ORCHESTRATOR_MAX_REVISIONS` | `3` | How many rounds of feedback one worker may take through `worker_revise`. At the cap the tool refuses with a report of what was tried, what changed between rounds and what is still failing — the refusal is the deliverable, not an error. `0` turns revisions off entirely, which is a legitimate setting rather than a typo, so it is clamped to 1–20 only at the top. An unparseable value falls back to the default. |
-| `ORCHESTRATOR_MAX_RETRIES` | `2` | How many times a turn is re-sent after a provider error **the provider itself marks retryable** (exponential backoff from 1s, capped at 30s). A content filter or a bad request reproduces exactly and is failed on the first try rather than three times. `0` turns retries off; clamped to 0–10. |
-| `ORCHESTRATOR_RUN_BUDGET_TOKENS` | `2000000` | §8's global cap, in tokens across every worker sharing a `runID`. Per-worker budgets stop one worker running away; this stops a *wave* doing it — six workers each dutifully inside their own ceiling still spend six ceilings. Refuses a spawn rather than killing what is running, and is checked again before a queued worker opens a session. `0` disables it; there is no upper clamp, because a big number is somebody who has measured their own spend. |
-| `ORCHESTRATOR_MODEL_IMPLEMENT`<br>`ORCHESTRATOR_MODEL_RESEARCH`<br>`ORCHESTRATOR_MODEL_REVIEW` | *(unset)* | DD-9's per-mode model presets. Unset means every worker takes `ORCHESTRATOR_MODEL`. |
-| `ORCHESTRATOR_REVIEW_POOL` | *(unset)* | Comma-separated models a `review` worker may be routed to, in preference order — the first that is **not** the model which wrote the code under review. This is what makes a critique an independent read rather than the author marking its own homework. Unset means reviews fall back to the preset or the default, which may well be the author's own model; `worker_result` says which kind of review you got either way. |
-| `ORCHESTRATOR_DASHBOARD_PORT` | `4180` | The local dashboard's port. `0` takes any free port, which is what you want when several orchestrators run at once; the URL is printed to stderr at startup either way. A port outside 0–65535 falls back to the default rather than silently disabling it. |
-| `ORCHESTRATOR_DASHBOARD` | `1` | Set `0` or `off` to not start the dashboard at all. Nothing binds a socket; the transcript ring is still filled, since it costs nothing. |
-| `ORCHESTRATOR_WAIT_MAX_MS` | `30000` | `worker_wait`'s cap. The default is half the *plain* ceiling measured on Claude Code 2.1.251 (60s) — the one that applies to a call sending no progress. `worker_wait` does send progress, and on that same host the ceiling with heartbeats is **at least 600s** (the probe's own limit, not the host's), so `300000` is the measured setting there and cuts a six-minute wave from ~8 blocking calls to 2. **Raise it only after measuring your own** — see [Making `worker_wait` wait longer](#making-worker_wait-wait-longer). A cap past what your host will actually wait for does not buy longer waits; it turns every wait into a failed tool call, and a failed wait leaves a worker running with nobody watching it. Clamped to 1s–600s. |
-| `ORCHESTRATOR_WORKSPACE` | `shared` | Where workers work. `shared` puts every worker in **your repository**, together, the way Claude's native subagents behave — no branch, nothing committed for you, no merge because the work is already in your tree. `isolated` gives each its own worktree and branch behind the gated merge: stronger evidence, at the cost of workers not seeing each other. Only an exact `isolated` opts out; a typo leaves you on the default. Per-worker override: `worker_spawn({workspace})`. |
-| `ORCHESTRATOR_PERMISSIONS` | `full` | How much an `implement` worker may do (ADR-0011). `full` grants `edit`, `bash`, `webfetch`, `external_directory`, `doom_loop` and then `*` — everything, including permissions this adapter has never heard of, because the provider's default for an unknown one is `ask` and `ask` in a headless run is a worker waiting on nobody until a watchdog kills it. Nothing stops to ask, so **a worker can write anywhere this process can**; the diff records the reach instead of a permission wall preventing it. `jailed` restores the worktree boundary: `external_directory` becomes a question that reaches you as a `blocked` worker, answered with `worker_message({decision})` — the only mode in which that parameter does anything. Only an exact `jailed` opts out; a typo leaves you on the default. Neither setting touches `research` and `review` workers, which stay read-only in both: DD-10 is a correctness property (a read-only worker whose diff is not empty is a finding) rather than a safety one. |
+| `DISPATCHED_CODE_REPO` | `process.cwd()` | The repository workers branch from. Worktrees are created under `<repo>/.dispatched-code/worktrees/`. |
+| `DISPATCHED_CODE_DB` | `<repo>/.dispatched-code/dispatched-code.db` | The SQLite index. `:memory:` works and means the run is not restartable. |
+| `DISPATCHED_CODE_MODEL` | `opencode/muse-spark-1.2-contributor-free` | `provider/model` for workers that do not name one. The default is free-tier and needs no credentials. |
+| `DISPATCHED_CODE_BASE_URL` | *(unset — spawn a server)* | Attach to an OpenCode server something else already owns, instead of spawning one. |
+| `DISPATCHED_CODE_VERIFY_TESTS` | `1` | Re-run the brief's test command after a worker finishes. Set `0` to turn the independent verification off; DD-4 is worth less without it. |
+| `DISPATCHED_CODE_MAX_CONCURRENT` | `3` | How many workers may run at once — counting `preparing`, `running` and `blocked`. Spawns past it are **queued**, not rejected. Phase 1 measured four concurrent sessions on one server completing with no cross-talk; that is one run on one free-tier model, so the default leaves headroom inside it. Raise it after measuring your own provider under load, not before. Clamped to 1–32; an unparseable value falls back to the default rather than refusing to start. |
+| `DISPATCHED_CODE_MAX_REVISIONS` | `3` | How many rounds of feedback one worker may take through `worker_revise`. At the cap the tool refuses with a report of what was tried, what changed between rounds and what is still failing — the refusal is the deliverable, not an error. `0` turns revisions off entirely, which is a legitimate setting rather than a typo, so it is clamped to 1–20 only at the top. An unparseable value falls back to the default. |
+| `DISPATCHED_CODE_MAX_RETRIES` | `2` | How many times a turn is re-sent after a provider error **the provider itself marks retryable** (exponential backoff from 1s, capped at 30s). A content filter or a bad request reproduces exactly and is failed on the first try rather than three times. `0` turns retries off; clamped to 0–10. |
+| `DISPATCHED_CODE_RUN_BUDGET_TOKENS` | `2000000` | §8's global cap, in tokens across every worker sharing a `runID`. Per-worker budgets stop one worker running away; this stops a *wave* doing it — six workers each dutifully inside their own ceiling still spend six ceilings. Refuses a spawn rather than killing what is running, and is checked again before a queued worker opens a session. `0` disables it; there is no upper clamp, because a big number is somebody who has measured their own spend. |
+| `DISPATCHED_CODE_MODEL_IMPLEMENT`<br>`DISPATCHED_CODE_MODEL_RESEARCH`<br>`DISPATCHED_CODE_MODEL_REVIEW` | *(unset)* | DD-9's per-mode model presets. Unset means every worker takes `DISPATCHED_CODE_MODEL`. |
+| `DISPATCHED_CODE_REVIEW_POOL` | *(unset)* | Comma-separated models a `review` worker may be routed to, in preference order — the first that is **not** the model which wrote the code under review. This is what makes a critique an independent read rather than the author marking its own homework. Unset means reviews fall back to the preset or the default, which may well be the author's own model; `worker_result` says which kind of review you got either way. |
+| `DISPATCHED_CODE_DASHBOARD_PORT` | `4180` | The local dashboard's port. `0` takes any free port, which is what you want when several instances run at once; the URL is printed to stderr at startup either way. A port outside 0–65535 falls back to the default rather than silently disabling it. |
+| `DISPATCHED_CODE_DASHBOARD` | `1` | Set `0` or `off` to not start the dashboard at all. Nothing binds a socket; the transcript ring is still filled, since it costs nothing. |
+| `DISPATCHED_CODE_WAIT_MAX_MS` | `30000` | `worker_wait`'s cap. The default is half the *plain* ceiling measured on Claude Code 2.1.251 (60s) — the one that applies to a call sending no progress. `worker_wait` does send progress, and on that same host the ceiling with heartbeats is **at least 600s** (the probe's own limit, not the host's), so `300000` is the measured setting there and cuts a six-minute wave from ~8 blocking calls to 2. **Raise it only after measuring your own** — see [Making `worker_wait` wait longer](#making-worker_wait-wait-longer). A cap past what your host will actually wait for does not buy longer waits; it turns every wait into a failed tool call, and a failed wait leaves a worker running with nobody watching it. Clamped to 1s–600s. |
+| `DISPATCHED_CODE_WORKSPACE` | `shared` | Where workers work. `shared` puts every worker in **your repository**, together, the way Claude's native subagents behave — no branch, nothing committed for you, no merge because the work is already in your tree. `isolated` gives each its own worktree and branch behind the gated merge: stronger evidence, at the cost of workers not seeing each other. Only an exact `isolated` opts out; a typo leaves you on the default. Per-worker override: `worker_spawn({workspace})`. |
+| `DISPATCHED_CODE_PERMISSIONS` | `full` | How much an `implement` worker may do (ADR-0011). `full` grants `edit`, `bash`, `webfetch`, `external_directory`, `doom_loop` and then `*` — everything, including permissions this adapter has never heard of, because the provider's default for an unknown one is `ask` and `ask` in a headless run is a worker waiting on nobody until a watchdog kills it. Nothing stops to ask, so **a worker can write anywhere this process can**; the diff records the reach instead of a permission wall preventing it. `jailed` restores the worktree boundary: `external_directory` becomes a question that reaches you as a `blocked` worker, answered with `worker_message({decision})` — the only mode in which that parameter does anything. Only an exact `jailed` opts out; a typo leaves you on the default. Neither setting touches `research` and `review` workers, which stay read-only in both: DD-10 is a correctness property (a read-only worker whose diff is not empty is a finding) rather than a safety one. |
 
 ```bash
-claude mcp add orchestrator \
-  --env ORCHESTRATOR_REPO=/path/to/repo \
-  --env ORCHESTRATOR_MODEL=anthropic/claude-sonnet-4 \
+claude mcp add dispatched-code \
+  --env DISPATCHED_CODE_REPO=/path/to/repo \
+  --env DISPATCHED_CODE_MODEL=anthropic/claude-sonnet-4 \
   -- bun run "$PWD/src/mcp/server.ts"
 ```
 
-`.orchestrator/` is added to the repository's `.git/info/exclude` — local and
+`.dispatched-code/` is added to the repository's `.git/info/exclude` — local and
 uncommitted, because your `.gitignore` is yours.
+
+### If you set this up before the rename
+
+The project was called **OpenCode Orchestrator** until this release. Nothing you
+already have stops working, and there is no migration step:
+
+- **Every `ORCHESTRATOR_*` variable is still read**, under its old name, and the
+  server names it on stderr at startup so you know it is there:
+  `ORCHESTRATOR_MAX_CONCURRENT is deprecated and still honoured; rename it to
+  DISPATCHED_CODE_MAX_CONCURRENT`. Set both and the new one wins — somebody who
+  has written the new spelling has migrated on purpose, and a stale line in a
+  shell profile should not quietly outrank it. That case gets its own line, so a
+  setting you believe is in force and is not never passes silently.
+- **A checkout that already has `.orchestrator/` keeps using it**, database
+  filename included. The state directory is where the index, the worktrees, the
+  run reports and the metrics live, so switching names underneath an existing
+  checkout would not migrate that state — it would orphan every worktree and
+  start the index from empty. Only a tree that has never run this before gets
+  `.dispatched-code/`. To move an existing one, stop the server and
+  `mv .orchestrator .dispatched-code`; nothing inside it refers to the directory
+  by name.
+- **`claude mcp add <alias>` was always your own label**, so an existing entry
+  called `orchestrator` keeps working. The server's own identity is now
+  `dispatched-code`.
+
+`OpenCode` is not part of this rename anywhere. It is the backend the workers run
+on, the binary you install, and the prefix on the model id — a different product,
+not an old name for this one.
 
 ### Watching a run: `http://127.0.0.1:4180`
 
@@ -321,7 +349,7 @@ What it shows:
   no MCP tool will ever return you.
 - **Its brief**, so "what did Claude actually tell it?" is one click rather than a
   reconstruction.
-- **Its result**, with the worker's claims and the orchestrator's measurements
+- **Its result**, with the worker's claims and Dispatched Code's measurements
   visually distinct, and the discrepancies between them called out (DD-4).
 - The lifecycle trail, and the diff.
 
@@ -352,12 +380,12 @@ higher than without. Measure both with the probe that has been in this repo sinc
 Phase 0 for exactly this purpose:
 
 ```
-orchestrator_timeout_probe({delayMs: 55000})                        # the plain ceiling
-orchestrator_timeout_probe({delayMs: 240000, progressEveryMs: 10000}) # with heartbeats
+dispatched_code_timeout_probe({delayMs: 55000})                        # the plain ceiling
+dispatched_code_timeout_probe({delayMs: 240000, progressEveryMs: 10000}) # with heartbeats
 ```
 
 Increase `delayMs` until the call fails; the host says its own limit in the
-error. Then set `ORCHESTRATOR_WAIT_MAX_MS` to **half** whichever ceiling you got —
+error. Then set `DISPATCHED_CODE_WAIT_MAX_MS` to **half** whichever ceiling you got —
 the other half pays for the tool's own work and the transport, and a wait that
 loses its race with the host leaves a worker running unwatched.
 
@@ -369,7 +397,7 @@ s; the instrument ran out before the host did. Half of that verified floor is
 what to use:
 
 ```bash
-claude mcp add orchestrator --env ORCHESTRATOR_WAIT_MAX_MS=300000 -- bun run "$PWD/src/mcp/server.ts"
+claude mcp add dispatched-code --env DISPATCHED_CODE_WAIT_MAX_MS=300000 -- bun run "$PWD/src/mcp/server.ts"
 ```
 
 That turns a six-minute wave from about eight blocking calls into two. **The
@@ -403,7 +431,7 @@ progress notifications are the whole of what the protocol offers.
 | `workspace_merge` | Start a gated merge of completed workers into an integration branch. |
 | `workspace_merge_status` | Poll it: which workers merged, which one broke it, where it rolled back to. |
 | `workspace_cleanup` | Prune worktrees and branches — and refuse, by default, to delete unmerged work. |
-| `run_report` | The run's markdown audit trail: workers, spend, tests, discrepancies, merges, timeline. Written to `.orchestrator/runs/`. |
+| `run_report` | The run's markdown audit trail: workers, spend, tests, discrepancies, merges, timeline. Written to `.dispatched-code/runs/`. |
 
 Every one of them returns in under two seconds (DD-1); `worker_wait` is the
 single bounded exception. `workspace_merge` is no exception either: it runs a
@@ -411,11 +439,11 @@ test suite after **every** merge, which is minutes, so it validates, warns about
 overlapping files and returns a handle to poll — the same spawn-and-poll shape as
 everything else, for the same reason (the host abandons a tool call at 60 s). The delegation heuristics from
 [`projectplan.md`](projectplan.md) §7 and the DD-8 trust model — the worker's
-summary is a *claim*, the discrepancies are the orchestrator's own finding —
+summary is a *claim*, the discrepancies are Dispatched Code's own finding —
 live in the tool descriptions, because that is the only documentation a model
 reliably reads.
 
-`orchestrator_timeout_probe` is also registered and is **not** part of that
+`dispatched_code_timeout_probe` is also registered and is **not** part of that
 surface: it is the instrument that measured the host's tool-call ceiling
 `worker_wait`'s cap sits under. See [`docs/phase3-notes.md`](docs/phase3-notes.md).
 

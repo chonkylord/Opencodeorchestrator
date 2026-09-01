@@ -1,9 +1,9 @@
 {
-  "name": "opencode-orchestrator",
+  "name": "dispatched-code",
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Claude -> OpenCode subagent orchestrator (MCP server)",
+  "description": "Dispatched Code — Claude delegates to parallel OpenCode workers (MCP server)",
   "scripts": {
     "spike": "bun run spike/spike.ts",
     "mcp": "bun run src/mcp/server.ts",

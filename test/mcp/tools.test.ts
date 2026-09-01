@@ -20,7 +20,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { OCMock } from "../ocmock/server.js";
-import { createOrchestrator, type ManagerTuning, type Orchestrator } from "../../src/mcp/server.js";
+import { createDispatchedCode, type ManagerTuning, type DispatchedCode } from "../../src/mcp/server.js";
 import { WAIT_TIMEOUT_MAX_MS } from "../../src/mcp/tools.js";
 import type { ServerConfig } from "../../src/mcp/config.js";
 import { makeGoldenRepo } from "../fixtures/golden.js";
@@ -45,7 +45,7 @@ const TRUTHFUL = {
 
 interface Harness {
   client: Client;
-  orchestrator: Orchestrator;
+  dispatched: DispatchedCode;
   mock: OCMock;
   repo: string;
   /** Total characters of tool-result text this client has been handed. */
@@ -64,7 +64,7 @@ async function harness(
 
   const config: ServerConfig = {
     repoRoot: repo.path,
-    dbPath: join(repo.path, ".orchestrator", "orchestrator.db"),
+    dbPath: join(repo.path, ".dispatched-code", "dispatched-code.db"),
     defaultModel: "ocmock/test-model",
     baseUrl: mock.baseUrl,
     verifyTests: false,
@@ -84,21 +84,21 @@ async function harness(
     permissionMode: "full",
     ...configOver,
   };
-  const orchestrator = await createOrchestrator(config, {
+  const dispatched = await createDispatchedCode(config, {
     tickMs: 10,
     budgetPollMs: 20,
     abortGraceMs: 400,
     retrySettleMs: 60,
     ...tuning,
   });
-  cleanup.push(() => orchestrator.dispose());
+  cleanup.push(() => dispatched.dispose());
 
   const client = new Client({ name: "test-host", version: "0.0.0" });
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-  await Promise.all([orchestrator.server.connect(serverSide), client.connect(clientSide)]);
+  await Promise.all([dispatched.server.connect(serverSide), client.connect(clientSide)]);
   cleanup.push(() => client.close());
 
-  return { client, orchestrator, mock, repo: repo.path, chars: () => budget.total };
+  return { client, dispatched, mock, repo: repo.path, chars: () => budget.total };
 }
 
 /** Accumulates what every tool result cost, for the §8 / Phase 3 budget check. */
@@ -161,7 +161,7 @@ describe("registration", () => {
     const names = (await client.listTools()).tools.map((t) => t.name).sort();
 
     expect(names).toEqual([
-      "orchestrator_timeout_probe",
+      "dispatched_code_timeout_probe",
       "run_report",
       "worker_budget",
       "worker_diff",
@@ -319,7 +319,7 @@ describe("the blocked path", () => {
   });
 
   test("blocked → message → completed, on the same session", async () => {
-    const { client, mock, orchestrator } = await harness({
+    const { client, mock, dispatched } = await harness({
       writeFiles: true,
       report: BLOCKED,
       dropPromptsWithinMs: 30,
@@ -327,7 +327,7 @@ describe("the blocked path", () => {
     const id = idFrom((await call(client, "worker_spawn", spawnArgs())).text);
     await call(client, "worker_wait", { id, timeoutMs: 5_000 });
 
-    const sessionID = orchestrator.manager.get(id)!.sessionID!;
+    const sessionID = dispatched.manager.get(id)!.sessionID!;
     mock.setReport(sessionID, TRUTHFUL);
 
     const answered = await call(client, "worker_message", { id, message: "Yes, but only the route table." });
@@ -438,10 +438,10 @@ describe("DD-1: nothing blocks", () => {
 
 describe("pagination and truncation (§8)", () => {
   test("worker_output pages, and the cursor continues rather than repeats", async () => {
-    const { client, orchestrator } = await harness({ writeFiles: true, report: TRUTHFUL });
+    const { client, dispatched } = await harness({ writeFiles: true, report: TRUTHFUL });
     const id = idFrom((await call(client, "worker_spawn", spawnArgs())).text);
     await call(client, "worker_wait", { id, timeoutMs: 5_000 });
-    for (let i = 0; i < 12; i++) orchestrator.store.appendEvent(id, `synthetic_${i}`, { i });
+    for (let i = 0; i < 12; i++) dispatched.store.appendEvent(id, `synthetic_${i}`, { i });
 
     const first = await call(client, "worker_output", { id, limit: 5 });
     expect(first.text).toMatch(/more remain — call again with cursor: (\d+)/);

@@ -4,7 +4,7 @@
  * One shape, built from the index and the manager, serialised as JSON. It is
  * the deliberate opposite of everything in `src/mcp/render.ts`: that module
  * exists to make Claude's context grow by under 2k tokens per interaction, and
- * this one exists to give a human every number the orchestrator has. The
+ * this one exists to give a human every number Dispatched Code has. The
  * constraint that shaped the tool surface — §8's context budget — does not
  * apply to a socket on 127.0.0.1, and pretending it does would be the one way to
  * build a dashboard that tells you less than the tools do.
@@ -15,7 +15,7 @@
  *   activity stream) is data. It is passed through as strings, and the UI renders
  *   it with `textContent`, never as markup.
  * - **DD-4.** A claim and a measurement are never merged into one field. The
- *   worker's `summary` sits beside the orchestrator's `changes` and
+ *   worker's `summary` sits beside Dispatched Code's `changes` and
  *   `discrepancies`, and the UI labels which is which.
  */
 
@@ -23,7 +23,7 @@ import type { MergeRecord, QueueHint, WorkerRecord, WorkerResult } from "../mana
 import type { ModelCapability, RunRow, Store } from "../store/index.js";
 import type { ActivityEntry, ActivityLog } from "./activity.js";
 
-/** What the orchestrator itself is configured to do. The graph's root node. */
+/** What Dispatched Code itself is configured to do. The graph's root node. */
 export interface ServerView {
   readonly name: string;
   readonly version: string;

@@ -1,4 +1,7 @@
 node_modules/
+.dispatched-code/
+# The state directory's pre-rename name. Still written by an existing checkout,
+# which keeps the name it already has — see `stateDir` in src/workspace/worktree.ts.
 .orchestrator/
 *.log
 bun.lock

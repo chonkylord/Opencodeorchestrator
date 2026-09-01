@@ -13,7 +13,7 @@
  * **DD-8 is the layout.** A worker's summary, risks and follow-ups are text a
  * model wrote after reading a repository that may contain anything, and they sit
  * in their own quoted block, capped, marked as the worker's own words. The
- * orchestrator's measurements — the changed-file counts, the independent test
+ * Dispatched Code's measurements — the changed-file counts, the independent test
  * run, the discrepancies, the merge outcomes — are in the table and the
  * discrepancy section, unquoted, because those are findings. When the two
  * disagree, the layout should make it obvious which one is evidence.
@@ -26,13 +26,21 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+import { stateDir } from "../workspace/index.js";
 import type { StoredEvent, Store } from "../store/index.js";
 import type { MergeRecord, WorkerRecord } from "./types.js";
 import { revisionRounds } from "./revisions.js";
 import { isFinal, isSettled } from "./state.js";
 
-/** Where `run_report` writes, under the directory git already ignores. */
-export const RUN_REPORT_DIR = join(".orchestrator", "runs");
+/**
+ * Where `run_report` writes, under the directory git already ignores.
+ *
+ * A function of the repository for the same reason `metricsDir` is: the state
+ * directory has two possible names and the checkout decides which.
+ */
+export function runReportDir(repoRoot: string): string {
+  return join(stateDir(repoRoot), "runs");
+}
 
 /** Caps (§8). Every one of these bounds a field a worker can influence. */
 const SUMMARY_CHARS = 400;
@@ -119,7 +127,7 @@ export function buildRunReport(opts: RunReportOptions): RunReport {
     "---",
     "",
     "Every line beginning with `>` is the worker's own words — a claim by a model that read",
-    "a repository which may contain anything. Everything else is the orchestrator's own",
+    "a repository which may contain anything. Everything else is Dispatched Code's own",
     "measurement, taken from git and from re-running the tests itself. Where the two",
     "disagree, the Discrepancies section is the finding.",
   );
@@ -135,7 +143,7 @@ export function buildRunReport(opts: RunReportOptions): RunReport {
 /** Build it and put it on disk, where §8 says the audit trail lives. */
 export function writeRunReport(repoRoot: string, opts: RunReportOptions): RunReport {
   const report = buildRunReport(opts);
-  const path = join(repoRoot, RUN_REPORT_DIR, `${safeFileName(opts.runID)}.md`);
+  const path = join(repoRoot, runReportDir(repoRoot), `${safeFileName(opts.runID)}.md`);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, report.markdown);
   return { ...report, path };
@@ -257,7 +265,7 @@ function workerSection(workers: readonly WorkerRecord[], store: Store): string[]
  * The revision rounds, one block each (§11 Phase 6).
  *
  * What each round was *asked* for is Claude's text; what it *produced* is the
- * orchestrator's measurement. They are rendered as different kinds of line for
+ * Dispatched Code's measurement. They are rendered as different kinds of line for
  * the same reason everything else here is: a reader has to be able to tell a
  * request from a finding without knowing how the report was assembled.
  */
@@ -268,7 +276,7 @@ function roundLines(w: WorkerRecord, store: Store): string[] {
     const head = round.round === 0 ? "**Round 0** — the original task as briefed" : `**Round ${round.round}**`;
     // Claude's feedback is *not* rendered as a `>` line. This document's footer
     // promises that every line beginning with `>` is the worker's own words, and
-    // the feedback is the orchestrator's — quoting both the same way would erase
+    // the feedback is Dispatched Code's — quoting both the same way would erase
     // exactly the distinction the footer exists to draw.
     const asked = round.feedback ? ` · asked for: ${cell(clamp(round.feedback, ROUND_CHARS))}` : "";
     if (!round.settled) {
@@ -314,7 +322,7 @@ function discrepancySection(workers: readonly WorkerRecord[]): string[] {
   return [
     "## Discrepancies",
     "",
-    "The orchestrator's own findings: where a worker's report and the repository disagreed.",
+    "Dispatched Code's own findings: where a worker's report and the repository disagreed.",
     "",
     ...shown.map((d) => `- **${d.workerID}** · \`${d.kind}\`${d.file ? ` · \`${cell(d.file)}\`` : ""} — ${cell(clamp(d.detail, ITEM_CHARS))}`),
     ...(all.length > shown.length ? [`- …and ${all.length - shown.length} more`] : []),
@@ -359,8 +367,8 @@ function timelineSection(store: Store, workers: readonly WorkerRecord[], max: nu
   return [
     "## Timeline",
     "",
-    "Lifecycle-grained, oldest first. Times are relative to the first event. This is what the",
-    "orchestrator did — it is not, and there is no tool that returns, a worker's transcript.",
+    "Lifecycle-grained, oldest first. Times are relative to the first event. This is what",
+    "Dispatched Code did — it is not, and there is no tool that returns, a worker's transcript.",
     "",
     "```",
     ...shown.map((e) => `${`+${duration(e.at - base)}`.padStart(9)}  ${e.workerID.padEnd(7)} ${e.kind}${detailOf(e)}`),

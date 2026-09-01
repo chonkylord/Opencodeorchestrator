@@ -6,7 +6,7 @@
  * merged. The trade is deliberate ([ADR-0008](../../docs/adr/0008-shared-workspace.md)),
  * and these tests are mostly about the half of it that must NOT be traded away:
  *
- * - The orchestrator must never commit in the user's checkout.
+ * - Dispatched Code must never commit in the user's checkout.
  * - It must never `git reset --hard` there, which means the merge pipeline must
  *   refuse a shared worker rather than treat the repo as an integration branch.
  * - `workspace_cleanup` must never delete it.
@@ -63,11 +63,11 @@ async function harness(
   const backend = new ServeBackend({ baseUrl: mock.baseUrl });
   cleanup.push(() => backend.dispose());
   await backend.start();
-  // Inside `.orchestrator/`, which is excluded from every diff and every dirty
+  // Inside `.dispatched-code/`, which is excluded from every diff and every dirty
   // scan — a database sitting loose in the repo root would show up as an
   // untracked file and be attributed to whichever worker settled first.
-  mkdirSync(join(repo.path, ".orchestrator"), { recursive: true });
-  const store = new Store(join(repo.path, ".orchestrator", "db.sqlite"));
+  mkdirSync(join(repo.path, ".dispatched-code"), { recursive: true });
+  const store = new Store(join(repo.path, ".dispatched-code", "db.sqlite"));
   cleanup.push(() => store.close());
   const manager = new WorkerManager({
     backend,
@@ -109,7 +109,7 @@ describe("a shared worker works in the repository itself", () => {
 
     const done = await h.manager.wait(r.workerID, 8_000);
     expect(done.state).toBe("completed");
-    // The repository itself, not `.orchestrator/worktrees/...`.
+    // The repository itself, not `.dispatched-code/worktrees/...`.
     expect(done.worktree).toBe(h.repo);
     expect(done.branch).toBe("");
     expect(readFileSync(join(h.repo, "src", "added.js"), "utf8")).toContain("added = 1");
@@ -118,7 +118,7 @@ describe("a shared worker works in the repository itself", () => {
 
   test("nothing is committed, and HEAD does not move", async () => {
     // DD-5 has the manager commit so the worker does not have to, which is right
-    // in a worktree the orchestrator owns. In the user's checkout `git add -A`
+    // in a worktree Dispatched Code owns. In the user's checkout `git add -A`
     // would sweep up whatever else they had in progress, onto whatever branch
     // they are on, and call it this worker's snapshot.
     const h = await harness();
@@ -139,7 +139,7 @@ describe("a shared worker works in the repository itself", () => {
     const h = await harness();
     const r = await h.manager.spawn(spec());
     await h.manager.wait(r.workerID, 8_000);
-    expect(existsSync(join(h.repo, ".orchestrator", "worktrees", r.workerID))).toBe(false);
+    expect(existsSync(join(h.repo, ".dispatched-code", "worktrees", r.workerID))).toBe(false);
   });
 
   test("the brief tells it the tree is shared and not to tidy other people's work", async () => {

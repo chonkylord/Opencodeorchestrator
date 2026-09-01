@@ -173,7 +173,7 @@ diff quoted in its brief: it sees the code as it was before the change, plus the
 change. That is how a human reads a pull request, and it makes the reviewer's own
 measurements mean what they say.
 
-The reviewer is also handed the discrepancies the orchestrator **already**
+The reviewer is also handed the discrepancies Dispatched Code **already**
 measured, so it does not spend its one round re-deriving findings that are already
 facts.
 
@@ -201,7 +201,7 @@ away from them.
 **The reviewer's critique is presented as one more model's opinion.** Every worker
 in this system runs on the same model (`docs/phase0-facts.md`, §7 of the Phase 6
 handoff), so Phase 6's reviewer is Muse Spark reviewing Muse Spark, and it shares
-the author's blind spots by construction. The orchestrator's own evidence — the
+the author's blind spots by construction. Dispatched Code's own evidence — the
 diff-versus-report reconciliation and the test command it re-ran itself — is
 stronger, and `worker_spawn`'s description says this in those words rather than
 letting a critique read as a finding. §11 Phase 8's cross-model review diversity
@@ -237,7 +237,7 @@ configuration option and nothing selects between models automatically.
   cap check, and both start a run loop over one session.
 - **Nothing revises a worker automatically**, and §11 Phase 6 is explicit about
   it: not a red merge gate, not a discrepancy, not a reviewer's critique. Claude
-  decides and the tools report. An orchestrator that revises workers by itself is
+  decides and the tools report. A system that revises workers by itself is
   an infinite fix loop with extra steps, and the cap is a backstop rather than a
   licence.
 - **Retries with backoff are still not here** (Phase 7). A revision is not a

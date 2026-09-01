@@ -10,7 +10,7 @@
  * heuristics, no benefit of the doubt. Every disagreement becomes a
  * {@link Discrepancy} that travels all the way to Claude. Discrepancies are not
  * failures — a worker that edits one extra file may have been right to — but
- * they are never invisible, because the alternative is an orchestrator that
+ * they are never invisible, because the alternative is a system that
  * launders a model's claims into facts.
  *
  * Note what is *not* here: nothing runs, resolves, or fetches anything named in

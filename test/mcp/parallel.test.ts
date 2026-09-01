@@ -20,7 +20,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { OCMock } from "../ocmock/server.js";
-import { createOrchestrator, type ManagerTuning, type Orchestrator } from "../../src/mcp/server.js";
+import { createDispatchedCode, type ManagerTuning, type DispatchedCode } from "../../src/mcp/server.js";
 import { WAIT_TIMEOUT_MAX_MS } from "../../src/mcp/tools.js";
 import type { ServerConfig } from "../../src/mcp/config.js";
 import { GOLDEN_TEST_COMMAND, makeGoldenRepo } from "../fixtures/golden.js";
@@ -43,7 +43,7 @@ const TRUTHFUL = {
 
 interface Harness {
   client: Client;
-  orchestrator: Orchestrator;
+  dispatched: DispatchedCode;
   repo: string;
 }
 
@@ -59,7 +59,7 @@ async function harness(
 
   const config: ServerConfig = {
     repoRoot: repo.path,
-    dbPath: join(repo.path, ".orchestrator", "orchestrator.db"),
+    dbPath: join(repo.path, ".dispatched-code", "dispatched-code.db"),
     defaultModel: "ocmock/test-model",
     baseUrl: mock.baseUrl,
     verifyTests: false,
@@ -79,21 +79,21 @@ async function harness(
     permissionMode: "full",
     ...configOver,
   };
-  const orchestrator = await createOrchestrator(config, {
+  const dispatched = await createDispatchedCode(config, {
     tickMs: 10,
     budgetPollMs: 20,
     abortGraceMs: 400,
     retrySettleMs: 60,
     ...tuning,
   });
-  cleanup.push(() => orchestrator.dispose());
+  cleanup.push(() => dispatched.dispose());
 
   const client = new Client({ name: "test-host", version: "0.0.0" });
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-  await Promise.all([orchestrator.server.connect(serverSide), client.connect(clientSide)]);
+  await Promise.all([dispatched.server.connect(serverSide), client.connect(clientSide)]);
   cleanup.push(() => client.close());
 
-  return { client, orchestrator, repo: repo.path };
+  return { client, dispatched, repo: repo.path };
 }
 
 interface CallOutcome {
@@ -294,7 +294,7 @@ describe("batched worker_wait", () => {
 // ---------------------------------------------------------------------------
 
 describe("run_report", () => {
-  test("keeps the worker's claims and the orchestrator's measurements apart, and writes the file", async () => {
+  test("keeps the worker's claims and Dispatched Code's measurements apart, and writes the file", async () => {
     const { client, repo } = await harness({ writeFiles: true, perWorktreeFileName: true }, { maxConcurrent: 3 });
     const a = await spawn(client, "write a file", { ownedPaths: ["**"] });
     await call(client, "worker_wait", { id: a, timeoutMs: 10_000 });
@@ -312,7 +312,7 @@ describe("run_report", () => {
     expect(report.text).toMatch(/Changed files \(measured by git\)/);
     expect(report.text).toMatch(/the worker's own words/);
 
-    const path = join(repo, ".orchestrator", "runs", "run-1.md");
+    const path = join(repo, ".dispatched-code", "runs", "run-1.md");
     expect(existsSync(path)).toBe(true);
     expect(readFileSync(path, "utf8")).toContain(a);
   }, 30_000);
@@ -354,7 +354,7 @@ describe("§11 Phase 5 AC", () => {
     // a fourth waits for one of them, and the wave lands on an integration
     // branch behind the test gate with a document to show for it. (Revisions —
     // the other half of §11's AC as written — are Phase 6's.)
-    const { client, repo, orchestrator } = await harness(
+    const { client, repo, dispatched } = await harness(
       { writeFiles: true, perWorktreeFileName: true, workMs: 120 },
       { maxConcurrent: 3 },
     );
@@ -375,11 +375,11 @@ describe("§11 Phase 5 AC", () => {
     const deadline = Date.now() + 20_000;
     while (Date.now() < deadline) {
       const admitted = [ui, api, tests, docs].filter((id) =>
-        ["preparing", "running", "blocked"].includes(orchestrator.manager.get(id)!.state),
+        ["preparing", "running", "blocked"].includes(dispatched.manager.get(id)!.state),
       ).length;
       peak = Math.max(peak, admitted);
       expect(admitted).toBeLessThanOrEqual(3);
-      if ([ui, api, tests, docs].every((id) => orchestrator.manager.get(id)!.state === "completed")) break;
+      if ([ui, api, tests, docs].every((id) => dispatched.manager.get(id)!.state === "completed")) break;
       await sleep(5);
     }
     expect(peak).toBe(3);
@@ -387,7 +387,7 @@ describe("§11 Phase 5 AC", () => {
     const all = await call(client, "worker_wait", { ids: [ui, api, tests, docs], mode: "all", timeoutMs: 20_000 });
     expect(all.text).toMatch(/All 4 worker\(s\) have settled/);
     // The dependent ran after its dependency, not merely at some point.
-    expect(orchestrator.manager.get(docs)!.startedAt!).toBeGreaterThanOrEqual(orchestrator.manager.get(api)!.endedAt!);
+    expect(dispatched.manager.get(docs)!.startedAt!).toBeGreaterThanOrEqual(dispatched.manager.get(api)!.endedAt!);
 
     const started = await call(client, "workspace_merge", { workerIDs: [ui, api, tests, docs], runID: "run-1" });
     expect(started.isError).toBe(false);
@@ -409,6 +409,6 @@ describe("§11 Phase 5 AC", () => {
     for (const id of [ui, api, tests, docs]) expect(report.text).toContain(id);
     expect(report.text).toContain(mergeID);
     expect(report.text).toMatch(/\| merged \|/);
-    expect(existsSync(join(repo, ".orchestrator", "runs", "run-1.md"))).toBe(true);
+    expect(existsSync(join(repo, ".dispatched-code", "runs", "run-1.md"))).toBe(true);
   }, 90_000);
 });

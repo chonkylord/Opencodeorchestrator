@@ -43,7 +43,7 @@ manager → `ActivityLog` (a bounded in-memory ring) → SSE → the browser.
 It reaches no tool result, ever. The rule `worker_output` states is unchanged;
 what changed is that the transcript now has a destination that is not Claude.
 
-**Neutral by construction (DD-2).** The observer is handed the orchestrator's own
+**Neutral by construction (DD-2).** The observer is handed Dispatched Code's own
 vocabulary, never OpenCode's, so the adapter can be rewritten without the
 dashboard noticing. The boundary test in `test/opencode/boundary.test.ts` caught
 the first version of this doing it wrong — comparing against raw event names —
@@ -101,10 +101,10 @@ will still run in five years with no toolchain to rot.
 document through `textContent` or `createTextNode`. There is no `innerHTML`
 assignment carrying data anywhere in `app.js`. A worker reads a repository that
 may contain anything; a dashboard that renders that as markup is a stored-XSS
-hole aimed at the one browser holding the orchestrator's own origin.
+hole aimed at the one browser holding Dispatched Code's own origin.
 
 **DD-4 — a claim is not a measurement.** The worker's own words get a light rule
-and a proportional face; the orchestrator's measurements get a heavy rule and a
+and a proportional face; Dispatched Code's measurements get a heavy rule and a
 monospace face; the discrepancy section says outright which one to believe. The
 distinction the result renderer makes in prose, the dashboard makes in
 typography.
@@ -123,9 +123,9 @@ at all.
 
 - The default is **on**, at `http://127.0.0.1:4180`, URL logged to stderr at
   startup. A feature you must know an environment variable to enable is one most
-  people never learn exists; `ORCHESTRATOR_DASHBOARD=0` opts out, and
-  `ORCHESTRATOR_DASHBOARD_PORT=0` takes any free port for running several
-  orchestrators at once.
+  people never learn exists; `DISPATCHED_CODE_DASHBOARD=0` opts out, and
+  `DISPATCHED_CODE_DASHBOARD_PORT=0` takes any free port for running several
+  instances at once.
 - The ring is filled whether or not the dashboard bound a port. It costs a few
   hundred kilobytes at worst and it is what makes attaching later possible.
 - **Nothing about Claude's token cost changes.** No tool result grew, no tool was

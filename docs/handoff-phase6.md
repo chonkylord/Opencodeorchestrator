@@ -1,6 +1,6 @@
 # Handoff: implement Phase 6 — the review loop, and reach v1
 
-You are picking up the **Claude → OpenCode Subagent Orchestrator** at
+You are picking up **Dispatched Code** at
 `chonkylord/Opencodeorchestrator`. Phases 0 through 5 are complete and pushed.
 
 **Phase 6 is the last phase of v1.** Everything before it made work *happen*
@@ -231,13 +231,13 @@ created.**
   `src/manager/runreport.ts` marks worker-authored text and caps it; follow that,
   do not invent a second house style. `runreport.ts`'s `cell()` exists because a
   worker's summary containing a backtick can open a code span that swallows the
-  orchestrator's own lines — a reviewer writing about code will contain
+  Dispatched Code's own lines — a reviewer writing about code will contain
   backticks constantly.
 - **A reviewer that shares the author's blind spots is a weaker check than the
-  reconciliation the orchestrator already does itself.** Every worker here is
+  reconciliation Dispatched Code already does itself.** Every worker here is
   Muse Spark (see §7), so Phase 6's reviewer is Muse Spark reviewing Muse Spark.
   The tool descriptions must not let a critique read as a finding: the
-  orchestrator's diff-versus-report reconciliation and its independent test run
+  Dispatched Code's diff-versus-report reconciliation and its independent test run
   are the stronger evidence and should stay the headline. Say this out loud in
   the design; it is the honest framing and §11 Phase 8 (cross-model review
   diversity) is where it stops being true.
@@ -334,7 +334,7 @@ created.**
   yourself writing exponential backoff, you have crossed into Phase 7.
 - **Automatic revision.** Nothing should decide on its own that a worker needs
   revising — not a red merge gate, not a discrepancy, not a reviewer's critique.
-  Claude decides; the tools report. An orchestrator that revises workers by
+  Claude decides; the tools report. A system that revises workers by
   itself is an infinite fix loop with extra steps, and §13's cap is a backstop,
   not a licence.
 - **Model-routing presets with automatic selection, worker priorities,
@@ -362,7 +362,7 @@ OC_E2E=1 bun test test/e2e      # the real-OpenCode tests
 OC_E2E=1 OC_E2E_CONCURRENCY=1 bun test test/e2e   # + the four-session isolation probe
 ```
 
-- Configure the server with `ORCHESTRATOR_REPO` / `_DB` / `_MODEL` / `_BASE_URL`
+- Configure the server with `DISPATCHED_CODE_REPO` / `_DB` / `_MODEL` / `_BASE_URL`
   / `_VERIFY_TESTS` / `_MAX_CONCURRENT` (README → Configuration). Anything new
   belongs in the same family and the same table.
 - **Driving a live Claude Code session from inside this container works, and is
@@ -374,13 +374,13 @@ OC_E2E=1 OC_E2E_CONCURRENCY=1 bun test test/e2e   # + the four-session isolation
           const r = makeGoldenRepo("demo"); console.log(r.path)'
 
   # 2. an mcp.json pointing the server at it
-  #    {"mcpServers":{"orchestrator":{"command":"bun",
+  #    {"mcpServers":{"dispatched-code":{"command":"bun",
   #      "args":["run","/abs/path/src/mcp/server.ts"],
-  #      "env":{"ORCHESTRATOR_REPO":"<the path from step 1>"}}}}
+  #      "env":{"DISPATCHED_CODE_REPO":"<the path from step 1>"}}}}
 
-  # 3. drive it, with ONLY orchestrator tools allowed
+  # 3. drive it, with ONLY Dispatched Code's tools allowed
   claude -p --strict-mcp-config --mcp-config ./mcp.json \
-    --allowedTools "mcp__orchestrator__worker_spawn,mcp__orchestrator__worker_status,…" \
+    --allowedTools "mcp__dispatched-code__worker_spawn,mcp__dispatched-code__worker_status,…" \
     --output-format stream-json --verbose "…" > demo.jsonl
   ```
 
@@ -512,6 +512,6 @@ adapter at all:**
    a worker prepares.** The database and now `run_report`'s output are written
    there by the server regardless. A run in which no worker ever reached
    `preparing` therefore leaves `.orchestrator/` visible in the user's
-   `git status`. Pre-existing, one line to fix in `createOrchestrator()`, and not
+   `git status`. Pre-existing, one line to fix in `createDispatchedCode()`, and not
    worth widening Phase 6 for — but somebody should, and Phase 7's hardening is
    the natural home.

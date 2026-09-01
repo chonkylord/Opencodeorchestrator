@@ -153,7 +153,7 @@ describe("the report parser", () => {
     expect(JSON.parse(findJsonObject(text)!)).toMatchObject({ status: "completed" });
   });
 
-  test("the schema requires the three fields the orchestrator reads", () => {
+  test("the schema requires the three fields Dispatched Code reads", () => {
     expect(REPORT_SCHEMA.required).toEqual(["status", "summary", "changes"]);
   });
 });

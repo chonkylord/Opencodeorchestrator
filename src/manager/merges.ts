@@ -43,7 +43,7 @@ export interface MergeCoordinatorOptions {
   readonly newMergeID?: () => string;
   /** How long the gate's test command may run. Generous; the poll is cheap. */
   readonly testTimeoutMs?: number;
-  /** Where integration worktrees go. Defaults under `.orchestrator/`. */
+  /** Where integration worktrees go. Defaults under the state directory. */
   readonly integrationRoot?: string;
   /** Diagnostics. Never stdout — that is the JSON-RPC channel. */
   readonly log?: (line: string) => void;
@@ -133,7 +133,7 @@ export class MergeCoordinator {
     const overlap = detectOverlap(
       records.map((r) => ({
         workerID: r.workerID,
-        // The orchestrator's own measurement (git), not the worker's claim.
+        // Dispatched Code's own measurement (git), not the worker's claim.
         files: r.result?.changes.paths ?? [],
         baseSha: r.baseSha,
       })),
@@ -170,8 +170,8 @@ export class MergeCoordinator {
 
     // Detached, and its rejection caught here rather than anywhere else: an
     // unhandled rejection in a background pipeline takes the whole MCP server
-    // down, and the server going away is indistinguishable to the host from the
-    // orchestrator never having worked.
+    // down, and the server going away is indistinguishable to the host from
+    // Dispatched Code never having worked.
     this.running.set(
       mergeID,
       this.drive(mergeID, record, candidates, req, testCommand).catch((e: unknown) => {

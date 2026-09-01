@@ -37,8 +37,8 @@ there is nobody to ask, it is a worker waiting until a watchdog kills it. `*`
 means a permission nobody in this repository has heard of cannot become an
 outage.
 
-`ORCHESTRATOR_PERMISSIONS=jailed` restores the previous set. Anything but an
-exact `jailed` means `full`, mirroring `ORCHESTRATOR_WORKSPACE`: a typo should
+`DISPATCHED_CODE_PERMISSIONS=jailed` restores the previous set. Anything but an
+exact `jailed` means `full`, mirroring `DISPATCHED_CODE_WORKSPACE`: a typo should
 not silently move somebody to the mode that stops and asks.
 
 ## Decision 2: a permission request that arrives anyway is granted in band
@@ -86,7 +86,7 @@ injection via repo content → hijacked worker" as a live risk whose mitigations
 are "workers sandboxed to worktree; output treated as untrusted; manager never
 executes report content; optional container mode later". The first of those four
 is now gone in the default mode. A worker that is talked into it by something it
-reads can write anywhere the orchestrator's own process can.
+reads can write anywhere Dispatched Code's own process can.
 
 The remaining mitigations are real but weaker: worker output is still untrusted
 (DD-8), the manager still never executes report content, and the diff still
@@ -99,7 +99,7 @@ disappear:
 
 - **§11 Phase 8 already put workers in the user's checkout by default.** In
   `shared` mode there is no worktree boundary to protect — the "jail" is the
-  repository the user pointed the orchestrator at, and a worker was always able
+  repository the user pointed Dispatched Code at, and a worker was always able
   to write anywhere inside it.
 - **Container sandboxing is the mitigation §13 actually wanted**, and it is the
   one Phase 8 could not build because there is no Docker daemon in this

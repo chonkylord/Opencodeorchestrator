@@ -2,7 +2,7 @@
  * Worktree plumbing against real git repositories.
  *
  * Everything here runs on a temp clone of the golden repo, because the failures
- * worth catching — a snapshot that commits the orchestrator's own scratch, a
+ * worth catching — a snapshot that commits Dispatched Code's own scratch, a
  * diff that misses an untracked file — only appear against real git.
  */
 
@@ -11,8 +11,13 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 
 import {
+  LEGACY_STATE_DIR,
+  STATE_DIR,
   changedFiles,
   createWorktree,
+  defaultWorktreeRoot,
+  ensureExcluded,
+  stateDir,
   diffStat,
   listManifests,
   readManifest,
@@ -71,10 +76,58 @@ describe("the golden repo fixture", () => {
   });
 });
 
+describe("the state directory across the rename", () => {
+  test("a tree that has never run this before gets the new name", () => {
+    const repo = golden();
+    expect(stateDir(repo.path)).toBe(STATE_DIR);
+    expect(defaultWorktreeRoot(repo.path)).toBe(join(repo.path, ".dispatched-code", "worktrees"));
+  });
+
+  test("a tree that already has `.orchestrator/` keeps it", () => {
+    const repo = golden();
+    // The state directory holds the index, the worktrees, the run reports and
+    // the metrics. Switching names underneath a checkout that already has one
+    // would not migrate that state — it would orphan every worktree in it.
+    mkdirSync(join(repo.path, LEGACY_STATE_DIR), { recursive: true });
+    expect(stateDir(repo.path)).toBe(LEGACY_STATE_DIR);
+    expect(defaultWorktreeRoot(repo.path)).toBe(join(repo.path, ".orchestrator", "worktrees"));
+  });
+
+  test("`ensureExcluded` writes the name the tree actually uses", async () => {
+    const repo = golden();
+    const excludeFile = join(repo.path, ".git", "info", "exclude");
+
+    await ensureExcluded(repo.path);
+    expect(readFileSync(excludeFile, "utf8")).toContain("/.dispatched-code/");
+
+    // A checkout that moves back onto the old name gets the old entry on the
+    // next start — which is every start, so the switch needs nothing from the
+    // user in either direction.
+    mkdirSync(join(repo.path, LEGACY_STATE_DIR), { recursive: true });
+    await ensureExcluded(repo.path);
+    expect(readFileSync(excludeFile, "utf8")).toContain("/.orchestrator/");
+  });
+
+  test("neither name can reach a snapshot commit", async () => {
+    const repo = golden();
+    const root = join(repo.path, ".dispatched-code", "worktrees");
+    const wt = await createWorktree({ repoRoot: repo.path, workerID: "w-001", root });
+    for (const dir of [STATE_DIR, LEGACY_STATE_DIR]) {
+      mkdirSync(join(wt.path, dir), { recursive: true });
+      writeFileSync(join(wt.path, dir, "scratch.txt"), "ours, not the worker's\n");
+    }
+    writeFileSync(join(wt.path, "real-work.txt"), "the worker's\n");
+
+    const snap = await snapshotCommit(wt.path, "snapshot");
+    expect(snap.files).toEqual(["real-work.txt"]);
+    expect(await changedFiles(wt.path, wt.baseSha)).toEqual(["real-work.txt"]);
+  });
+});
+
 describe("createWorktree", () => {
   test("branches from a resolved sha and lands where §6.1 says", async () => {
     const repo = golden();
-    const root = join(repo.path, ".orchestrator", "worktrees");
+    const root = join(repo.path, ".dispatched-code", "worktrees");
     const wt = await createWorktree({ repoRoot: repo.path, workerID: "w-001", root });
 
     expect(wt.path).toBe(join(root, "w-001"));
@@ -88,14 +141,14 @@ describe("createWorktree", () => {
 
   test("refuses to reuse an occupied path rather than clobbering work", async () => {
     const repo = golden();
-    const root = join(repo.path, ".orchestrator", "worktrees");
+    const root = join(repo.path, ".dispatched-code", "worktrees");
     await createWorktree({ repoRoot: repo.path, workerID: "w-001", root });
     await expect(createWorktree({ repoRoot: repo.path, workerID: "w-001", root })).rejects.toThrow(/already exists/);
   });
 
   test("two workers get genuinely independent trees", async () => {
     const repo = golden();
-    const root = join(repo.path, ".orchestrator", "worktrees");
+    const root = join(repo.path, ".dispatched-code", "worktrees");
     const a = await createWorktree({ repoRoot: repo.path, workerID: "w-001", root });
     const b = await createWorktree({ repoRoot: repo.path, workerID: "w-002", root });
     writeFileSync(join(a.path, "only-a.txt"), "a\n");
@@ -133,7 +186,7 @@ describe("snapshotCommit (DD-5)", () => {
     expect(snap).toEqual({ committed: false, files: [] });
   });
 
-  test("never commits the orchestrator's own scratch", async () => {
+  test("never commits Dispatched Code's own scratch", async () => {
     // The manifest lives in the worktree so the worktree can say who it belongs
     // to (DD-7). If it landed in the commit it would be in every worker's diff,
     // in every reconciliation, forever.
@@ -195,7 +248,7 @@ describe("manifests (DD-7)", () => {
 
   test("listManifests enumerates the worktrees a lost database would need", async () => {
     const repo = golden();
-    const root = join(repo.path, ".orchestrator", "worktrees");
+    const root = join(repo.path, ".dispatched-code", "worktrees");
     for (const id of ["w-001", "w-002"]) {
       const wt = await createWorktree({ repoRoot: repo.path, workerID: id, root });
       writeManifest(wt.path, manifest({ workerID: id, branch: `worker/${id}` }));
@@ -206,10 +259,10 @@ describe("manifests (DD-7)", () => {
 
   test("a corrupt manifest is ignored rather than crashing the scan", async () => {
     const repo = golden();
-    const root = join(repo.path, ".orchestrator", "worktrees");
+    const root = join(repo.path, ".dispatched-code", "worktrees");
     const wt = await createWorktree({ repoRoot: repo.path, workerID: "w-001", root });
-    mkdirSync(join(wt.path, ".orchestrator"), { recursive: true });
-    writeFileSync(join(wt.path, ".orchestrator", "worker.json"), "{ not json");
+    mkdirSync(join(wt.path, ".dispatched-code"), { recursive: true });
+    writeFileSync(join(wt.path, ".dispatched-code", "worker.json"), "{ not json");
     expect(readManifest(wt.path)).toBeNull();
     expect(listManifests(root)).toEqual([]);
   });

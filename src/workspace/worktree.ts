@@ -22,8 +22,32 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { DiffStat, WorkerManifest } from "../manager/types.js";
 import { WorkspaceError, git, gitLine } from "./git.js";
 
-/** Per-worktree orchestrator scratch. Never committed, never reconciled. */
-export const ORCHESTRATOR_DIR = ".orchestrator";
+/** Per-worktree Dispatched Code scratch. Never committed, never reconciled. */
+export const STATE_DIR = ".dispatched-code";
+/**
+ * What {@link STATE_DIR} was called before the rename to Dispatched Code.
+ *
+ * Still honoured, and not merely for tidiness: this directory is where the
+ * index, the worktrees, the run reports and the metrics live. A server that
+ * switched to the new name on upgrade would not migrate that state — it would
+ * silently stop being able to see it, orphaning every worktree a running
+ * orchestration had open and starting the index from empty.
+ */
+export const LEGACY_STATE_DIR = ".orchestrator";
+
+/**
+ * Which of the two names this tree actually uses.
+ *
+ * The old one wins **when it is already there**, so an existing checkout keeps
+ * reading and writing the state it has; a tree that has never run this before
+ * gets the new name. Resolved per call rather than once at import, because the
+ * answer is a property of the tree, and one process serves several — a repo
+ * root and a worktree under it can legitimately differ.
+ */
+export function stateDir(root: string): string {
+  return existsSync(join(root, LEGACY_STATE_DIR)) ? LEGACY_STATE_DIR : STATE_DIR;
+}
+
 export const MANIFEST_FILE = "worker.json";
 /** §5's secondary completion signal, if the worker chooses to write one. */
 export const REPORT_FILE = "report.json";
@@ -34,8 +58,14 @@ export const REPORT_FILE = "report.json";
  * Excluded from the snapshot commit and filtered out of every changed-file list:
  * they are orchestration artifacts, and counting them as the worker's work would
  * put a false entry in every single reconciliation.
+ *
+ * Both state-directory names are listed unconditionally rather than resolved per
+ * tree. Exclusion is the safety half of this file — a state directory that
+ * reaches a diff is a false discrepancy in every reconciliation, and one that
+ * reaches a merge commit is worse — so it costs one array entry to be right
+ * whichever name a tree carries, including a tree that carries both.
  */
-const EXCLUDED = [ORCHESTRATOR_DIR, REPORT_FILE];
+const EXCLUDED = [STATE_DIR, LEGACY_STATE_DIR, REPORT_FILE];
 const EXCLUDE_PATHSPECS = EXCLUDED.map((p) => `:(exclude)${p}`);
 
 export interface CreateWorktreeOptions {
@@ -43,7 +73,7 @@ export interface CreateWorktreeOptions {
   readonly workerID: string;
   /** Branch point. Defaults to the repo's current HEAD. */
   readonly baseRef?: string;
-  /** Where worktrees live. Defaults to `<repoRoot>/.orchestrator/worktrees` (§6.1). */
+  /** Where worktrees live. Defaults to `<repoRoot>/.dispatched-code/worktrees` (§6.1). */
   readonly root?: string;
   /** Branch name. Defaults to `worker/<workerID>`. */
   readonly branch?: string;
@@ -70,7 +100,7 @@ export async function resolveSha(repoRoot: string, ref = "HEAD"): Promise<string
 }
 
 export function defaultWorktreeRoot(repoRoot: string): string {
-  return join(repoRoot, ORCHESTRATOR_DIR, "worktrees");
+  return join(repoRoot, stateDir(repoRoot), "worktrees");
 }
 
 /**
@@ -97,7 +127,7 @@ export async function createWorktree(opts: CreateWorktreeOptions): Promise<Workt
 }
 
 /**
- * Keep the orchestrator's scratch out of everyone's `git status`.
+ * Keep Dispatched Code's scratch out of everyone's `git status`.
  *
  * Written to `info/exclude`, which is local and uncommitted — the user's own
  * `.gitignore` is theirs, and a tool that edits it has overstepped. The common
@@ -105,15 +135,20 @@ export async function createWorktree(opts: CreateWorktreeOptions): Promise<Workt
  * also what keeps a worker's manifest out of `git add -A`.
  *
  * **Exported since Phase 7, and called at server start as well as here.** It
- * used to run only when a worker prepared a worktree, but the server writes
- * `.orchestrator/` the moment it opens its database — and a run in which no
+ * used to run only when a worker prepared a worktree, but the server writes its
+ * state directory the moment it opens its database — and a run in which no
  * worker ever reached `preparing` therefore left the directory sitting visible
  * in the user's `git status`. Idempotent, and safe on a read-only `.git`.
+ *
+ * Only the name this tree actually uses is written. A checkout that still has
+ * `.orchestrator/` keeps the entry it already has, and one that has moved on
+ * gets the new entry the next time this runs — which is at every server start,
+ * so the switch needs nothing from the user.
  */
 export async function ensureExcluded(repoRoot: string): Promise<void> {
   const commonDir = await gitLine(repoRoot, ["rev-parse", "--git-common-dir"]);
   const excludeFile = join(isAbsolute(commonDir) ? commonDir : join(repoRoot, commonDir), "info", "exclude");
-  const entry = `/${ORCHESTRATOR_DIR}/`;
+  const entry = `/${stateDir(repoRoot)}/`;
   try {
     const existing = existsSync(excludeFile) ? readFileSync(excludeFile, "utf8") : "";
     if (existing.split("\n").some((l) => l.trim() === entry)) return;
@@ -130,14 +165,14 @@ export async function ensureExcluded(repoRoot: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export function manifestPath(worktree: string): string {
-  return join(worktree, ORCHESTRATOR_DIR, MANIFEST_FILE);
+  return join(worktree, stateDir(worktree), MANIFEST_FILE);
 }
 
 // ---------------------------------------------------------------------------
 // Scratch space (§11 Phase 9)
 // ---------------------------------------------------------------------------
 
-/** Where per-worker scratch lives, under {@link ORCHESTRATOR_DIR}. */
+/** Where per-worker scratch lives, under {@link STATE_DIR}. */
 export const SCRATCH_DIR = "scratch";
 
 /**
@@ -153,7 +188,7 @@ export const SCRATCH_DIR = "scratch";
  * doing exactly what it was asked to do.
  *
  * This is the third answer: inside the jail, so no permission is needed; under
- * `.orchestrator/`, which is already git-excluded and already filtered out of
+ * the state directory, which is already git-excluded and already filtered out of
  * every changed-file list by {@link EXCLUDED}, so nothing written here can reach
  * a diff, a snapshot or a reconciliation.
  *
@@ -161,7 +196,7 @@ export const SCRATCH_DIR = "scratch";
  * user's whole checkout and several workers are in it at once.
  */
 export function scratchPath(worktree: string, workerID: string): string {
-  return join(worktree, ORCHESTRATOR_DIR, SCRATCH_DIR, workerID);
+  return join(worktree, stateDir(worktree), SCRATCH_DIR, workerID);
 }
 
 /**
@@ -238,9 +273,9 @@ export interface Snapshot {
  * repository content to execute in the manager's process.
  */
 export async function snapshotCommit(worktree: string, message: string): Promise<Snapshot> {
-  // Stage everything, then unstage the orchestrator's own files. Naming them in
+  // Stage everything, then unstage Dispatched Code's own files. Naming them in
   // an `add` pathspec looks tidier and is not equivalent: git rejects a pathspec
-  // that explicitly matches an ignored path, and `.orchestrator/` is ignored
+  // that explicitly matches an ignored path, and the state directory is ignored
   // precisely so the worker never sees it. Unstaging afterwards holds whether or
   // not the ignore entry was written.
   await git(worktree, ["add", "-A", "--", "."]);

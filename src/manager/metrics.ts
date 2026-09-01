@@ -1,8 +1,8 @@
 /**
  * The metrics log (`projectplan.md` §11 Phase 7).
  *
- * One JSON object per line, appended, under `.orchestrator/metrics/`. It is
- * deliberately the smallest thing that answers "what did this orchestrator
+ * One JSON object per line, appended, under the state directory's `metrics/`. It
+ * is deliberately the smallest thing that answers "what did Dispatched Code
  * actually do, over time" — the questions the run report cannot, because a run
  * report is *per run* and these questions are across them: is the free tier
  * getting slower, how often does a worker need revising, how much does an
@@ -26,9 +26,18 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-import { ORCHESTRATOR_DIR } from "../workspace/index.js";
+import { stateDir } from "../workspace/index.js";
 
-export const METRICS_DIR = `${ORCHESTRATOR_DIR}/metrics`;
+/**
+ * Where the log goes, relative to the repository.
+ *
+ * A function rather than a constant because the state directory it sits under
+ * carries two possible names — see `stateDir` — and which one a checkout uses is
+ * a fact about that checkout, not about this module.
+ */
+export function metricsDir(repoRoot: string): string {
+  return `${stateDir(repoRoot)}/metrics`;
+}
 
 /** What kind of thing happened. Closed set: a metrics file is only useful sorted. */
 export type MetricKind = "worker_settled" | "merge_finished" | "revision_round" | "retry" | "recovery";
@@ -55,7 +64,7 @@ export const NULL_METRICS: MetricsSink = { record: () => {} };
  *
  * Per day rather than per run: a run is minutes and a file per run would make
  * "what happened last Tuesday" a directory listing rather than a `grep`. Per day
- * also means the file a long-running orchestrator is appending to stays a size
+ * also means the file a long-running process is appending to stays a size
  * an editor will open.
  */
 export function fileMetrics(repoRoot: string, now: () => number = Date.now): MetricsSink {
@@ -64,7 +73,7 @@ export function fileMetrics(repoRoot: string, now: () => number = Date.now): Met
       try {
         const at = metric.at || now();
         const day = new Date(at).toISOString().slice(0, 10);
-        const path = join(repoRoot, METRICS_DIR, `${day}.jsonl`);
+        const path = join(repoRoot, metricsDir(repoRoot), `${day}.jsonl`);
         mkdirSync(dirname(path), { recursive: true });
         appendFileSync(path, `${JSON.stringify({ ...metric, at })}\n`);
       } catch {

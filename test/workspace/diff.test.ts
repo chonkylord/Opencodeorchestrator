@@ -72,11 +72,11 @@ describe("readDiff", () => {
     expect(after.lines.join("\n")).toContain("+new");
   });
 
-  test("`.orchestrator/` is never in a diff, even if asked for", async () => {
+  test("`.dispatched-code/` is never in a diff, even if asked for", async () => {
     const wt = await tree(repo());
     writeFileSync(join(wt.path, "src", "stats.js"), "export const sum = () => 1;\n");
-    const page = await readDiff(wt.path, { baseSha: wt.baseSha, paths: [".orchestrator", "src"] });
-    expect(page.lines.join("\n")).not.toContain(".orchestrator");
+    const page = await readDiff(wt.path, { baseSha: wt.baseSha, paths: [".dispatched-code", "src"] });
+    expect(page.lines.join("\n")).not.toContain(".dispatched-code");
     expect(page.lines.join("\n")).toContain("src/stats.js");
   });
 

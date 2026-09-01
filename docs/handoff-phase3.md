@@ -1,6 +1,6 @@
 # Handoff: implement Phase 3 — the MCP server
 
-You are picking up the **Claude → OpenCode Subagent Orchestrator** at
+You are picking up **Dispatched Code** at
 `chonkylord/Opencodeorchestrator`. Phases 0, 1 and 2 are complete and pushed.
 Your job is Phase 3, and only Phase 3.
 
@@ -10,7 +10,7 @@ branch instead, that wins — push there and say which you used.)
 This is the phase where the system stops being a library and starts being a
 product. Everything below this layer is built and tested; what you are writing is
 **the whole of what Claude ever sees**. Get the tool descriptions wrong and a
-correct orchestrator gets used incorrectly.
+correct delegation layer gets used incorrectly.
 
 ---
 
@@ -60,14 +60,14 @@ Concretely, deliver:
    heuristics ("delegate multi-file implementation; do not delegate single-file
    edits or codebase questions") belong *in the descriptions*, not in a doc
    nobody loads. So does DD-8: a worker's summary is a **claim**, and the
-   `discrepancies` field is the orchestrator's own finding about that claim.
+   `discrepancies` field is Dispatched Code's own finding about that claim.
 4. **Pagination and truncation** (§8): event pages of 50, result summaries under
    ~1.5k tokens, and a hard cap on every field that a worker can influence the
    size of. `renderResult` already respects the result budget; `worker_output`
    is yours, and `Store.listEvents({limit, afterID})` is the cursor you want.
 5. **Configuration.** The server needs to know which repository it orchestrates
    and where to put its database. Environment variables are fine
-   (`ORCHESTRATOR_REPO`, `ORCHESTRATOR_DB`, `ORCHESTRATOR_MODEL`); defaulting the
+   (`DISPATCHED_CODE_REPO`, `DISPATCHED_CODE_DB`, `DISPATCHED_CODE_MODEL`); defaulting the
    repo to `process.cwd()` is fine. Say what you chose in the README.
 6. **`test/mcp/`** — the tool surface driven over real JSON-RPC against `ocmock`,
    not by calling the handlers directly. The `InMemoryTransport` pair from
@@ -114,7 +114,7 @@ The rest:
 
 - **`manager.wait()` already has the semantics `worker_wait` needs.** It resolves
   on any *settled* state — which includes `blocked`, because a blocked worker is
-  finished as far as the orchestrator is concerned — and it **resolves rather
+  finished as far as Dispatched Code is concerned — and it **resolves rather
   than throws** on timeout, because "still running" is a legitimate answer. Do
   not wrap it in your own timeout race.
 - **`spawn()` is already DD-1-compliant.** It creates the worktree and session in
@@ -137,8 +137,8 @@ The rest:
   follow-ups are text a model wrote after reading a repository that may contain
   anything. Pass it through as data; never let it become part of a tool
   description, never interpolate it into a shell string, and consider whether
-  your rendering makes it visually distinguishable from the orchestrator's own
-  findings. `discrepancies` is the orchestrator talking; `summary` is the worker
+  your rendering makes it visually distinguishable from Dispatched Code's own
+  findings. `discrepancies` is Dispatched Code talking; `summary` is the worker
   talking, and Claude should be able to tell.
 - **One `ServeBackend` per server process, pre-warmed.** The first prompt on a
   fresh server emits ~45 unscoped events before generation starts. Call
@@ -213,7 +213,7 @@ OC_E2E=1 bun test test/e2e      # the real-OpenCode tests, if you want the basel
 ```
 
 - Wire the server into a host with
-  `claude mcp add orchestrator -- bun run "$PWD/src/mcp/server.ts"`.
+  `claude mcp add dispatched-code -- bun run "$PWD/src/mcp/server.ts"`.
 - `opencode/muse-spark-1.2-contributor-free` works with no configured
   credentials and is the default. It **rejects schema-constrained output**; the
   manager already handles that, and you should not be surprised to see a
@@ -252,7 +252,7 @@ working.
 Three items from earlier phases remain open. **One of them is finally yours to
 close**, and it is the one this phase's own cap depends on:
 
-1. **Claude Code's MCP tool-call timeout.** `orchestrator_timeout_probe` is built
+1. **Claude Code's MCP tool-call timeout.** `dispatched_code_timeout_probe` is built
    and verified over real JSON-RPC; the measurement needs a live Claude Code
    session with the server registered, which Phase 3 is the first phase to have.
    Call it with increasing `delayMs` until the host gives up. The largest delay

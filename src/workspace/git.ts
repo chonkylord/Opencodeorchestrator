@@ -42,8 +42,8 @@ export interface GitOptions {
  * human's name on a machine's work.
  */
 export const COMMIT_IDENTITY = Object.freeze({
-  name: "opencode-orchestrator",
-  email: "orchestrator@localhost",
+  name: "dispatched-code",
+  email: "dispatched-code@localhost",
 });
 
 const IDENTITY_ARGS: readonly string[] = Object.freeze([

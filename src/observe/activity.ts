@@ -15,8 +15,8 @@
  *
  * **Bounded twice, on purpose.** A worker that generates 39,004 tokens with no
  * terminal event is not hypothetical here — Phase 8 measured one — and an
- * unbounded buffer behind an event stream is how a long-running orchestrator
- * turns somebody's laptop into swap. Every worker's ring is capped by entry
+ * unbounded buffer behind an event stream is how a long-running Dispatched Code
+ * process turns somebody's laptop into swap. Every worker's ring is capped by entry
  * count *and* by total characters, and the two catch different failures: a
  * chatty tool-calling worker hits the first, a worker emitting one enormous
  * reply hits the second.

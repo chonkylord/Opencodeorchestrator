@@ -129,7 +129,7 @@ export const DEFAULT_MODEL = "opencode/muse-spark-1.2-contributor-free";
  * feedback is usually one where the instruction, not the worker, is wrong. The
  * cap is a backstop and not a licence — nothing in this system revises a worker
  * on its own, and §11 Phase 6 is explicit that Claude decides and the tools
- * report. `ORCHESTRATOR_MAX_REVISIONS` moves it.
+ * report. `DISPATCHED_CODE_MAX_REVISIONS` moves it.
  */
 export const DEFAULT_MAX_REVISIONS = 3;
 
@@ -182,12 +182,12 @@ export const DEFAULT_RUN_BUDGET_TOKENS = 2_000_000;
  *
  * `external_directory` is deliberately *not* widened here. Phase 0 called it "a
  * useful jail signal for §8", and it is: a worker reaching outside its worktree
- * raises a question the orchestrator can surface, rather than silently writing
+ * raises a question Dispatched Code can surface, rather than silently writing
  * where it should not.
  *
  * **This is no longer the default.** `full` is — see {@link FULL_PERMISSIONS}
  * and `docs/adr/0011-full-permissions.md`. This set is what
- * `ORCHESTRATOR_PERMISSIONS=jailed` restores, and it is the only mode in which
+ * `DISPATCHED_CODE_PERMISSIONS=jailed` restores, and it is the only mode in which
  * `worker_message`'s `decision` parameter has anything to decide.
  */
 const JAILED_IMPLEMENT_PERMISSIONS: readonly PermissionRule[] = Object.freeze([
@@ -233,7 +233,7 @@ export interface WorkerManagerOptions {
   readonly store: Store;
   /** Any path inside the repository the workers branch from. */
   readonly repoRoot: string;
-  /** Defaults to `<repoRoot>/.orchestrator/worktrees` (§6.1). */
+  /** Defaults to `<repoRoot>/.dispatched-code/worktrees` (§6.1). */
   readonly worktreeRoot?: string;
   readonly defaultModel?: string;
   /** DD-9 presets, per mode. */
@@ -264,14 +264,14 @@ export interface WorkerManagerOptions {
    * Counts `preparing`, `running` and `blocked` — every state in which a worker
    * holds a session on the shared backend. Defaults to
    * {@link DEFAULT_MAX_CONCURRENT}; the server reads it from
-   * `ORCHESTRATOR_MAX_CONCURRENT`.
+   * `DISPATCHED_CODE_MAX_CONCURRENT`.
    */
   readonly maxConcurrent?: number;
   /**
    * How many revision rounds one worker may take (§5, §13).
    *
    * Defaults to {@link DEFAULT_MAX_REVISIONS}; the server reads it from
-   * `ORCHESTRATOR_MAX_REVISIONS`. At the cap {@link WorkerManager.revise}
+   * `DISPATCHED_CODE_MAX_REVISIONS`. At the cap {@link WorkerManager.revise}
    * refuses, and the refusal carries the terminal report §13 calls actionable.
    */
   readonly maxRevisions?: number;
@@ -762,7 +762,7 @@ export class WorkerManager {
   /**
    * Translate one backend frame for the dashboard, or drop it (§11 Phase 9).
    *
-   * DD-2 lives here: the observer is handed the orchestrator's own vocabulary,
+   * DD-2 lives here: the observer is handed Dispatched Code's own vocabulary,
    * never OpenCode's, so the adapter can be rewritten without the dashboard
    * noticing. Frames that are pure liveness — heartbeats, stream opens, the
    * `status` ticks — are dropped rather than translated: they are how the
@@ -901,7 +901,7 @@ export class WorkerManager {
     if (spent < cap) return undefined;
     return (
       `run ${runID} has spent ${spent.toLocaleString("en-US")} tokens against a run cap of ${cap.toLocaleString("en-US")} ` +
-      "(§8's global cap, ORCHESTRATOR_RUN_BUDGET_TOKENS). Per-worker budgets stop one worker running away; this stops a wave doing it. " +
+      "(§8's global cap, DISPATCHED_CODE_RUN_BUDGET_TOKENS). Per-worker budgets stop one worker running away; this stops a wave doing it. " +
       "Read run_report to see where the tokens went, then start a new run with a fresh runID if the work is worth continuing, or raise the cap deliberately."
     );
   }
@@ -1081,7 +1081,7 @@ export class WorkerManager {
   /**
    * The standing contract this worker is running under, if it has one yet.
    *
-   * For the dashboard (§11 Phase 9). "What did the orchestrator actually tell
+   * For the dashboard (§11 Phase 9). "What did Dispatched Code actually tell
    * it?" is the first question anybody asks about a worker that went sideways,
    * and until now the only answer was to reconstruct the brief by reading
    * `buildBrief` with the spec in hand. In memory only, so a worker from a
@@ -1097,7 +1097,7 @@ export class WorkerManager {
    * Wait for a worker to stop needing the manager's attention.
    *
    * Resolves on any settled state, `blocked` included — a blocked worker is
-   * finished as far as the orchestrator is concerned until somebody answers it.
+   * finished as far as Dispatched Code is concerned until somebody answers it.
    * Resolves (rather than throwing) on timeout: "still running" is an answer,
    * and Phase 3's `worker_wait` has a hard cap it must respect.
    */
@@ -1240,7 +1240,7 @@ export class WorkerManager {
         ok: false,
         code: "orphaned",
         message:
-          `worker ${workerID} belongs to a previous orchestrator process — its row says ${stored.state}, but the ` +
+          `worker ${workerID} belongs to a previous Dispatched Code process — its row says ${stored.state}, but the ` +
           "session that would receive the answer is gone, so nothing can be delivered to it",
       };
     }
@@ -1567,7 +1567,7 @@ export class WorkerManager {
    *
    * - **`resume`** — carry on with this worker. What that means depends on a
    *   fact only the backend knows: whether its session still exists. If it does
-   *   (a shared server, `ORCHESTRATOR_BASE_URL`), the turn may still be running
+   *   (a shared server, `DISPATCHED_CODE_BASE_URL`), the turn may still be running
    *   and this re-subscribes and monitors it. If it does not — the ordinary case,
    *   because a restarted manager spawns a fresh server — the turn is gone but
    *   **the worktree is not**, so the worker is settled from what is on disk:
@@ -2249,7 +2249,7 @@ export class WorkerManager {
     w.lastPromptText = text;
     w.usedFormat = this.supportsStructuredOutput(rec.model);
     w.turnStarted = false;
-    // The live view's only sight of the orchestrator's own side of the
+    // The live view's only sight of Dispatched Code's own side of the
     // conversation. Without it a resumed or revised worker appears to start
     // talking again for no reason.
     this.note(rec.workerID, `prompt sent (${text.length} chars${w.usedFormat ? ", schema attached" : ""})`);
@@ -2811,7 +2811,7 @@ export class WorkerManager {
     // never meant to exist.
     let snapshot: WorkerResult["snapshot"];
     // **Never in shared mode.** DD-5 has the manager commit so the worker does
-    // not have to, which is right in a worktree the orchestrator owns. The user's
+    // not have to, which is right in a worktree Dispatched Code owns. The user's
     // checkout is not that: `git add -A` there would sweep up whatever else they
     // had in progress, onto whatever branch they happen to be on, and call it
     // this worker's snapshot. The work is left as uncommitted changes for them to
@@ -3104,9 +3104,9 @@ export class WorkerManager {
       task: t.task,
       summary: t.result?.summary ?? "",
       changedPaths: t.result?.changes.paths ?? [],
-      diff: page?.lines ?? ["(the orchestrator could not read a diff for this worker)"],
+      diff: page?.lines ?? ["(Dispatched Code could not read a diff for this worker)"],
       diffTruncated: page?.hasMore ?? false,
-      // The orchestrator's own reconciliation, handed over so the reviewer does
+      // Dispatched Code's own reconciliation, handed over so the reviewer does
       // not spend its one round re-deriving findings that are already measured.
       discrepancies: (t.result?.discrepancies ?? []).slice(0, MAX_REVIEW_DISCREPANCIES).map((d) => `${d.kind}: ${d.detail}`),
     };
@@ -3313,5 +3313,5 @@ function notRevisable(rec: WorkerRecord, state: WorkerState): string {
 
 function snapshotMessage(rec: WorkerRecord): string {
   const task = rec.task.split("\n")[0]?.slice(0, 60) ?? rec.task.slice(0, 60);
-  return `${rec.workerID}: ${task}\n\nSnapshot taken by the orchestrator (DD-5); the worker does not commit its own work.`;
+  return `${rec.workerID}: ${task}\n\nSnapshot taken by Dispatched Code (DD-5); the worker does not commit its own work.`;
 }

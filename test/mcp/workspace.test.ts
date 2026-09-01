@@ -19,7 +19,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { OCMock } from "../ocmock/server.js";
-import { createOrchestrator, type Orchestrator } from "../../src/mcp/server.js";
+import { createDispatchedCode, type DispatchedCode } from "../../src/mcp/server.js";
 import type { ServerConfig } from "../../src/mcp/config.js";
 import { GOLDEN_TEST_COMMAND, makeGoldenRepo } from "../fixtures/golden.js";
 import { gitLine } from "../../src/workspace/git.js";
@@ -32,7 +32,7 @@ afterEach(async () => {
 
 interface Harness {
   client: Client;
-  orchestrator: Orchestrator;
+  dispatched: DispatchedCode;
   repo: string;
 }
 
@@ -44,7 +44,7 @@ async function harness(mockOpts: Parameters<typeof OCMock.start>[0] = {}): Promi
 
   const config: ServerConfig = {
     repoRoot: repo.path,
-    dbPath: join(repo.path, ".orchestrator", "orchestrator.db"),
+    dbPath: join(repo.path, ".dispatched-code", "dispatched-code.db"),
     defaultModel: "ocmock/test-model",
     baseUrl: mock.baseUrl,
     verifyTests: false,
@@ -63,20 +63,20 @@ async function harness(mockOpts: Parameters<typeof OCMock.start>[0] = {}): Promi
     dashboardPort: -1,
     permissionMode: "full",
   };
-  const orchestrator = await createOrchestrator(config, {
+  const dispatched = await createDispatchedCode(config, {
     tickMs: 10,
     budgetPollMs: 20,
     abortGraceMs: 400,
     retrySettleMs: 60,
   });
-  cleanup.push(() => orchestrator.dispose());
+  cleanup.push(() => dispatched.dispose());
 
   const client = new Client({ name: "test-host", version: "0.0.0" });
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-  await Promise.all([orchestrator.server.connect(serverSide), client.connect(clientSide)]);
+  await Promise.all([dispatched.server.connect(serverSide), client.connect(clientSide)]);
   cleanup.push(() => client.close());
 
-  return { client, orchestrator, repo: repo.path };
+  return { client, dispatched, repo: repo.path };
 }
 
 interface CallOutcome {
@@ -206,7 +206,7 @@ describe("workspace_merge over JSON-RPC", () => {
     const a = await completedWorker(client, "write hello");
     const b = await completedWorker(client, "write hello differently");
     // The baseline is taken once the workers exist, because spawning one adds
-    // `/.orchestrator/` to `.git/info/exclude` — a deliberate, documented write
+    // `/.dispatched-code/` to `.git/info/exclude` — a deliberate, documented write
     // that changes `git status` output and has nothing to do with merging.
     const before = await gitLine(repo, ["status", "--porcelain"]);
     const head = await gitLine(repo, ["rev-parse", "HEAD"]);
@@ -243,7 +243,7 @@ describe("workspace_merge over JSON-RPC", () => {
 
 describe("worker_diff over JSON-RPC", () => {
   test("renders the worker's diff, marked as untrusted, and paginates", async () => {
-    const { client, orchestrator } = await harness({ perWorktreeFileName: true });
+    const { client, dispatched } = await harness({ perWorktreeFileName: true });
     const id = await completedWorker(client, "write a file");
 
     const page = await call(client, "worker_diff", { id });
@@ -254,7 +254,7 @@ describe("worker_diff over JSON-RPC", () => {
     expect(page.text).toMatch(/A WORKER WROTE/);
 
     // Make the diff long enough to page, in the worker's own worktree.
-    const worktree = orchestrator.manager.get(id)!.worktree;
+    const worktree = dispatched.manager.get(id)!.worktree;
     writeFileSync(join(worktree, "big.txt"), `${Array.from({ length: 900 }, (_, i) => `line ${i}`).join("\n")}\n`);
 
     const first = await call(client, "worker_diff", { id, maxLines: 400 });
@@ -273,10 +273,10 @@ describe("worker_diff over JSON-RPC", () => {
 
 describe("workspace_cleanup over JSON-RPC", () => {
   test("prunes merged workers, keeps unmerged ones, and reports orphans", async () => {
-    const { client, orchestrator, repo } = await harness({ perWorktreeFileName: true });
+    const { client, dispatched, repo } = await harness({ perWorktreeFileName: true });
     const a = await completedWorker(client, "write a file");
     const b = await completedWorker(client, "write another file");
-    const worktreeB = orchestrator.manager.get(b)!.worktree;
+    const worktreeB = dispatched.manager.get(b)!.worktree;
 
     const started = await call(client, "workspace_merge", { workerIDs: [a] });
     await pollMerge(client, mergeIDFrom(started.text));

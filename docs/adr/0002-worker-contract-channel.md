@@ -38,8 +38,8 @@ forced move, and there are three reasons to make it anyway:
 1. **The brief must not be in the diff we reconcile against.** DD-4 checks the
    worker's claims against `git diff --name-only`. A file the manager writes into
    the worktree is a change the manager then has to remember to exclude from
-   every comparison, forever. The orchestrator already carries one such
-   exception (`.orchestrator/`); adding the contract itself to that list means
+   every comparison, forever. Dispatched Code already carries one such
+   exception (`.dispatched-code/`); adding the contract itself to that list means
    the thing being enforced lives inside the thing being measured.
 2. **The worker can edit a file. It cannot edit its own system prompt.** An
    `implement` worker has `edit: allow` over its whole tree. A contract it can

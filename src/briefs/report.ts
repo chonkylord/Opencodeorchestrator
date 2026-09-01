@@ -23,7 +23,7 @@ import type { WorkerReport } from "../manager/types.js";
  *
  * Kept minimal on purpose: every required field is one more thing a small model
  * can fail, and the fields that matter (`status`, `summary`, `changes`) are the
- * ones the orchestrator actually reads.
+ * ones Dispatched Code actually reads.
  */
 export const REPORT_SCHEMA = Object.freeze({
   type: "object",
@@ -60,7 +60,7 @@ export const REPORT_SCHEMA = Object.freeze({
     questions: {
       type: "array",
       items: { type: "string" },
-      description: 'Required when status is "blocked": what the orchestrator must answer.',
+      description: 'Required when status is "blocked": what Dispatched Code must answer.',
     },
     followUps: { type: "array", items: { type: "string" } },
   },

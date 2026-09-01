@@ -354,7 +354,7 @@ interface EventBase {
  * Normalized event vocabulary.
  *
  * OpenCode's stream carries 89+ documented variants plus at least one undocumented
- * (`server.heartbeat`). This union is the subset the orchestrator acts on;
+ * (`server.heartbeat`). This union is the subset Dispatched Code acts on;
  * everything else arrives as `kind: "other"` with its type string intact, so an
  * unmapped-but-interesting event shows up in logs instead of vanishing.
  */
@@ -424,13 +424,13 @@ export function isTerminal(e: OCEvent): e is Extract<OCEvent, { kind: "idle" | "
   return e.kind === "idle" || e.kind === "error";
 }
 
-/** Blocked kinds: the worker is waiting on the orchestrator (§5). */
+/** Blocked kinds: the worker is waiting on Dispatched Code (§5). */
 export function isBlocking(e: OCEvent): boolean {
   return e.kind === "permission.asked" || e.kind === "question.asked";
 }
 
 /**
- * A block the orchestrator can answer **in band**, leaving the turn running.
+ * A block Dispatched Code can answer **in band**, leaving the turn running.
  *
  * The distinction is not cosmetic and it is not the caller's to work out: a
  * permission request is answered with one of three fixed decisions and the
@@ -457,8 +457,8 @@ export function isAnswerable(e: OCEvent): e is Extract<OCEvent, { kind: "permiss
 export function isWorkerEvent(e: OCEvent): boolean {
   if (e.kind === "heartbeat" || e.kind === "stream.open") return false;
   // An unmapped event still counts as progress if it is scoped to the session —
-  // `message.updated` and friends are real worker activity even though the
-  // orchestrator does not act on them. Unscoped noise (`plugin.added`,
+  // `message.updated` and friends are real worker activity even though
+  // Dispatched Code does not act on them. Unscoped noise (`plugin.added`,
   // `catalog.updated`) is not.
   if (e.kind === "other") return e.sessionID !== undefined;
   return true;

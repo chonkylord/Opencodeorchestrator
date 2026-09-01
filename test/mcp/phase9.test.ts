@@ -16,7 +16,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { OCMock } from "../ocmock/server.js";
-import { createOrchestrator, type ManagerTuning, type Orchestrator } from "../../src/mcp/server.js";
+import { createDispatchedCode, type ManagerTuning, type DispatchedCode } from "../../src/mcp/server.js";
 import { ANSWER_CONFIRM_MS, WAIT_TIMEOUT_CEILING_MS, WAIT_TIMEOUT_MAX_MS, clampWaitMax } from "../../src/mcp/tools.js";
 import { loadConfig, type ServerConfig } from "../../src/mcp/config.js";
 import { DEFAULT_DASHBOARD_PORT } from "../../src/observe/index.js";
@@ -48,7 +48,7 @@ const DONE = {
 
 interface Harness {
   client: Client;
-  orchestrator: Orchestrator;
+  dispatched: DispatchedCode;
   mock: OCMock;
   repo: string;
 }
@@ -65,7 +65,7 @@ async function harness(
 
   const config: ServerConfig = {
     repoRoot: repo.path,
-    dbPath: join(repo.path, ".orchestrator", "orchestrator.db"),
+    dbPath: join(repo.path, ".dispatched-code", "dispatched-code.db"),
     defaultModel: "ocmock/test-model",
     baseUrl: mock.baseUrl,
     verifyTests: false,
@@ -82,21 +82,21 @@ async function harness(
     permissionMode: "full",
     ...configOver,
   };
-  const orchestrator = await createOrchestrator(config, {
+  const dispatched = await createDispatchedCode(config, {
     tickMs: 10,
     budgetPollMs: 20,
     abortGraceMs: 400,
     retrySettleMs: 60,
     ...tuning,
   });
-  cleanup.push(() => orchestrator.dispose());
+  cleanup.push(() => dispatched.dispose());
 
   const client = new Client({ name: "test-host", version: "0.0.0" });
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-  await Promise.all([orchestrator.server.connect(serverSide), client.connect(clientSide)]);
+  await Promise.all([dispatched.server.connect(serverSide), client.connect(clientSide)]);
   cleanup.push(() => client.close());
 
-  return { client, orchestrator, mock, repo: repo.path };
+  return { client, dispatched, mock, repo: repo.path };
 }
 
 interface CallOutcome {
@@ -161,14 +161,14 @@ describe("worker_message never reports a delivery that did not happen", () => {
 
   test("a worker orphaned by a restart is refused and pointed at worker_recover", async () => {
     // The exact sequence from the field: block, lose the process, come back.
-    const { client, orchestrator, mock, repo } = await harness({ report: BLOCKED, dropPromptsWithinMs: 30 });
+    const { client, dispatched, mock, repo } = await harness({ report: BLOCKED, dropPromptsWithinMs: 30 });
     const id = idFrom((await call(client, "worker_spawn", { task: "create hello.txt" })).text);
     await pollUntil(client, id, /blocked/);
-    orchestrator.manager.halt();
+    dispatched.manager.halt();
 
-    const second = await createOrchestrator(
+    const second = await createDispatchedCode(
       {
-        ...orchestrator.config,
+        ...dispatched.config,
         repoRoot: repo,
         baseUrl: mock.baseUrl,
       },
@@ -180,7 +180,7 @@ describe("worker_message never reports a delivery that did not happen", () => {
     await Promise.all([second.server.connect(s2), client2.connect(c2)]);
     cleanup.push(() => client2.close());
 
-    // `createOrchestrator` runs the restart sweep, so the row is `interrupted`
+    // `createDispatchedCode` runs the restart sweep, so the row is `interrupted`
     // here. Either way the answer is the same and the recovery is named.
     const res = await call(client2, "worker_message", { id, message: "yes" });
     expect(res.isError).toBe(true);
@@ -205,13 +205,13 @@ describe("worker_result tells a blocked worker's story truthfully", () => {
   });
 
   test("an unreachable blocked worker is pointed at worker_recover instead", async () => {
-    const { client, orchestrator } = await harness({ report: BLOCKED, dropPromptsWithinMs: 30 });
+    const { client, dispatched } = await harness({ report: BLOCKED, dropPromptsWithinMs: 30 });
     const id = idFrom((await call(client, "worker_spawn", { task: "create hello.txt" })).text);
     await pollUntil(client, id, /blocked/);
 
     // Drop the registry without writing, and without the restart sweep — the row
     // stays `blocked`, which is precisely the state that had no way out.
-    orchestrator.manager.halt();
+    dispatched.manager.halt();
 
     const res = await call(client, "worker_result", { id });
     expect(res.text).toContain("NOTHING CAN ANSWER THEM ANY MORE");
@@ -224,10 +224,10 @@ describe("worker_result tells a blocked worker's story truthfully", () => {
   // worker. Both now come from `manager.isOrphaned`.
 
   test("worker_status gives the same advice as worker_result about an unreachable worker", async () => {
-    const { client, orchestrator } = await harness({ report: BLOCKED, dropPromptsWithinMs: 30 });
+    const { client, dispatched } = await harness({ report: BLOCKED, dropPromptsWithinMs: 30 });
     const id = idFrom((await call(client, "worker_spawn", { task: "create hello.txt" })).text);
     await pollUntil(client, id, /blocked/);
-    orchestrator.manager.halt();
+    dispatched.manager.halt();
 
     const res = await call(client, "worker_status", { ids: [id] });
     expect(res.text).toContain("worker_recover");
@@ -251,10 +251,10 @@ describe("worker_result tells a blocked worker's story truthfully", () => {
   test("worker_wait's status line carries the same correction", async () => {
     // `wait` resolves on `blocked` as well as on settled, so it renders the same
     // line from a different call path — and had the same bug.
-    const { client, orchestrator } = await harness({ report: BLOCKED, dropPromptsWithinMs: 30 });
+    const { client, dispatched } = await harness({ report: BLOCKED, dropPromptsWithinMs: 30 });
     const id = idFrom((await call(client, "worker_spawn", { task: "create hello.txt" })).text);
     await pollUntil(client, id, /blocked/);
-    orchestrator.manager.halt();
+    dispatched.manager.halt();
 
     const res = await call(client, "worker_wait", { ids: [id], timeoutMs: 2_000 });
     expect(res.text).toContain("worker_recover");
@@ -264,8 +264,8 @@ describe("worker_result tells a blocked worker's story truthfully", () => {
 
 describe("worker_spawn surfaces a model capability instead of burying it", () => {
   test("a model measured refusing the schema is named at spawn", async () => {
-    const { client, orchestrator } = await harness();
-    orchestrator.store.putModelCapability("ocmock/test-model", {
+    const { client, dispatched } = await harness();
+    dispatched.store.putModelCapability("ocmock/test-model", {
       structuredOutput: false,
       at: Date.now(),
       code: "api",
@@ -273,7 +273,7 @@ describe("worker_spawn surfaces a model capability instead of burying it", () =>
     });
     // The manager caches the set at construction, so a second one is what a
     // real restart gives — and is what makes this observable through the tools.
-    const second = await createOrchestrator({ ...orchestrator.config }, { tickMs: 10 });
+    const second = await createDispatchedCode({ ...dispatched.config }, { tickMs: 10 });
     cleanup.push(() => second.dispose());
     const c = new Client({ name: "host", version: "0.0.0" });
     const [a, b] = InMemoryTransport.createLinkedPair();
@@ -329,7 +329,7 @@ describe("worker_wait's cap is configurable and bounded", () => {
 describe("the timeout probe can measure the ceiling that progress notifications buy", () => {
   test("it takes progressEveryMs and reports how many frames it sent", async () => {
     const { client } = await harness();
-    const res = await call(client, "orchestrator_timeout_probe", { delayMs: 350, progressEveryMs: 250 });
+    const res = await call(client, "dispatched_code_timeout_probe", { delayMs: 350, progressEveryMs: 250 });
     const body = JSON.parse(res.text) as { returned: boolean; progressSent: number; progressRequested: boolean };
     expect(body.returned).toBe(true);
     // No progress token is sent unless the client asks for one, so
@@ -341,7 +341,7 @@ describe("the timeout probe can measure the ceiling that progress notifications 
 
   test("without progressEveryMs it behaves exactly as it did before", async () => {
     const { client } = await harness();
-    const res = await call(client, "orchestrator_timeout_probe", { delayMs: 50 });
+    const res = await call(client, "dispatched_code_timeout_probe", { delayMs: 50 });
     const body = JSON.parse(res.text) as { requestedMs: number; returned: boolean };
     expect(body.requestedMs).toBe(50);
     expect(body.returned).toBe(true);
@@ -351,36 +351,36 @@ describe("the timeout probe can measure the ceiling that progress notifications 
 describe("configuration", () => {
   test("the dashboard is on by default and takes one variable to switch off", () => {
     expect(loadConfig({}, "/repo").dashboardPort).toBe(DEFAULT_DASHBOARD_PORT);
-    expect(loadConfig({ ORCHESTRATOR_DASHBOARD: "0" }, "/repo").dashboardPort).toBe(-1);
-    expect(loadConfig({ ORCHESTRATOR_DASHBOARD: "off" }, "/repo").dashboardPort).toBe(-1);
-    expect(loadConfig({ ORCHESTRATOR_DASHBOARD_PORT: "9999" }, "/repo").dashboardPort).toBe(9999);
+    expect(loadConfig({ DISPATCHED_CODE_DASHBOARD: "0" }, "/repo").dashboardPort).toBe(-1);
+    expect(loadConfig({ DISPATCHED_CODE_DASHBOARD: "off" }, "/repo").dashboardPort).toBe(-1);
+    expect(loadConfig({ DISPATCHED_CODE_DASHBOARD_PORT: "9999" }, "/repo").dashboardPort).toBe(9999);
     // 0 means "any free port", which is a legitimate setting rather than off.
-    expect(loadConfig({ ORCHESTRATOR_DASHBOARD_PORT: "0" }, "/repo").dashboardPort).toBe(0);
+    expect(loadConfig({ DISPATCHED_CODE_DASHBOARD_PORT: "0" }, "/repo").dashboardPort).toBe(0);
     // A typo falls back to the default rather than silently disabling it — the
     // explicit off switch is the way to turn it off.
-    expect(loadConfig({ ORCHESTRATOR_DASHBOARD_PORT: "nonsense" }, "/repo").dashboardPort).toBe(DEFAULT_DASHBOARD_PORT);
-    expect(loadConfig({ ORCHESTRATOR_DASHBOARD_PORT: "70000" }, "/repo").dashboardPort).toBe(DEFAULT_DASHBOARD_PORT);
+    expect(loadConfig({ DISPATCHED_CODE_DASHBOARD_PORT: "nonsense" }, "/repo").dashboardPort).toBe(DEFAULT_DASHBOARD_PORT);
+    expect(loadConfig({ DISPATCHED_CODE_DASHBOARD_PORT: "70000" }, "/repo").dashboardPort).toBe(DEFAULT_DASHBOARD_PORT);
   });
 
   test("the wait cap comes from the environment, clamped", () => {
     expect(loadConfig({}, "/repo").waitMaxMs).toBe(WAIT_TIMEOUT_MAX_MS);
-    expect(loadConfig({ ORCHESTRATOR_WAIT_MAX_MS: "50000" }, "/repo").waitMaxMs).toBe(50_000);
-    expect(loadConfig({ ORCHESTRATOR_WAIT_MAX_MS: "banana" }, "/repo").waitMaxMs).toBe(WAIT_TIMEOUT_MAX_MS);
+    expect(loadConfig({ DISPATCHED_CODE_WAIT_MAX_MS: "50000" }, "/repo").waitMaxMs).toBe(50_000);
+    expect(loadConfig({ DISPATCHED_CODE_WAIT_MAX_MS: "banana" }, "/repo").waitMaxMs).toBe(WAIT_TIMEOUT_MAX_MS);
   });
 });
 
-describe("the orchestrator wires the dashboard to the run", () => {
+describe("Dispatched Code wires the dashboard to the run", () => {
   test("with the dashboard on, the transcript reaches the ring and the store reaches the stream", async () => {
-    const { client, orchestrator } = await harness({}, {}, { dashboardPort: 0 });
-    expect(orchestrator.dashboard).toBeDefined();
+    const { client, dispatched } = await harness({}, {}, { dashboardPort: 0 });
+    expect(dispatched.dashboard).toBeDefined();
 
     const id = idFrom((await call(client, "worker_spawn", { task: "create hello.txt" })).text);
     await pollUntil(client, id, /completed/, 10_000);
 
     // The live transcript exists and is about this worker...
-    expect(orchestrator.activity.entries(id).length).toBeGreaterThan(0);
+    expect(dispatched.activity.entries(id).length).toBeGreaterThan(0);
     // ...and is reachable from the dashboard rather than from any tool.
-    const res = await fetch(`${orchestrator.dashboard!.url}/api/worker/${id}/detail`);
+    const res = await fetch(`${dispatched.dashboard!.url}/api/worker/${id}/detail`);
     const body = (await res.json()) as { activity: unknown[]; events: unknown[] };
     expect(body.activity.length).toBeGreaterThan(0);
     expect(body.events.length).toBeGreaterThan(0);
@@ -391,12 +391,12 @@ describe("the orchestrator wires the dashboard to the run", () => {
   });
 
   test("with the dashboard off, nothing binds and the run is unaffected", async () => {
-    const { client, orchestrator } = await harness({}, {}, { dashboardPort: -1 });
-    expect(orchestrator.dashboard).toBeUndefined();
+    const { client, dispatched } = await harness({}, {}, { dashboardPort: -1 });
+    expect(dispatched.dashboard).toBeUndefined();
     const id = idFrom((await call(client, "worker_spawn", { task: "create hello.txt" })).text);
     await pollUntil(client, id, /completed/, 10_000);
     // The ring is still filled — it costs nothing and is what a later `watch`
     // would show — but nothing is listening on a socket.
-    expect(orchestrator.activity.entries(id).length).toBeGreaterThan(0);
+    expect(dispatched.activity.entries(id).length).toBeGreaterThan(0);
   });
 });

@@ -12,10 +12,10 @@
  * `createTextNode`. There is not one `innerHTML` assignment carrying data in
  * this file. A worker reads a repository that may contain anything, and a
  * dashboard that renders that as markup is a stored-XSS hole aimed at the one
- * browser with the orchestrator's own origin open in it.
+ * browser with Dispatched Code's own origin open in it.
  *
  * DD-4 — a claim and a measurement never share a visual treatment. The worker's
- * own words get a light rule and a proportional face; the orchestrator's
+ * own words get a light rule and a proportional face; Dispatched Code's
  * measurements get a heavy rule and a monospace face; and the discrepancy
  * section says outright which one to believe.
  */
@@ -170,12 +170,12 @@
       return n;
     };
 
-    // --- the orchestrator, at the top, because it is the thing delegating ---
+    // --- Dispatched Code, at the top, because it is the thing delegating ---
     const rootW = 250;
     const rootX = (width - rootW) / 2;
     const rootG = mk("g", { class: "node" });
     mk("rect", { class: "n-box is-root", x: rootX, y: ROOT_Y, width: rootW, height: ROOT_H, rx: 2 }, rootG);
-    txt(mk("text", { class: "n-title", x: rootX + 12, y: ROOT_Y + 20 }, rootG), "Claude · orchestrator");
+    txt(mk("text", { class: "n-title", x: rootX + 12, y: ROOT_Y + 20 }, rootG), "Claude · dispatched code");
     txt(
       mk("text", { class: "n-sub", x: rootX + 12, y: ROOT_Y + 36 }, rootG),
       `${snap.totals.running} running · ${snap.totals.queued} queued · ${snap.server.maxConcurrent} slots · ${fmtNum(
@@ -447,7 +447,7 @@
         p,
         w && ACTIVE.has(w.state)
           ? "Waiting for the first frame from this worker."
-          : "Nothing streamed for this worker. A worker from a previous orchestrator process has no live transcript — its audit trail is under Trail.",
+          : "Nothing streamed for this worker. A worker from a previous Dispatched Code process has no live transcript — its audit trail is under Trail.",
       );
       box.appendChild(p);
       return;
@@ -524,7 +524,7 @@
       txt(
         p,
         w.orphaned
-          ? "This worker's session died with a previous orchestrator process, so nothing can answer it. Ask Claude for worker_recover."
+          ? "This worker's session died with a previous Dispatched Code process, so nothing can answer it. Ask Claude for worker_recover."
           : "Ask Claude to answer it — worker_message. The words above are the worker's own.",
       );
       s.appendChild(p);
@@ -623,7 +623,7 @@
     } else {
       txt(
         pre,
-        "No live brief. This worker is not running in the current orchestrator process, so the brief it was given is not in memory.\n\nThe spec it was built from:\n\n" +
+        "No live brief. This worker is not running in the current Dispatched Code process, so the brief it was given is not in memory.\n\nThe spec it was built from:\n\n" +
           JSON.stringify(detail.spec, null, 2),
       );
     }
@@ -730,7 +730,7 @@
         snap.server.waitMaxMs / 1000,
       )}s`,
     );
-    document.title = snap.totals.blocked > 0 ? `(${snap.totals.blocked} blocked) orchestrator` : "orchestrator";
+    document.title = snap.totals.blocked > 0 ? `(${snap.totals.blocked} blocked) dispatched code` : "dispatched code";
   }
 
   function redrawAll() {

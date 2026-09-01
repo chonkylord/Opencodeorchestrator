@@ -28,7 +28,7 @@ export interface RenderOptions {
  *
  * Plain text, not JSON: this is read by a model in a tool result, and the
  * shape in §4.3 was chosen to be skimmable. Discrepancies come *before* risks
- * because a discrepancy is the orchestrator's own finding and a risk is the
+ * because a discrepancy is Dispatched Code's own finding and a risk is the
  * worker's opinion of itself.
  */
 export function renderResult(r: WorkerResult, opts: RenderOptions = {}): string {
@@ -120,7 +120,7 @@ export function renderResult(r: WorkerResult, opts: RenderOptions = {}): string 
   if (r.risks.length > 0) lines.push(`Risks: ${listOf(r.risks, maxItems)}`);
   if (r.followUps.length > 0) lines.push(`Follow-ups: ${listOf(r.followUps, maxItems)}`);
   if (r.snapshot?.committed && r.snapshot.sha) lines.push(`Snapshot: ${r.snapshot.sha.slice(0, 10)} on the worker's branch`);
-  if (r.reportSource === "none") lines.push("Report: the worker never produced one — every claim above is the orchestrator's own measurement");
+  if (r.reportSource === "none") lines.push("Report: the worker never produced one — every claim above is Dispatched Code's own measurement");
   else if (r.reportSource === "report_file") lines.push("Report: recovered from the worktree, not from the reply");
   else if (r.reportSource === "not_started") {
     lines.push("Report: none, because no prompt was ever sent. Respawning this task costs nothing that was already spent.");

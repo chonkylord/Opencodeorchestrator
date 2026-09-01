@@ -8,9 +8,9 @@
  * **The merge never happens in the user's checkout.** `config.repoRoot` is a
  * real repository a human may have open, on a branch of their choosing, with
  * uncommitted work in it. `git merge` there is rude; `git reset --hard` there —
- * which is the rollback — destroys work the orchestrator never created and
+ * which is the rollback — destroys work Dispatched Code never created and
  * cannot restore. So every operation below runs in a **dedicated integration
- * worktree** created for this merge under `.orchestrator/`, which is already in
+ * worktree** created for this merge under the state directory, which is already in
  * `.git/info/exclude`. The user's branch, index and working tree are never
  * written to. Nothing in §6.3 says this, because §6.3 was drawn before there was
  * a repository to be careful about; see `docs/adr/0003-integration-worktree.md`.
@@ -44,11 +44,11 @@ import { dirname, join, resolve } from "node:path";
 
 import { WorkspaceError, git, gitLine } from "./git.js";
 import { type TestRun, runTestCommand } from "./verify.js";
-import { ORCHESTRATOR_DIR, resolveRepoRoot, resolveSha } from "./worktree.js";
+import { resolveRepoRoot, resolveSha, stateDir } from "./worktree.js";
 
 /** Where integration worktrees live, beside the workers' own. */
 export function defaultIntegrationRoot(repoRoot: string): string {
-  return join(repoRoot, ORCHESTRATOR_DIR, "integration");
+  return join(repoRoot, stateDir(repoRoot), "integration");
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ export interface MergeOptions {
   readonly candidates: readonly MergeCandidate[];
   /** Defaults to `integration/<mergeID>`. */
   readonly integrationBranch?: string;
-  /** Where the integration worktree goes. Defaults under `.orchestrator/`. */
+  /** Where the integration worktree goes. Defaults under the state directory. */
   readonly integrationRoot?: string;
   /** Branch point. Defaults to the candidates' shared base sha. */
   readonly baseSha?: string;

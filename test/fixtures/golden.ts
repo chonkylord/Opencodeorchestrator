@@ -5,7 +5,7 @@
  * temp directory and makes it a git repository with one commit. Copying rather
  * than using it in place is not fussiness — the lifecycle tests create
  * worktrees, commit into them and leave branches behind, and doing that inside
- * the orchestrator's own checkout would be indistinguishable from a bug.
+ * Dispatched Code's own checkout would be indistinguishable from a bug.
  *
  * `breakGoldenRepo` is the "make them fail on demand" half of §12: the
  * reconciliation tests need a suite that fails for a real reason, not a stubbed
@@ -40,7 +40,7 @@ export const GOLDEN_TEST_COMMAND = "npm test";
  * git for them — `rev-parse --show-toplevel` and `worktree list --porcelain`
  * both answer with the resolved path. A fixture that hands out the unresolved
  * one makes every comparison against git's output fail on macOS and pass on
- * Linux, which is a property of the fixture rather than of the orchestrator.
+ * Linux, which is a property of the fixture rather than of Dispatched Code.
  *
  * Resolved once here rather than at each comparison, because the alternative is
  * remembering to do it at every assertion for as long as the suite exists.

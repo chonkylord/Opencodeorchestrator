@@ -32,7 +32,7 @@ because the answer is not Claude's to know. It turns on whether the worker's
 session still exists, which only the backend can say:
 
 - **The session is alive** — an OpenCode server outlived the manager, which is
-  what `ORCHESTRATOR_BASE_URL` produces. The turn may still be running, so the
+  what `DISPATCHED_CODE_BASE_URL` produces. The turn may still be running, so the
   manager re-subscribes and monitors it.
 - **The session is gone** — the ordinary case, because a restarted manager spawns
   a fresh server that has never heard of it. There is nothing to monitor, but the
@@ -51,7 +51,7 @@ process's memory. The measurements survive, and §4.3 has always held that they
 are the stronger half. Verified on 2026-08-29 with a real `SIGKILL` against real
 OpenCode 1.18.25: a worker killed 20 seconds into its task came back
 `completed` with 205 insertions across two files committed as its snapshot, its
-`npm test` re-run green by the orchestrator, and `reportSource: "none"` — an
+`npm test` re-run green by Dispatched Code, and `reportSource: "none"` — an
 honest record of exactly what died with the process.
 
 ## Decision 2: a recovered worker gets a *grace window*, not the idle watchdog
@@ -136,14 +136,14 @@ spent is not a cap.
 
 **§9's orphan TTL** is 24 hours and refuses to prune anything younger — or of
 unknown age. The failure it exists for is not deleting stale scratch; it is
-deleting *another orchestrator's live worktree*, or this one's before its index
+deleting *another Dispatched Code's live worktree*, or this one's before its index
 caught up. Both look exactly like an orphan to a scan and neither is one. A TTL
 that pruned what it could not date would delete the thing it was least sure
 about, so a missing age counts as *too young*.
 
 ## Decision 6: metrics are a file, and never reach Claude
 
-JSONL under `.orchestrator/metrics/`, one file per UTC day, and **no tool returns
+JSONL under `.dispatched-code/metrics/`, one file per UTC day, and **no tool returns
 it**. Three reasons, and the third is the one that matters:
 
 - DD-7 makes the database an index and the worktrees the durable state; metrics
@@ -220,7 +220,7 @@ first version did exactly that and failed the worker `aborted_externally`.
 - **A restarted manager mints ids from `w-001` again**, so anything it spawns
   collides with the rows the dead one left. Phase 7 did not fix this — the tests
   give their second manager a distinct prefix — and it is a real sharp edge for
-  anyone running a long-lived orchestrator over one database. A durable id
+  anyone running a long-lived instance over one database. A durable id
   sequence is Phase 8's, or the first bug report's.
 - **Nothing here retries a *worker*.** Retries are per turn and inside the run
   loop. Re-running a whole worker is a new `worker_spawn`, and it is deliberately

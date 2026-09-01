@@ -34,7 +34,7 @@ import { isFinal, type WorkerState } from "./state.js";
  * cross-talk at ~1.4–1.9× single-session latency (`docs/phase0-facts.md`
  * "Unresolved" 2). That is one run, four sessions, one free-tier model: it is
  * the ceiling that worked once, not the number to ship. Three leaves headroom
- * inside a measurement nobody has repeated, and `ORCHESTRATOR_MAX_CONCURRENT`
+ * inside a measurement nobody has repeated, and `DISPATCHED_CODE_MAX_CONCURRENT`
  * moves it for anyone who has measured their own.
  */
 export const DEFAULT_MAX_CONCURRENT = 3;

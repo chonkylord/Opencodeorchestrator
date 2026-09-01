@@ -1,6 +1,6 @@
 # Handoff: implement Phase 5 — parallelism — then Phase 6 — the review loop
 
-You are picking up the **Claude → OpenCode Subagent Orchestrator** at
+You are picking up **Dispatched Code** at
 `chonkylord/Opencodeorchestrator`. Phases 0 through 4 are complete and pushed to
 `main`.
 
@@ -172,7 +172,7 @@ The rest:
   creates the run row, the worker row, the `ManagedWorker`, and kicks off
   `drive()` without awaiting it. The semaphore goes inside that detached path,
   not in front of `spawn()`. If `worker_spawn` starts blocking until a slot is
-  free, you have converted the orchestrator's whole async contract into a
+  free, you have converted Dispatched Code's whole async contract into a
   synchronous one, and the symptom is a host that times out at 60 s.
 - **`w.done` is the promise everything else awaits.** `dispose()` awaits every
   worker's `done`; `cancel()` awaits it too. A worker sitting in the queue must
@@ -206,7 +206,7 @@ The rest:
   `console.log` corrupts the protocol and the symptom is a host that says
   nothing is wrong.
 - **Worker output is untrusted (DD-8).** A run report renders worker summaries.
-  Cap them, mark them as the worker's own words, and keep the orchestrator's
+  Cap them, mark them as the worker's own words, and keep Dispatched Code's
   measurements — the changed-file list, the diff stat, the discrepancies, the
   merge outcomes — visibly separate from the claims. `src/mcp/render.ts` is the
   precedent and it is the only house style that exists.
@@ -284,8 +284,8 @@ OC_E2E=1 bun test test/e2e      # the real-OpenCode tests, if you want the basel
 ```
 
 - Wire the server into a host with
-  `claude mcp add orchestrator -- bun run "$PWD/src/mcp/server.ts"`, or configure
-  it with `ORCHESTRATOR_REPO` / `_DB` / `_MODEL` / `_BASE_URL` / `_VERIFY_TESTS`
+  `claude mcp add dispatched-code -- bun run "$PWD/src/mcp/server.ts"`, or configure
+  it with `DISPATCHED_CODE_REPO` / `_DB` / `_MODEL` / `_BASE_URL` / `_VERIFY_TESTS`
   (README → Configuration). Your new concurrency cap belongs in the same family
   and the same README table.
 - **You can drive a live Claude Code session from inside this container**, which
@@ -335,7 +335,7 @@ already true and none of which you should be surprised by:
   model is a config change, and do not build selection logic around models that
   are not there. **Say this out loud in Phase 6's design:** a reviewer that
   shares the author's blind spots is a weaker check than the diff-versus-report
-  reconciliation the orchestrator already does itself, and the tool descriptions
+  reconciliation Dispatched Code already does itself, and the tool descriptions
   should not oversell it.
 - **Its throughput under sustained concurrency is unmeasured.** See §3, trap 3.
   Three concurrent free-tier sessions is your default and your first real
@@ -468,7 +468,7 @@ terminates at cap with an actionable report to Claude.* §7's table has a
 - **A reviewer's critique is worker output and is untrusted (DD-8).** It is a
   claim about a claim. The tool descriptions must not let it read as a finding,
   and — per §7 above — a Muse Spark reviewing Muse Spark shares the author's
-  blind spots. The orchestrator's own diff-versus-report reconciliation is the
+  blind spots. Dispatched Code's own diff-versus-report reconciliation is the
   stronger check and should stay the headline.
 - **§13's risk row is the whole design constraint:** *"Infinite fix loops →
   revision caps with terminal actionable reports."* A cap that stops the loop

@@ -1,6 +1,6 @@
 # Handoff: implement Phase 2 — the worker manager
 
-You are picking up the **Claude → OpenCode Subagent Orchestrator** at
+You are picking up **Dispatched Code** at
 `chonkylord/Opencodeorchestrator`. Phases 0 and 1 are complete and pushed. Your
 job is Phase 2, and only Phase 2.
 
@@ -232,6 +232,6 @@ record the result in `docs/phase0-facts.md`:
    (`cost: 0` throughout). Your budget enforcement is the natural place to find
    out whether `cost` populates on a paid provider.
 3. **Claude Code's MCP tool-call timeout.** Instrument built
-   (`orchestrator_timeout_probe`), measurement requires a live Claude Code
+   (`dispatched_code_timeout_probe`), measurement requires a live Claude Code
    session. Not yours — but Phase 3's `worker_wait` cap depends on it, so if you
    happen to be running inside a session that can take the measurement, take it.

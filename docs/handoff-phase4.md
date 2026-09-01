@@ -1,6 +1,6 @@
 # Handoff: implement Phase 4 — isolation & the gated merge
 
-You are picking up the **Claude → OpenCode Subagent Orchestrator** at
+You are picking up **Dispatched Code** at
 `chonkylord/Opencodeorchestrator`. Phases 0, 1, 2 and 3 are complete and pushed.
 Your job is Phase 4, and only Phase 4.
 
@@ -247,8 +247,8 @@ OC_E2E=1 bun test test/e2e      # the real-OpenCode tests, if you want the basel
 ```
 
 - Wire the server into a host with
-  `claude mcp add orchestrator -- bun run "$PWD/src/mcp/server.ts"`, or configure
-  it with `ORCHESTRATOR_REPO` / `_DB` / `_MODEL` / `_BASE_URL` / `_VERIFY_TESTS`
+  `claude mcp add dispatched-code -- bun run "$PWD/src/mcp/server.ts"`, or configure
+  it with `DISPATCHED_CODE_REPO` / `_DB` / `_MODEL` / `_BASE_URL` / `_VERIFY_TESTS`
   (README → Configuration).
 - **You can drive a live Claude Code session from inside this container**, which
   is how Phase 3 took its measurements and how you can demonstrate a merge
@@ -266,7 +266,7 @@ OC_E2E=1 bun test test/e2e      # the real-OpenCode tests, if you want the basel
 - `test/fixtures/golden.ts` materializes the golden repo into a temp git
   repository, and `breakGoldenRepo()` makes its suite fail on a real assertion.
   Never point a test at this repository itself — the merge tests create branches
-  and reset them, and doing that in the orchestrator's own checkout would be
+  and reset them, and doing that in Dispatched Code's own checkout would be
   indistinguishable from a bug.
 - **Do not run `pkill -f 'opencode serve'`.** `pkill -f` matches full command
   lines including your own shell's; Phase 3 did it anyway and killed its own
