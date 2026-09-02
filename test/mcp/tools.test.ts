@@ -22,6 +22,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { OCMock } from "../ocmock/server.js";
 import { createDispatchedCode, type ManagerTuning, type DispatchedCode } from "../../src/mcp/server.js";
 import { WAIT_TIMEOUT_MAX_MS } from "../../src/mcp/tools.js";
+import { WAIT_INLINE_MAX } from "../../src/mcp/render.js";
 import type { ServerConfig } from "../../src/mcp/config.js";
 import { makeGoldenRepo } from "../fixtures/golden.js";
 import { sleep } from "../helpers.js";
@@ -553,5 +554,122 @@ describe("the context budget (Phase 3 AC)", () => {
     // Headroom check: if this ever creeps up, it is a rendering change and the
     // number in the phase notes needs re-taking.
     expect(chars).toBeLessThan(3_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+/**
+ * The round trips, which are what made this feel unlike a subagent.
+ *
+ * A native subagent is one tool call: you ask, it works, you get its report.
+ * The cheapest path here used to be three — spawn, wait, result — and a wave of
+ * four cost eight to ten, every one of them a full trip through the host's
+ * context. These tests pin the two changes that close that gap, and the honesty
+ * properties that make them safe to reach for.
+ */
+describe("the subagent shape", () => {
+  test("worker_wait hands back the result, not just the state", async () => {
+    const { client } = await harness({ writeFiles: true, report: TRUTHFUL });
+    const id = idFrom((await call(client, "worker_spawn", spawnArgs())).text);
+
+    const waited = await call(client, "worker_wait", { id, timeoutMs: 5_000 });
+
+    // Everything worker_result would have said, without the call that said it.
+    expect(waited.text).toMatch(/settled after/);
+    expect(waited.text).toContain("Created hello.txt as asked.");
+    expect(waited.text).toContain("Discrepancies: none");
+    expect(waited.text).toContain("status: completed");
+  });
+
+  test("a wave's results come back from one wait", async () => {
+    const { client } = await harness({ writeFiles: true, report: TRUTHFUL });
+    const ids = [
+      idFrom((await call(client, "worker_spawn", spawnArgs())).text),
+      idFrom((await call(client, "worker_spawn", spawnArgs())).text),
+    ];
+
+    const waited = await call(client, "worker_wait", { ids, mode: "all", timeoutMs: 10_000 });
+
+    for (const id of ids) expect(waited.text).toContain(id);
+    // Two results in one reply, which is the wave collapsing from ~6 calls to 2.
+    expect(waited.text.match(/Created hello\.txt as asked\./g)?.length).toBe(2);
+  });
+
+  test("more results than the cap are named, never dropped", async () => {
+    const { client } = await harness({ writeFiles: true, report: TRUTHFUL });
+    const ids: string[] = [];
+    for (let i = 0; i < WAIT_INLINE_MAX + 2; i += 1) {
+      ids.push(idFrom((await call(client, "worker_spawn", spawnArgs())).text));
+    }
+
+    const waited = await call(client, "worker_wait", { ids, mode: "all", timeoutMs: 20_000 });
+
+    expect(waited.text.match(/Created hello\.txt as asked\./g)?.length).toBe(WAIT_INLINE_MAX);
+    // The whole point of the cap: a reader can tell a bounded reply from a
+    // complete one, and knows exactly what to call for the rest.
+    expect(waited.text).toContain("more worker(s) settled and are not shown");
+    expect(waited.text).toContain("worker_result");
+    for (const id of ids) expect(waited.text).toContain(id);
+  });
+
+  test("a timed-out wait returns no result and says the worker is still running", async () => {
+    const { client } = await harness({ scenario: "hang" });
+    const id = idFrom((await call(client, "worker_spawn", spawnArgs())).text);
+
+    const waited = await call(client, "worker_wait", { id, timeoutMs: 300 });
+
+    expect(waited.isError).toBe(false);
+    expect(waited.text).toMatch(/still working/);
+    expect(waited.text).not.toContain("Discrepancies");
+  });
+
+  test("worker_spawn({wait}) is the whole interaction", async () => {
+    const { client } = await harness({ writeFiles: true, report: TRUTHFUL });
+
+    const spawned = await call(client, "worker_spawn", spawnArgs({ wait: true, waitMs: 10_000 }));
+
+    expect(spawned.isError).toBe(false);
+    expect(spawned.text).toMatch(/settled after/);
+    expect(spawned.text).toContain("Created hello.txt as asked.");
+    expect(spawned.text).toContain("status: completed");
+  });
+
+  test("a wait that runs out hands the id back rather than losing the worker", async () => {
+    const { client } = await harness({ scenario: "hang" });
+
+    const spawned = await call(client, "worker_spawn", spawnArgs({ wait: true, waitMs: 300 }));
+
+    expect(spawned.isError).toBe(false);
+    const id = idFrom(spawned.text);
+    expect(spawned.text).toMatch(/the wait ran out, not the worker/);
+    // Nothing is lost: the worker is exactly where a plain spawn would have
+    // left it, and the id still works.
+    expect((await call(client, "worker_status", { ids: [id] })).text).toContain(id);
+  });
+
+  test("waiting on a queued worker returns the id instead of spending the budget on the queue", async () => {
+    const { client } = await harness({ writeFiles: true, report: TRUTHFUL }, {}, { maxConcurrent: 1 });
+    await call(client, "worker_spawn", spawnArgs());
+
+    const queued = await call(client, "worker_spawn", spawnArgs({ wait: true, waitMs: 20_000 }));
+
+    // The measurement that matters: it did not block. A wait here would have
+    // been spent on the worker ahead of it.
+    expect(queued.ms).toBeLessThan(2_000);
+    expect(queued.text).toMatch(/QUEUED/);
+    expect(queued.text).toMatch(/`wait` was not used/);
+    expect(queued.text).not.toContain("Discrepancies");
+  });
+
+  test("a dependency-queued wait says which workers it would have waited on", async () => {
+    const { client } = await harness({ writeFiles: true, report: TRUTHFUL });
+    const first = idFrom((await call(client, "worker_spawn", spawnArgs())).text);
+
+    const dependent = await call(client, "worker_spawn", spawnArgs({ wait: true, dependsOn: [first] }));
+
+    expect(dependent.ms).toBeLessThan(2_000);
+    expect(dependent.text).toContain(first);
+    expect(dependent.text).toMatch(/`wait` was not used/);
   });
 });

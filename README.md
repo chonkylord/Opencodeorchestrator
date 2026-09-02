@@ -263,6 +263,39 @@ claude mcp add dispatched-code -- bun run "$PWD/src/mcp/server.ts"
 That is the whole setup: with no configuration the server works on the
 directory the host launched it in.
 
+### Under Codex CLI
+
+```bash
+codex mcp add dispatched-code \
+  --env DISPATCHED_CODE_WAIT_MAX_MS=150000 \
+  -- bun run "$PWD/src/mcp/server.ts"
+```
+
+Then run `codex` **from the repository you want orchestrated** — Codex starts a
+stdio MCP server in its own working directory, so that is the tree workers
+branch from, exactly as it is under Claude Code.
+
+Two things differ from Claude Code, both measured, both in
+[ADR-0012](docs/adr/0012-codex-as-a-host.md):
+
+- **Codex passes an MCP server no ambient environment.** Only a fixed core set
+  (`HOME`, `PATH`, `SHELL`, `TERM`, `USER`, `LOGNAME`, `LANG`, `TMPDIR`, plus
+  the well-known CA-bundle variables) survives, along with exactly what
+  `--env` wrote into `[mcp_servers.dispatched-code.env]` in `~/.codex/config.toml`.
+  A `DISPATCHED_CODE_*` variable exported in your shell **does nothing, and says
+  nothing** — every setting in the table below has to go on the `codex mcp add`
+  line or into that file. `shell_environment_policy.inherit = "all"` does not
+  change this.
+- **Codex's tool-call ceiling is a flat 300 s and does not move on progress.**
+  Claude Code resets its 60 s timeout when a call emits `notifications/progress`,
+  which is why `worker_wait` heartbeats; Codex accepts the frames and holds the
+  deadline anyway. `150000` above is half of 300 s, the same rule that makes the
+  compiled default half of Claude Code's 60. The server prints this advice on
+  stderr at startup if it sees a Codex host still on the compiled default.
+
+Verified against `codex-cli 0.152.1`. `codex mcp list` reporting
+`Auth: Unsupported` is expected and fine — this server needs no auth.
+
 ### Configuration
 
 Environment variables, because an MCP server is launched from a command line the
@@ -284,7 +317,7 @@ is one more thing to find.
 | `DISPATCHED_CODE_REVIEW_POOL` | *(unset)* | Comma-separated models a `review` worker may be routed to, in preference order — the first that is **not** the model which wrote the code under review. This is what makes a critique an independent read rather than the author marking its own homework. Unset means reviews fall back to the preset or the default, which may well be the author's own model; `worker_result` says which kind of review you got either way. |
 | `DISPATCHED_CODE_DASHBOARD_PORT` | `4180` | The local dashboard's port. `0` takes any free port, which is what you want when several instances run at once; the URL is printed to stderr at startup either way. A port outside 0–65535 falls back to the default rather than silently disabling it. |
 | `DISPATCHED_CODE_DASHBOARD` | `1` | Set `0` or `off` to not start the dashboard at all. Nothing binds a socket; the transcript ring is still filled, since it costs nothing. |
-| `DISPATCHED_CODE_WAIT_MAX_MS` | `30000` | `worker_wait`'s cap. The default is half the *plain* ceiling measured on Claude Code 2.1.251 (60s) — the one that applies to a call sending no progress. `worker_wait` does send progress, and on that same host the ceiling with heartbeats is **at least 600s** (the probe's own limit, not the host's), so `300000` is the measured setting there and cuts a six-minute wave from ~8 blocking calls to 2. **Raise it only after measuring your own** — see [Making `worker_wait` wait longer](#making-worker_wait-wait-longer). A cap past what your host will actually wait for does not buy longer waits; it turns every wait into a failed tool call, and a failed wait leaves a worker running with nobody watching it. Clamped to 1s–600s. |
+| `DISPATCHED_CODE_WAIT_MAX_MS` | `30000` | `worker_wait`'s cap. The default is half the *plain* ceiling measured on Claude Code 2.1.251 (60s) — the one that applies to a call sending no progress. `worker_wait` does send progress, and on that same host the ceiling with heartbeats is **at least 600s** (the probe's own limit, not the host's), so `300000` is the measured setting there and cuts a six-minute wave from ~8 blocking calls to 2. **Raise it only after measuring your own** — see [Making `worker_wait` wait longer](#making-worker_wait-wait-longer). On **Codex** the measured ceiling is a flat **300 s** that progress does *not* extend, so `150000` is the setting there ([ADR-0012](docs/adr/0012-codex-as-a-host.md)). A cap past what your host will actually wait for does not buy longer waits; it turns every wait into a failed tool call, and a failed wait leaves a worker running with nobody watching it. Clamped to 1s–600s. |
 | `DISPATCHED_CODE_WORKSPACE` | `shared` | Where workers work. `shared` puts every worker in **your repository**, together, the way Claude's native subagents behave — no branch, nothing committed for you, no merge because the work is already in your tree. `isolated` gives each its own worktree and branch behind the gated merge: stronger evidence, at the cost of workers not seeing each other. Only an exact `isolated` opts out; a typo leaves you on the default. Per-worker override: `worker_spawn({workspace})`. |
 | `DISPATCHED_CODE_PERMISSIONS` | `full` | How much an `implement` worker may do (ADR-0011). `full` grants `edit`, `bash`, `webfetch`, `external_directory`, `doom_loop` and then `*` — everything, including permissions this adapter has never heard of, because the provider's default for an unknown one is `ask` and `ask` in a headless run is a worker waiting on nobody until a watchdog kills it. Nothing stops to ask, so **a worker can write anywhere this process can**; the diff records the reach instead of a permission wall preventing it. `jailed` restores the worktree boundary: `external_directory` becomes a question that reaches you as a `blocked` worker, answered with `worker_message({decision})` — the only mode in which that parameter does anything. Only an exact `jailed` opts out; a typo leaves you on the default. Neither setting touches `research` and `review` workers, which stay read-only in both: DD-10 is a correctness property (a read-only worker whose diff is not empty is a finding) rather than a safety one. |
 
@@ -416,10 +449,10 @@ progress notifications are the whole of what the protocol offers.
 
 | Tool | What it is for |
 |---|---|
-| `worker_spawn` | Delegate a task. Returns an id immediately; the work runs in the background. |
+| `worker_spawn` | Delegate a task. Returns an id immediately; the work runs in the background. Pass `wait: true` and it blocks and returns the result instead — one call, the shape a native subagent has. |
 | `worker_status` | Where workers are. Cheap, safe to poll. |
-| `worker_wait` | Block until one — or any, or all, of several — settles, capped. Cheaper than polling. |
-| `worker_result` | The §4.3 result — the default thing to read. |
+| `worker_wait` | Block until one — or any, or all, of several — settles, capped, **and return their results**. Cheaper than polling, and the reason a wave costs two calls rather than eight. |
+| `worker_result` | The §4.3 result — for a worker you did not wait for, or one past the four a wait returns inline. |
 | `worker_output` | The lifecycle audit trail, paginated. Debugging only. Not the transcript — that is on the dashboard. |
 | `worker_message` | Answer a blocked worker; the session is reused. |
 | `worker_revise` | Send a settled worker back with feedback; same session, capped, with a terminal report at the cap. |
@@ -437,7 +470,9 @@ Every one of them returns in under two seconds (DD-1); `worker_wait` is the
 single bounded exception. `workspace_merge` is no exception either: it runs a
 test suite after **every** merge, which is minutes, so it validates, warns about
 overlapping files and returns a handle to poll — the same spawn-and-poll shape as
-everything else, for the same reason (the host abandons a tool call at 60 s). The delegation heuristics from
+everything else, for the same reason: every host abandons a long tool call, and
+where it draws the line is its own business (60 s on Claude Code without
+progress, a flat 300 s on Codex). The delegation heuristics from
 [`projectplan.md`](projectplan.md) §7 and the DD-8 trust model — the worker's
 summary is a *claim*, the discrepancies are Dispatched Code's own finding —
 live in the tool descriptions, because that is the only documentation a model
@@ -445,7 +480,32 @@ reliably reads.
 
 `dispatched_code_timeout_probe` is also registered and is **not** part of that
 surface: it is the instrument that measured the host's tool-call ceiling
-`worker_wait`'s cap sits under. See [`docs/phase3-notes.md`](docs/phase3-notes.md).
+`worker_wait`'s cap sits under — on both hosts. See
+[`docs/phase3-notes.md`](docs/phase3-notes.md) and
+[ADR-0012](docs/adr/0012-codex-as-a-host.md).
+
+### The round trips
+
+A native subagent is one tool call: you ask, it works, you get its report. This
+surface used to take three for one worker — `worker_spawn`, `worker_wait`,
+`worker_result` — and roughly eight to ten for a wave of four, each one a full
+trip through the host's context. Two changes close most of that gap:
+
+| | before | now |
+|---|---|---|
+| one worker | 3 (`spawn` → `wait` → `result`) | **1** (`spawn({wait: true})`) |
+| wave of four | ~9 (4 spawns + waits + 4 results) | **5** (4 spawns + one `wait({ids})`) |
+
+`worker_wait` returns the results of everything that settled, so the call that
+tells you a worker is done is the call that tells you what it did. At most four
+come back in one reply; past that the extras are named and `worker_result` reads
+them, because a reply carrying eight results is one you cannot stop reading.
+
+`worker_spawn({wait: true})` is for the single-worker case and degrades
+honestly: if the cap expires first you get the id back and nothing is lost, and
+a worker that is **queued** is never waited on at all — that budget would be
+spent on whatever is ahead of it, so the tool says so and returns immediately.
+Do not pass it when spawning a wave; it would serialize them.
 
 There is no `worker_review` tool, deliberately: a reviewer *is* a worker, so it is
 spawned by `worker_spawn({mode: "review", reviewOf: "w-001"})` like any other. A

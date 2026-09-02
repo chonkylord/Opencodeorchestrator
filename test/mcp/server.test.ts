@@ -28,7 +28,14 @@ import {
   loadConfig,
   type ServerConfig,
 } from "../../src/mcp/config.js";
-import { createDispatchedCode, type DispatchedCode } from "../../src/mcp/server.js";
+import {
+  CODEX_CLIENT_NAME,
+  CODEX_WAIT_MAX_MS,
+  createDispatchedCode,
+  type DispatchedCode,
+  hostAdvice,
+} from "../../src/mcp/server.js";
+import { WAIT_TIMEOUT_MAX_MS } from "../../src/mcp/tools.js";
 import { makeGoldenRepo } from "../fixtures/golden.js";
 
 const cleanup: Array<() => Promise<void> | void> = [];
@@ -318,5 +325,106 @@ describe("start-up and recovery (§9)", () => {
     expect(o.manager.get(id)!.state).toBe("cancelled");
     // Idempotent: a SIGINT arriving twice must not double-close the database.
     await o.dispose();
+  }, 20_000);
+});
+
+/**
+ * The second host (ADR-0012).
+ *
+ * Codex's tool-call ceiling is a flat 300 s and it does *not* reset on progress,
+ * where Claude Code's is 60 s and does. One compiled default cannot be right for
+ * both, and the host does not name itself until `initialize` — by which time the
+ * tools are registered. So the difference is a startup line, and these pin what
+ * it says and, more importantly, when it stays quiet.
+ */
+describe("host-specific advice", () => {
+  test("Codex on the compiled default gets the measured number and where to put it", () => {
+    const advice = hostAdvice({ name: CODEX_CLIENT_NAME }, WAIT_TIMEOUT_MAX_MS);
+
+    expect(advice).toBeDefined();
+    expect(advice).toContain("300s");
+    expect(advice).toContain(`DISPATCHED_CODE_WAIT_MAX_MS=${CODEX_WAIT_MAX_MS}`);
+    // The half that costs an afternoon if it is missing: Codex passes an MCP
+    // server no ambient environment, so the shell is the wrong place for it.
+    expect(advice).toContain("config.toml");
+    // And the difference from the other host, said out loud, because assuming
+    // progress behaves the same everywhere is how a cap loses results.
+    expect(advice).toMatch(/does NOT reset/);
+  });
+
+  test("a cap somebody set themselves is left alone", () => {
+    // They have either measured their own host or decided. Either way a line
+    // telling them to change a number they chose is noise.
+    expect(hostAdvice({ name: CODEX_CLIENT_NAME }, CODEX_WAIT_MAX_MS)).toBeUndefined();
+    expect(hostAdvice({ name: CODEX_CLIENT_NAME }, 45_000)).toBeUndefined();
+  });
+
+  test("every other host is silent, including one that did not introduce itself", () => {
+    expect(hostAdvice({ name: "claude-ai" }, WAIT_TIMEOUT_MAX_MS)).toBeUndefined();
+    expect(hostAdvice(undefined, WAIT_TIMEOUT_MAX_MS)).toBeUndefined();
+    expect(hostAdvice({}, WAIT_TIMEOUT_MAX_MS)).toBeUndefined();
+  });
+});
+
+/**
+ * The startup order, which ADR-0012 changed.
+ *
+ * Codex builds its model's tool list without waiting for a slow MCP server, and
+ * this one used to take ~2 s because it awaited an `opencode serve` spawn before
+ * serving anything. That is not a slow start, it is a server the model is never
+ * told about. The warm-up still begins at launch; what changed is that nothing
+ * waits for it to finish before the protocol works.
+ */
+describe("the backend does not gate the protocol", () => {
+  test("tools answer while the backend is still coming up, and a dead one fails at the spawn", async () => {
+    const repo = makeGoldenRepo("startup");
+    cleanup.push(repo.cleanup);
+    // Port 1 is not a server. In attached mode `start()` proves the backend is
+    // really there, so this is a backend that will never come up — the harshest
+    // version of "slow", and the one that shows where the failure now lands.
+    const o = await createDispatchedCode(
+      {
+        repoRoot: repo.path,
+        dbPath: ":memory:",
+        defaultModel: "ocmock/test-model",
+        baseUrl: "http://127.0.0.1:1",
+        verifyTests: false,
+        maxConcurrent: 3,
+        maxRevisions: 3,
+        maxRetries: 0,
+        runBudgetTokens: 0,
+        models: {},
+        reviewPool: [],
+        workspace: "isolated",
+        waitMaxMs: 30_000,
+        dashboardPort: -1,
+        permissionMode: "full",
+      },
+      { tickMs: 10, abortGraceMs: 200 },
+    );
+    cleanup.push(() => o.dispose());
+    const client = await connect(o);
+
+    // The whole point: the surface is up regardless.
+    expect((await client.listTools()).tools.length).toBeGreaterThan(0);
+    expect(await textOf(client, "worker_list")).toBeDefined();
+
+    // And the failure is not hidden — it surfaces where it is actionable,
+    // rather than as a server the host silently never sees.
+    await o.backendReady;
+    const spawned = await textOf(client, "worker_spawn", { task: "go" });
+    const id = /\b(w-\d+)\b/.exec(spawned)?.[1];
+    if (id !== undefined) {
+      const deadline = Date.now() + 5_000;
+      let state = "";
+      while (Date.now() < deadline) {
+        state = o.manager.get(id)?.state ?? "";
+        if (state === "failed" || state === "cancelled") break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(["failed", "cancelled"]).toContain(state);
+    } else {
+      expect(spawned).toMatch(/could not spawn|backend/i);
+    }
   }, 20_000);
 });

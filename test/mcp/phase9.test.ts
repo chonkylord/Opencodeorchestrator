@@ -257,8 +257,14 @@ describe("worker_result tells a blocked worker's story truthfully", () => {
     dispatched.manager.halt();
 
     const res = await call(client, "worker_wait", { ids: [id], timeoutMs: 2_000 });
-    expect(res.text).toContain("worker_recover");
-    expect(res.text).not.toContain("worker_message");
+    // The assertion is about the status line, which is what this test is named
+    // for: `worker_wait` now returns the blocked worker's questions underneath
+    // it, and that block names `worker_message` — to say it would fail. Asserting
+    // on the whole reply would fail on the warning as readily as on the bug.
+    const line = res.text.split("\n")[0]!;
+    expect(line).toContain("worker_recover");
+    expect(line).not.toContain("worker_message");
+    expect(res.text).toContain("worker_message would fail");
   });
 });
 

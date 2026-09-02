@@ -7,10 +7,22 @@
  * One process owns one backend, one index and one manager, and the startup order
  * below is not arbitrary:
  *
- * 1. **Start the backend before serving any tool.** The first prompt against a
+ * 1. **Warm the backend, but do not wait for it.** The first prompt against a
  *    cold server pays for a burst of ~45 unscoped start-up events before
- *    generation begins. Warming it here spends that once, at launch, instead of
- *    charging it to whichever worker happens to be first.
+ *    generation begins, so warming starts at launch and is charged once rather
+ *    than to whichever worker happens to be first. It is deliberately *not*
+ *    awaited here, and that is a correction: awaiting it put ~2 seconds between
+ *    the process starting and its first answer, and a host that builds its
+ *    model's tool list without waiting for a slow MCP server drops one that
+ *    takes that long. Codex 0.152.1 does exactly that — measured in
+ *    `docs/adr/0012-codex-as-a-host.md`, where a server answering `initialize`
+ *    in 1.5s is simply absent from the turn, with no error anywhere. The
+ *    symptom is the worst kind: the model never calls a tool it was never told
+ *    about. Every entry point on the adapter already awaits `start()` and the
+ *    promise is memoized, so the warm-up keeps its head start — it now runs
+ *    alongside recovery and the handshake instead of in front of them — and a
+ *    backend that cannot start still fails, at the first spawn, with its own
+ *    error rather than a silent absence.
  * 2. **Recover before the transport is connected.** `recover()` turns rows left
  *    mid-flight by a dead process into `interrupted`, and `rebuildIndex()` puts
  *    rows back from the worktree manifests when the database itself is gone
@@ -36,7 +48,7 @@ import { Store } from "../store/index.js";
 import { ActivityLog, type Dashboard, startDashboard } from "../observe/index.js";
 import { ensureExcluded, stateDir } from "../workspace/index.js";
 import { type ServerConfig, deprecatedEnv, loadConfig } from "./config.js";
-import { registerWorkerTools } from "./tools.js";
+import { WAIT_TIMEOUT_MAX_MS, registerWorkerTools } from "./tools.js";
 
 export const SERVER_NAME = "dispatched-code";
 export const SERVER_VERSION = "0.7.0";
@@ -54,6 +66,13 @@ export interface DispatchedCode {
   readonly activity: ActivityLog;
   /** Absent when the dashboard is switched off, or when its port was unavailable. */
   readonly dashboard?: Dashboard;
+  /**
+   * Resolves when the warm-up in note 1 finishes, or when it has failed and
+   * said so. Nothing needs to await it — every adapter entry point awaits the
+   * same memoized `start()` — but a test that wants a warm backend before it
+   * measures something has no other way to ask.
+   */
+  readonly backendReady: Promise<void>;
   readonly dispose: () => Promise<void>;
 }
 
@@ -82,8 +101,16 @@ export async function createDispatchedCode(config: ServerConfig, tuning: Manager
     ...(config.baseUrl === undefined ? {} : { baseUrl: config.baseUrl }),
     onServerLog: (line) => log(`opencode: ${line}`),
   });
-  await backend.start();
-  log(`backend ready (repo ${config.repoRoot})`);
+  // Not awaited — see note 1 in this file's header. The rejection is handled
+  // here only so an unhandled one cannot take the process down: `start()`
+  // memoizes its promise, so the adapter's own entry points still await the
+  // same failure and a spawn against a backend that never came up reports it.
+  const backendReady = backend
+    .start()
+    .then(() => log(`backend ready (repo ${config.repoRoot})`))
+    .catch((e: unknown) => {
+      log(`backend did not start: ${e instanceof Error ? e.message : String(e)} — spawns will fail until it does`);
+    });
 
   // Declared before the store, because the store's hooks close over it and the
   // dashboard closes over the store. The `dashboard` binding is filled in below;
@@ -192,7 +219,7 @@ export async function createDispatchedCode(config: ServerConfig, tuning: Manager
     store.close();
   };
 
-  return { server, manager, merges, store, config, activity, ...(dashboard ? { dashboard } : {}), dispose };
+  return { server, manager, merges, store, config, activity, backendReady, ...(dashboard ? { dashboard } : {}), dispose };
 }
 
 /**
@@ -273,6 +300,50 @@ export function registerProbe(server: McpServer): void {
   );
 }
 
+/**
+ * The `clientInfo.name` Codex identifies itself with. Measured, not documented:
+ * `codex mcp` writes no marker into the server's environment, so the handshake
+ * is the only place the host names itself.
+ */
+export const CODEX_CLIENT_NAME = "codex-mcp-client";
+
+/**
+ * What `DISPATCHED_CODE_WAIT_MAX_MS` should be on Codex — half of a measured
+ * 300 s, the same way the compiled default is half of Claude Code's 60 s.
+ */
+export const CODEX_WAIT_MAX_MS = 150_000;
+
+/**
+ * Tell a Codex user the number their host is worth, once, at startup.
+ *
+ * A diagnostic rather than a silent default, and the reason is a hard ordering
+ * constraint rather than caution: `worker_wait`'s cap is baked into its own
+ * description and into the `max` on its `timeoutMs` schema, both of which are
+ * fixed when the tools are registered — and registration has to happen before
+ * `connect()`, while `initialize` is the first moment the host says who it is.
+ * Registering after the handshake would fix the ordering and lose something
+ * worse: Codex builds its model's tool list without waiting for a slow server
+ * (see note 1 in this file's header), so a server that defers registration to
+ * win a better default can lose the whole turn. So the host is detected, and
+ * what it buys is one accurate line on stderr instead of a wrong default.
+ *
+ * Silent unless the cap is still the compiled one: somebody who has set it has
+ * either measured their own host or decided, and a startup line telling them to
+ * change a number they chose is noise.
+ */
+export function hostAdvice(client: { name?: string } | undefined, waitMaxMs: number): string | undefined {
+  if (client?.name !== CODEX_CLIENT_NAME) return undefined;
+  if (waitMaxMs !== WAIT_TIMEOUT_MAX_MS) return undefined;
+  return (
+    `host is Codex, whose MCP tool-call ceiling is a flat 300s — and unlike Claude Code it does NOT reset that ` +
+    `on notifications/progress, so the heartbeat buys nothing here. worker_wait's cap is still the compiled ` +
+    `${WAIT_TIMEOUT_MAX_MS}ms, which is half of a different host's ceiling. Set ` +
+    `DISPATCHED_CODE_WAIT_MAX_MS=${CODEX_WAIT_MAX_MS} to halve the wait calls a wave costs. It must go in ` +
+    `[mcp_servers.<name>.env] in ~/.codex/config.toml: Codex passes an MCP server no ambient environment, so ` +
+    `the same variable exported in your shell is silently ignored.`
+  );
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   // Before anything else writes to stderr, so a stale variable name is the first
@@ -299,6 +370,12 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
+  // Before connect: `initialize` can land the instant the transport is up, and
+  // a handler attached after it would never fire.
+  dispatched.server.server.oninitialized = () => {
+    const advice = hostAdvice(dispatched.server.server.getClientVersion(), config.waitMaxMs);
+    if (advice !== undefined) log(advice);
+  };
   await dispatched.server.connect(new StdioServerTransport());
   log(
     `ready on stdio · db ${config.dbPath} · model ${config.defaultModel} · ` +

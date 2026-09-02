@@ -12,6 +12,11 @@ about OpenCode: Claude Code's MCP tool-call timeout, measured at last, which
 closes unresolved item 1 and is what DD-1's "every tool returns in under two
 seconds" is calibrated against. Nothing in §1–§6 needed correcting this phase.
 
+**Phase 11 additions.** §7 gains a second host. Every row about Codex was
+measured against `codex-cli 0.152.1`; the method, and the one thing it does not
+prove, are in [ADR-0012](adr/0012-codex-as-a-host.md). Nothing in §1–§6 needed
+correcting this phase — Codex is a client, and the OpenCode facts are unmoved.
+
 **Phase 2 additions.** Rows marked **verified (phase 2)** were established while building the
 worker manager (`src/manager/`), on the wire against 1.18.25. **One earlier row was wrong**
 and is corrected in place: structured output was marked "verified (schema)" and does not
@@ -106,17 +111,28 @@ None of these are drop-in replacements for §6's gated merge, but building git p
 
 ## 7. The host (not OpenCode)
 
-Two facts here, and they are what DD-1 is calibrated against. They are about
-*Claude Code*, not about OpenCode, which is why they sit in their own section: an
-OpenCode version bump does not invalidate them, and a host upgrade does.
+Facts about the *hosts*, not about OpenCode, which is why they sit in their own
+section: an OpenCode version bump does not invalidate them, and a host upgrade
+does. Two hosts now, and they do not agree.
 
-They are the same host, the same version, three days apart, and they disagree by
-a factor of ten — because the second call emits progress and the first does not.
+The first two rows are the same host, the same version, three days apart, and
+they disagree by a factor of ten — because the second call emits progress and the
+first does not. The Codex rows below then show that this is a property of Claude
+Code and **not** of hosts in general: Codex takes the same progress frames and
+does not move at all. A cap set on the assumption that every host behaves like
+the first one loses results on the second.
 
 | Fact | Status | Detail |
 |---|---|---|
 | **Claude Code's MCP tool-call timeout is 60 s** | **verified (phase 3)** · *resolves unresolved #1* | Measured on **Claude Code 2.1.251**, on **2026-08-28**, with Dispatched Code registered as a real MCP server (`--mcp-config`, `--strict-mcp-config`) in a headless `claude -p` session, using the timeout probe — the instrument Phase 0 built for exactly this and could not run, named `orchestrator_timeout_probe` at the time and `dispatched_code_timeout_probe` since. `delayMs` of 30,000, 45,000 and 55,000 all returned normally (the last as `{"requestedMs":55000,"actualMs":55002,"returned":true}`); 60,000 failed, and the host named its own limit in the error, quoted as it came: `MCP server "orchestrator" tool "orchestrator_timeout_probe" timed out after 60s`. So it is a hard 60 s deadline on the call, not a shorter budget that happens to round to one. The failure is per tool call — the session continues and the server stays connected — but the call's result is lost, which for a long `worker_wait` means a worker still running with nobody watching. **`worker_wait`'s cap therefore stays at §7's 30,000 ms, now as a measured half of the ceiling rather than a guess.** The remaining 30 s absorbs the tool's own work, the transport, and any host that lowers the limit. |
 | **With `notifications/progress`, the same host waits at least 600 s** | **verified (phase 10)** · *closes §11 Phase 9's one unmeasured item* | Measured **2026-08-31**, on the **same Claude Code 2.1.251** as the row above, with Dispatched Code registered as a real MCP server in a live session. The control first: `{delayMs: 55000}` with no progress returned `{"actualMs":55001,"progressSent":0}`, reproducing the 60 s row exactly. Then `{delayMs: 240000, progressEveryMs: 10000}` — **four times the plain ceiling** — returned normally, `{"actualMs":240003,"progressSent":23}`. Then `{delayMs: 600000, progressEveryMs: 10000}`, the largest delay the probe accepts, also returned normally: `{"actualMs":600002,"progressSent":59}`. **So this host does reset its tool-call timeout on progress, and the MCP spec's "may" is a "does" here.** What is *not* known is the ceiling: 600 s is the instrument's limit, not the host's, so this is a measured **floor** and the honest way to write it is `≥600 s`. Since `worker_wait` heartbeats every 10 s unconditionally (§11 Phase 9), this is the ceiling that actually applies to it. **The compiled default stays at 30,000 ms anyway**, and that is deliberate: a host that does *not* reset on progress is still possible, the default has to be safe on one, and the failure mode is asymmetric — too small costs an extra tool call, too large loses the call's result and leaves a worker running with nobody watching it. On this host, set `DISPATCHED_CODE_WAIT_MAX_MS=300000` — half of the verified floor — and a six-minute wave costs two `worker_wait` calls instead of eight. |
+
+| **Codex's MCP tool-call timeout is 300 s, and progress does NOT extend it** | **verified (phase 11)** | Measured **2026-09-02** on **codex-cli 0.152.1**, Dispatched Code registered as a real stdio MCP server, using `dispatched_code_timeout_probe`. `{delayMs: 600000}` failed at **300,058 ms**, and Codex named its own limit the way Claude Code does: `timed out awaiting tools/call after 300s`. The measurement that matters is the second one: `{delayMs: 600000, progressEveryMs: 10000}` **also failed, at 300,053 ms**. The frames are delivered and tolerated — `{delayMs: 60000, progressEveryMs: 5000}` returned `{"actualMs":60005,"progressSent":11}` — they simply buy no time. **So the MCP spec's "a host may reset its timeout on progress" is a "does" on Claude Code and a "does not" here**, and `startHeartbeat`'s ten-second tick is worth nothing on Codex beyond keeping the pipe warm. There is also no knob: the MCP-server config struct in the shipped binary has `startup_timeout_sec`/`startup_timeout_ms` and **no per-call timeout**. On this host set `DISPATCHED_CODE_WAIT_MAX_MS=150000` — half of 300 s, by the same rule that makes the compiled default half of 60 s. |
+| **Codex does not wait for a slow MCP server before building the model's tool list** | **verified (phase 11)** | Measured **2026-09-02** on **codex-cli 0.152.1** with stub servers that delay their `initialize` reply by a fixed amount: **250 / 500 / 1000 ms appear** in the model's tool list; **1500 ms does not** (three consecutive runs, one server), nor do 2000 / 4000 / 8000. `startup_timeout_sec = 60` does not change it — that key governs giving up on the server *entirely*, and is a different number. A server that misses the window is absent for the **whole thread**, not just the first turn. The boundary is not a constant: with eight servers registered even 1100 ms missed, so it is a race against Codex's own turn setup, on the order of a second, rather than a deadline anybody can configure. **Dispatched Code was losing it** — it awaited the `opencode serve` spawn (~1.3 s, §1) before serving the protocol and answered `initialize` at ~2.0 s, which under Codex meant the model was never told this server existed. There is no error anywhere; the symptom is a tool that is never called. Fixed by warming the backend without awaiting it (ADR-0012): **0.185 s**, present in the list, and a real tool call through Codex returns. |
+| **Codex passes an MCP server no ambient environment** | **verified (phase 11)** | Measured **2026-09-02** on **codex-cli 0.152.1** by exporting variables into the shell that launched `codex` and reading `process.env` inside the server. What arrives: `HOME`, `LANG`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `TMPDIR`, `USER`, the well-known CA-bundle variables (`CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `GIT_SSL_CAINFO`, `PIP_CERT`, `CARGO_HTTP_CAINFO`), and **exactly** what `[mcp_servers.<name>.env]` declares. `DISPATCHED_CODE_*`, `ORCHESTRATOR_*`, `HTTPS_PROXY` and a control variable all failed to arrive, and **`shell_environment_policy.inherit = "all"` does not change it** — the filter is not the shell policy and nothing widens it. Since this project is configured entirely through environment variables, the consequence is that **under Codex a setting exported in your shell does nothing, silently**; it has to be written into `~/.codex/config.toml`. `PATH` surviving is what makes the zero-config launch work at all (`bun` and `opencode` are found through it), and `HOME` surviving is what lets OpenCode find the credentials `opencode auth login` wrote. |
+| **Codex launches a stdio MCP server in the directory `codex` was invoked from** | **verified (phase 11)** | Measured **2026-09-02** on **codex-cli 0.152.1**, twice: a recording stub reported that `cwd`, and the real server logged `backend ready (repo <that directory>)` when started from this repository. Not the config directory, not `$HOME`. So `loadConfig`'s `resolve(read(env, "REPO") ?? cwd)` orchestrates the tree the user is actually in with no configuration at all — which is the same promise the `claude mcp add` launch makes. `config.toml`'s `cwd` key overrides it. |
+| **Codex advertises no `roots` capability, and answers `roots/list` with an empty list anyway** | **verified (phase 11)** | Measured **2026-09-02** on **codex-cli 0.152.1**. `initialize` carries `protocolVersion: "2025-06-18"`, `clientInfo: {name: "codex-mcp-client", title: "Codex", version: "0.152.1"}` and `capabilities: {elicitation: {form, url}}` — no `roots`. A server that sends `roots/list` regardless gets `{"roots": []}`: a **successful, empty** answer, not a method-not-found error. Any code that asks the host where it is has to read that as "this host does not do roots" rather than "this host has no directory open", or it warns on every Codex session. `clientInfo.name` is also the only place Codex names itself — nothing identifies it in the environment — which is what `hostAdvice()` keys on. |
+| **Codex groups each MCP server into one `namespace` tool, and accepts every schema here** | **verified (phase 11)** | Measured **2026-09-02** on **codex-cli 0.152.1**. The model is offered `mcp__<server>` as a single tool of type `namespace`, with the server name normalized (`dispatched-code` → `mcp__dispatched_code`) and the individual tools nested inside it; a call is a `function_call` carrying a `namespace` field beside the plain tool name, and every flattened spelling is rejected with `unsupported call`. All **17** tools were served and accepted in one `tools/list` of **36,535 bytes** — descriptions up to 3,256 characters, `budget`'s nested optional object, arrays, enums — with no rejection and no truncation. `annotations` cross intact, and Codex sends `_meta.progressToken` on both `tools/list` and tool calls. **Not settled:** the feature flag `non_prefixed_mcp_tool_names` exists and is marked "under development", so this shape may change. |
 
 ---
 
@@ -171,3 +187,27 @@ a factor of ten — because the second call emits progress and the first does no
 
    **Still open after Phase 6, and now measured rather than reasoned about.** Phase 6 did not touch the adapter, so the workaround stands. What the v1 demo added is the price: on one live run (2026-08-29, OpenCode 1.18.25, free Muse Spark, four workers), **`external_directory` fired three times on two different paths** — twice for `<repo>/.orchestrator/*` and once for `/tmp/*` — and each one cost a partial turn plus a `worker_message` round trip. One worker (`w-003`) escalated twice and needed two answers and two revisions before it settled; it ended on 47,531 tokens against 7,715 and 12,481 for the two workers that never escalated. So the cost of the missing in-band reply is roughly **a partial turn per ask, and asks are not rare** — the §5 row's "not deterministic" holds, but "uncommon" would not. This is the strongest argument yet for `respond()`, and it is Phase 7's to make.
 6. **`RunBackend` parity.** `opencode run` exposes `--session`, `--format json`, `--agent`, `--model`, `--variant`, `--attach`, `--auto`. The flags exist; the fallback path was not built or exercised.
+7. **Codex 0.147.0 is unmeasured, and one Codex row is a moving target.** Every
+   Codex row in §7 was taken against **0.152.1**. The version actually installed
+   on the machine this work was commissioned from is **0.147.0**, and nothing
+   here has been run against it. The row most likely to differ is the
+   `namespace` tool shape: it sits behind feature flags Codex itself marks
+   "under development" (`non_prefixed_mcp_tool_names`, `mcp_2026_07_28`), so it
+   is the shape of the tool surface, not a ceiling, that should be re-checked on
+   a Codex bump. The 300 s ceiling and the environment filter are the rows worth
+   trusting across versions; re-run the probe anyway.
+8. **No Codex row was taken against a live model.** The account available was
+   rate-limited until **2026-09-25**, so the tool calls in §7 were driven by
+   pointing Codex at a local OpenAI-compatible server over
+   `wire_api = "responses"` — Codex's own MCP client, its own timeout, its own
+   router, with a scripted model in place of a real one. The ceiling is the
+   host's and a fake provider cannot influence it. What is *not* proven is how a
+   real model spells a namespaced tool call, and whether an authenticated
+   session differs in any way. See [ADR-0012](adr/0012-codex-as-a-host.md)
+   "Method".
+9. **How much startup margin is enough.** §7's startup race is ~1 s on the
+   machine it was measured on and moves with the number of registered MCP
+   servers and, presumably, with process-spawn cost. Dispatched Code now answers
+   `initialize` in 0.185 s, an order of magnitude inside it, which is
+   comfortable and is not a guarantee. Nobody has measured a host with a tighter
+   race, and there is no signal a server could read to find out it lost one.

@@ -70,7 +70,9 @@ import {
   modelCapabilityNote,
   sharedPathWarning,
   renderWaitMany,
+  renderWaitOutcomes,
   statusLine,
+  WAIT_INLINE_MAX,
 } from "./render.js";
 
 /**
@@ -269,7 +271,12 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
       description:
         "Start an autonomous coding worker in its own git worktree, branched from the current HEAD. " +
         "Returns in under a second with an id — the work runs in the background. Poll worker_status, " +
-        "or block briefly with worker_wait, then read worker_result.\n\n" +
+        "or block briefly with worker_wait, which now returns the result too.\n\n" +
+        "ONE WORKER, ONE CALL: pass `wait: true` and this blocks until the worker settles and returns " +
+        "its result, the way a subagent does — no id to poll, no second call. Use it when you are " +
+        "delegating one thing and have nothing to do until it lands. Do NOT pass it when spawning a " +
+        "wave: it would run them one after another. Spawn the wave without it and cover all of them " +
+        "with a single worker_wait({ids}).\n\n" +
         "DELEGATE: multi-file implementation; writing a test suite; mechanical refactors across many " +
         "files; independent chunks you want run in parallel; anything where the edit-run-debug cycle " +
         "dominates and you would otherwise spend dozens of turns on it.\n" +
@@ -409,10 +416,27 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
               "CANCELLED with a reason naming it, rather than waiting forever for something that will " +
               "never finish.",
           ),
+        wait: z
+          .boolean()
+          .optional()
+          .describe(
+            "Block until this worker settles and return its RESULT, instead of returning an id to poll. " +
+              "One call instead of three — use it for a single worker you have nothing else to do without. " +
+              "Do NOT use it when spawning a wave: it serializes them. Spawn the wave without it, then one " +
+              "worker_wait({ids}) covers all of them. If the worker is queued behind others, or has not " +
+              "settled by the cap, you get the id back and nothing is lost.",
+          ),
+        waitMs: z
+          .number()
+          .int()
+          .min(100)
+          .max(waitMax)
+          .optional()
+          .describe(`How long \`wait\` blocks. Implies wait. Default ${WAIT_TIMEOUT_DEFAULT_MS}ms, hard cap ${waitMax}ms.`),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async (args): Promise<ToolResult> => {
+    async (args, extra): Promise<ToolResult> => {
       const spec: WorkerSpec = {
         task: args.task,
         ...(args.scope === undefined ? {} : { scope: args.scope }),
@@ -441,6 +465,60 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         // reaches a merge and two of them claiming one file do not produce a
         // conflict for a gate to catch — they overwrite each other, live.
         const warning = sharedPathWarning(manager, r.workerID, spec, shared) + modelCapabilityNote(manager, r.model);
+        // `waitMs` implies `wait`: naming a duration is asking to wait for it,
+        // and a caller who set one and got an id back would reasonably read
+        // that as the tool ignoring them.
+        const wantWait = args.wait === true || args.waitMs !== undefined;
+        // A queued worker is the one case where waiting is a trap. The budget
+        // would be spent on whatever is *ahead* of it — work this call did not
+        // start and cannot report on — and it would expire having watched a
+        // worker that never ran. So the queue wins and says so: the id comes
+        // back immediately, which is what the caller would have got anyway.
+        if (wantWait && hint) {
+          return ok(
+            `${head}\n${warning}` +
+              (hint.waitingFor.length > 0
+                ? `QUEUED behind ${hint.waitingFor.join(", ")}, so \`wait\` was not used — it would have spent its ` +
+                  "budget on those, not on this worker.\n" +
+                  `Next: worker_wait({ids: ${JSON.stringify([...hint.waitingFor, r.workerID])}, mode: "all"}), which ` +
+                  "returns their results too."
+                : `QUEUED ${hint.position} deep (${hint.running}/${hint.maxConcurrent} slots busy), so \`wait\` was not ` +
+                  "used — it would have spent its budget on the workers ahead of it. Nothing has been allocated and " +
+                  "its time limits have not started.\n" +
+                  `Next: worker_wait on the workers that are running, or worker_wait({id: "${r.workerID}"}) once a slot frees.`),
+          );
+        }
+        if (wantWait) {
+          const budget = Math.min(args.waitMs ?? WAIT_TIMEOUT_DEFAULT_MS, waitMax);
+          const started = now();
+          const stopHeartbeat = startHeartbeat(extra, budget, () => 1);
+          try {
+            const settled = await manager.wait(r.workerID, budget);
+            const waited = Math.round((now() - started) / 1000);
+            const line = statusLine(settled, now(), manager.queueHint(r.workerID), manager.isOrphaned(r.workerID));
+            if (!isSettled(settled.state)) {
+              // Honest degradation, and the reason `wait` is safe to reach for:
+              // the worker is untouched and the id is the same one a plain
+              // spawn would have returned, so a wait that ran out costs the
+              // caller the wait and nothing else.
+              return ok(
+                `${head}\n${warning}${line}\n(still working after ${waited}s — the wait ran out, not the worker. ` +
+                  `Nothing is lost: worker_wait({id: "${r.workerID}"}) picks it back up.)`,
+              );
+            }
+            const outcome = renderWaitOutcomes([settled], [settled.workerID], now(), (w) => manager.isOrphaned(w));
+            return ok(`${head}\n${warning}${line}\n(settled after ${waited}s)\n\n${outcome}`);
+          } catch (e) {
+            // The worker outlives a failed wait, so this reports the wait and
+            // hands the id back rather than implying the spawn failed.
+            return ok(
+              `${head}\n${warning}Could not wait on ${r.workerID}: ${message(e)}\n` +
+                `It was spawned and is running: worker_wait({id: "${r.workerID}"}).`,
+            );
+          } finally {
+            stopHeartbeat();
+          }
+        }
         if (!hint) {
           return ok(
             `${head}\n${warning}` +
@@ -541,6 +619,12 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
         "moment they do — completed, failed, timed_out, over_budget, cancelled, or BLOCKED (a worker " +
         "waiting on an answer has stopped, as far as you are concerned) — or when the timeout expires, " +
         "whichever comes first.\n\n" +
+        "IT RETURNS THE RESULTS, not just the states: every worker that settled comes back with the same " +
+        "block worker_result would have given you — what it says it did, what git says it did, whether " +
+        `the tests pass, and every place those disagree. Do NOT call worker_result for a worker this ` +
+        `already showed you. At most ${WAIT_INLINE_MAX} results come back in one reply; if more than that ` +
+        "settled at once the extras are named and worker_result reads them. A BLOCKED worker comes back " +
+        "with its questions instead, which is what you need to answer it.\n\n" +
         "ONE OR MANY: pass `id` for one worker, or `ids` for a wave. With `ids`, `mode: \"any\"` (the " +
         "default) returns as soon as ONE of them settles — use it while a wave runs, because a worker " +
         "that blocked on a question is the event worth waking for and waiting for the slowest would " +
@@ -596,18 +680,32 @@ export function registerWorkerTools(server: McpServer, deps: ToolDeps): void {
           const r = await manager.wait(targets[0]!, budget);
           const waited = now() - started;
           const line = statusLine(r, now(), manager.queueHint(r.workerID), manager.isOrphaned(r.workerID));
-          return ok(
-            isSettled(r.state)
-              ? `${line}\n(settled after ${Math.round(waited / 1000)}s of waiting)`
-              : `${line}\n(still working after ${Math.round(waited / 1000)}s — not an error. Call worker_wait again, ` +
+          if (!isSettled(r.state)) {
+            return ok(
+              `${line}\n(still working after ${Math.round(waited / 1000)}s — not an error. Call worker_wait again, ` +
                 "or go do something else and come back to worker_status.)",
-          );
+            );
+          }
+          // The result inline, not a pointer to it. A wait that resolved and
+          // then made Claude spend another round trip to learn *what* happened
+          // was the single largest avoidable cost in this surface: three calls
+          // for one worker where a native subagent takes one.
+          const outcome = renderWaitOutcomes([r], [r.workerID], now(), (w) => manager.isOrphaned(w));
+          return ok(`${line}\n(settled after ${Math.round(waited / 1000)}s of waiting)\n\n${outcome}`);
         }
         const chosen = mode ?? "any";
         const { records, settled } = await manager.waitMany(targets, { mode: chosen, timeoutMs: budget });
-        return ok(
-          renderWaitMany(records, settled, chosen, now() - started, now(), (w) => manager.queueHint(w), (w) => manager.isOrphaned(w)),
+        const summary = renderWaitMany(
+          records,
+          settled,
+          chosen,
+          now() - started,
+          now(),
+          (w) => manager.queueHint(w),
+          (w) => manager.isOrphaned(w),
         );
+        const outcomes = renderWaitOutcomes(records, settled, now(), (w) => manager.isOrphaned(w));
+        return ok(outcomes === "" ? summary : `${summary}\n\n${outcomes}`);
       } catch (e) {
         return fail(`Could not wait on ${targets.join(", ")}: ${message(e)}`);
       } finally {

@@ -1162,8 +1162,19 @@ export class WorkerManager {
       inertSettled += 1;
     }
 
+    // The *record*, not the machine, and the difference is a bug this wait had
+    // from the start. A worker settles in three steps — the machine transitions,
+    // the record is updated from it, the waiters are notified — so a waiter
+    // woken by one worker sees every *other* worker's machine mid-flight, one
+    // step ahead of the record. `satisfied()` read the machine and the returned
+    // records read `record.current`, so `mode: "all"` could resolve on a machine
+    // that had transitioned and then report that same worker as still running.
+    // Reading what this call is actually going to return keeps the two in step:
+    // each worker's own notify fires after its own update, so the last one to
+    // settle is the one that ends the wait, with every record already current.
+    const settledNow = (w: ManagedWorker): boolean => isSettled(w.record.current.state);
     const satisfied = (): boolean => {
-      const settled = live.filter((w) => isSettled(w.machine.state)).length + inertSettled;
+      const settled = live.filter(settledNow).length + inertSettled;
       return mode === "any" ? settled > 0 : settled === live.length + inertSettled;
     };
 

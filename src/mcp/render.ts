@@ -22,7 +22,7 @@
 
 import type { StoredEvent } from "../store/index.js";
 import type { MergeRecord, QueueHint, RecoverOutcome, SharedCollision, RevisionCapReport, RevisionRound, StartedMerge, WorkerRecord } from "../manager/index.js";
-import { isSettled as isSettledState } from "../manager/index.js";
+import { type RenderOptions, isSettled as isSettledState, renderResult } from "../manager/index.js";
 import type { CleanupReport, DiffPage, MergeStep, OverlapReport } from "../workspace/index.js";
 
 // ---------------------------------------------------------------------------
@@ -316,8 +316,79 @@ export function renderWaitMany(
     ...records.map((r) => statusLine(r, now, hintOf(r.workerID), orphanedOf(r.workerID))),
     pending.length > 0
       ? "Call worker_wait again to keep waiting, or go and do something else and come back to worker_status."
-      : "Next: worker_result on each, then workspace_merge for the ones you want to land.",
+      : "Next: workspace_merge for the ones you want to land.",
   ].join("\n");
+}
+
+/**
+ * How many settled workers `worker_wait` hands back in full.
+ *
+ * The tokens are not the thing this bounds. Four results inline cost what four
+ * `worker_result` calls cost — the round trips are what returning them inline
+ * removes, not the content. What it bounds is a reply Claude cannot stop
+ * reading partway: four `worker_result` calls are four decisions to spend the
+ * context, and one reply carrying eight results is none. So the reply carries
+ * at most this many and *names* the rest, because an id and a tool to call is a
+ * cheap thing to be told and a result that was silently dropped teaches Claude
+ * to trust a wave summary that is not complete.
+ */
+export const WAIT_INLINE_MAX = 4;
+
+/**
+ * Tightened rendering for a reply that carries more than one result.
+ *
+ * `renderResult`'s own defaults (12 files, 6 items) are sized for a reply
+ * holding exactly one, which is what `worker_result` always is. A wave settling
+ * together would otherwise multiply §4.3's per-worker budget by four in a
+ * single reply, so a multi-result reply trades list depth for the round trips
+ * it saves: the summary, the diff stat and — above all — the discrepancies
+ * survive intact, and it is the long file and follow-up lists that shorten.
+ * `renderResult` prints its own `…and N more`, so nothing shortened here is
+ * shortened silently.
+ */
+const INLINE_MANY: RenderOptions = { maxFiles: 5, maxItems: 3 };
+
+/**
+ * What one settled worker looks like inside a `worker_wait` reply.
+ *
+ * The same three cases `worker_result` distinguishes, in the same order and for
+ * the same reason: `blocked` is settled but has no result, because the result
+ * is built at settle and blocking is not settling — and a blocked worker's
+ * questions are the whole point of having waited for it.
+ */
+function outcomeBlock(r: WorkerRecord, now: number, opts: RenderOptions, orphaned: boolean): string {
+  if (r.state === "blocked") return renderBlocked(r, now, orphaned);
+  if (!r.result) return renderNoResult(r, now);
+  return renderResult(r.result, opts);
+}
+
+/**
+ * The results of the workers that settled, for `worker_wait` to return inline.
+ *
+ * This is the change that makes a wait worth its round trip: before it, a wait
+ * that resolved told Claude only *that* a worker had settled, and learning what
+ * it did cost another call per worker. Empty string when nothing settled —
+ * a timeout is not an error and has nothing to append.
+ */
+export function renderWaitOutcomes(
+  records: readonly WorkerRecord[],
+  settled: readonly string[],
+  now: number,
+  orphanedOf: (workerID: string) => boolean = () => false,
+): string {
+  const done = records.filter((r) => settled.includes(r.workerID));
+  if (done.length === 0) return "";
+  const shown = done.slice(0, WAIT_INLINE_MAX);
+  const opts = shown.length > 1 ? INLINE_MANY : {};
+  const blocks = shown.map((r) => outcomeBlock(r, now, opts, orphanedOf(r.workerID)));
+  const overflow = done.slice(WAIT_INLINE_MAX);
+  if (overflow.length > 0) {
+    blocks.push(
+      `${overflow.length} more worker(s) settled and are not shown: ${overflow.map((r) => r.workerID).join(", ")}. ` +
+        "Read them with worker_result.",
+    );
+  }
+  return blocks.join("\n\n");
 }
 
 /**
